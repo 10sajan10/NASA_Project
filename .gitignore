@@ -27,6 +27,9 @@ LANDFIRE/
 # Local notebooks/checkpoints
 .ipynb_checkpoints/
 
+# Local project notes / assistant context
+claude.md
+
 # OS/editor noise
 .DS_Store
 *.swp
