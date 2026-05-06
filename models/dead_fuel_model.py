@@ -1,8 +1,9 @@
 """DeadFuelModel: 1-h, 10-h, 100-h dead fuel moisture per timestep using
 Nelson (1984) equilibrium-moisture-content lookup, with fixed lag multipliers
-for the heavier classes.
+for the heavier classes. **Tile-streamed** so the (T_hours, H, W) outputs
+never live in RAM at full grid scale.
 
-EMC formula (Nelson 1984, simplified Simard form used in NFDRS):
+EMC formula (NFDRS Simard form):
     if RH < 10:    EMC = 0.03229 + 0.281073*RH - 0.000578*RH*T_c
     elif RH < 50:  EMC = 2.22749 + 0.160107*RH - 0.014784*T_c
     else:          EMC = 21.0606 + 0.005565*RH^2 - 0.00035*RH*T_c
@@ -12,12 +13,11 @@ Lag class moistures:
     1-hr   = EMC
     10-hr  = EMC * 1.35
     100-hr = EMC * 1.75
-
-Reads hourly `rh` and `temp_c` from cube; writes `dfm_1hr`, `dfm_10hr`,
-`dfm_100hr` at the same timesteps.
 """
 from __future__ import annotations
+
 from datetime import datetime, timedelta
+
 import numpy as np
 
 from cube.store import Cube
@@ -36,32 +36,54 @@ def _nelson_emc(rh: np.ndarray, t_c: np.ndarray) -> np.ndarray:
     return np.clip(out, 1.0, 50.0)
 
 
-def run(cube: Cube, day0: datetime, n_days: int) -> list[str]:
-    """Compute dead-fuel moistures for every hour in [day0, day0+n_days)."""
-    ts_rh, rh_3d = cube.read_3d("rh")
-    ts_t,  t_3d  = cube.read_3d("temp_c")
-    if ts_rh != ts_t:
-        raise ValueError("rh and temp_c timesteps differ; re-run CMIP6Driver")
+def run(cube: Cube, day0: datetime, n_days: int,
+        tile: int = 256) -> list[str]:
+    """Compute dead-fuel moistures for every hour in [day0, day0+n_days).
+
+    Streams in (24h x tile x tile) chunks, so a 1000 x 1000 grid x 720 hours
+    only ever holds ~24 x 256 x 256 x 4 bytes ~ 6 MB per variable in RAM.
+    """
+    rh_ts_full = cube.read_3d_times("rh")
+    t_ts_full  = cube.read_3d_times("temp_c")
+    if rh_ts_full != t_ts_full:
+        raise ValueError("rh and temp_c timesteps differ; re-run climate driver")
+
     t_start = day0
     t_end = day0 + timedelta(days=n_days)
-    keep = [i for i, t in enumerate(ts_rh) if t_start <= t < t_end]
+    keep = [i for i, t in enumerate(rh_ts_full) if t_start <= t < t_end]
     if not keep:
         raise RuntimeError("no overlap between cube weather and requested window")
+    if keep != list(range(min(keep), max(keep) + 1)):
+        raise RuntimeError("requested window is not contiguous in the cube")
+    t_slice = slice(min(keep), max(keep) + 1)
+    ts = [rh_ts_full[i] for i in keep]
+    n_t = len(ts)
 
-    ts = [ts_rh[i] for i in keep]
-    rh = rh_3d[keep].astype(np.float32)
-    T  = t_3d[keep].astype(np.float32)
-    emc = _nelson_emc(rh, T)
-
-    src = "Nelson1984 EMC + lag multipliers"
+    src = "Nelson1984 EMC + lag multipliers; tile-streamed"
     nat = float(cube.grid.pixel_m)
-    cube.write_3d("dfm_1hr",   ts, emc,
-                  source=src, native_res_m=nat, units="%",
-                  producer="dead_fuel_model")
-    cube.write_3d("dfm_10hr",  ts, (emc * 1.35).astype(np.float32),
-                  source=src, native_res_m=nat, units="%",
-                  producer="dead_fuel_model")
-    cube.write_3d("dfm_100hr", ts, (emc * 1.75).astype(np.float32),
-                  source=src, native_res_m=nat, units="%",
-                  producer="dead_fuel_model")
+    chunk_t = min(24, n_t)
+    for var, lag in [("dfm_1hr",  1.00),
+                     ("dfm_10hr", 1.35),
+                     ("dfm_100hr", 1.75)]:
+        cube.init_time_tiled(
+            var, ts=ts, dtype="float32",
+            source=src, native_res_m=nat, units="%", producer="dead_fuel_model",
+            chunk=(chunk_t, tile, tile))
+
+    # Walk (time-chunk) x (spatial-tile)
+    H, W = cube.grid.shape
+    n_tiles = sum(1 for _ in cube.iter_spatial_tiles(tile=tile))
+    print(f"      streaming Nelson EMC over {n_tiles} {tile}x{tile} tiles "
+          f"x {n_t} hours")
+    tile_no = 0
+    for y_sl, x_sl in cube.iter_spatial_tiles(tile=tile):
+        tile_no += 1
+        # process the whole time axis for this tile in one go (small)
+        rh = cube.read_chunk_time("rh",     t_slice, y_sl, x_sl).astype(np.float32)
+        T  = cube.read_chunk_time("temp_c", t_slice, y_sl, x_sl).astype(np.float32)
+        emc = _nelson_emc(rh, T)
+        cube.write_chunk_time("dfm_1hr",   slice(0, n_t), y_sl, x_sl, emc)
+        cube.write_chunk_time("dfm_10hr",  slice(0, n_t), y_sl, x_sl, emc * 1.35)
+        cube.write_chunk_time("dfm_100hr", slice(0, n_t), y_sl, x_sl, emc * 1.75)
+        del rh, T, emc
     return ["dfm_1hr", "dfm_10hr", "dfm_100hr"]

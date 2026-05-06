@@ -24,14 +24,26 @@ SURFACE_WILDLAND = 1
 SURFACE_URBAN = 2
 
 
-def _slice_3d(cube: Cube, var: str, day0: datetime, n_days: int) -> np.ndarray:
-    ts, arr = cube.read_3d(var)
+def _time_mean_tiled(cube: Cube, var: str, day0: datetime, n_days: int,
+                     tile: int = 256) -> np.ndarray:
+    """Tile-streamed time-mean: never holds the full 3D array."""
+    ts = cube.read_3d_times(var)
     t0 = day0
     t1 = day0 + timedelta(days=n_days)
     keep = [i for i, t in enumerate(ts) if t0 <= t < t1]
     if not keep:
         raise RuntimeError(f"{var}: no data in requested threshold window")
-    return arr[keep]
+    if keep != list(range(min(keep), max(keep) + 1)):
+        raise RuntimeError(f"{var}: requested window is not contiguous")
+    sl = slice(min(keep), max(keep) + 1)
+
+    H, W = cube.grid.shape
+    out = np.empty((H, W), dtype=np.float32)
+    for y_sl, x_sl in cube.iter_spatial_tiles(tile=tile):
+        chunk = cube.read_chunk_time(var, sl, y_sl, x_sl)
+        out[y_sl, x_sl] = chunk.mean(axis=0).astype(np.float32)
+        del chunk
+    return out
 
 
 def _fuel_group(codes: np.ndarray) -> np.ndarray:
@@ -72,7 +84,8 @@ class FuelThresholdProducer(BaseProducer):
             raise ValueError("fuel thresholds require t_start")
 
         fbfm = cube.read_static("fbfm40").astype(np.int32)
-        dfm1 = _slice_3d(cube, "dfm_1hr", request.t_start, request.n_days).mean(0)
+        dfm1 = _time_mean_tiled(cube, "dfm_1hr",
+                                  request.t_start, request.n_days)
         lfmc = cube.read_static("lfmc_pct").astype(np.float32)
         group = _fuel_group(fbfm)
 

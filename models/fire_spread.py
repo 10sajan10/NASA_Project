@@ -47,28 +47,66 @@ def _midflame_factor(fuel_depth_m: np.ndarray, sheltered: np.ndarray) -> np.ndar
     return waf.astype(np.float32)
 
 
-def _slice_3d(cube: Cube, var: str, day0: datetime, n_days: int):
-    ts, arr = cube.read_3d(var)
+def _window_slice(cube: Cube, var: str, day0: datetime,
+                   n_days: int) -> slice:
+    ts = cube.read_3d_times(var)
     t_start = day0
     t_end = day0 + timedelta(days=n_days)
     keep = [i for i, t in enumerate(ts) if t_start <= t < t_end]
-    return arr[keep]
+    if not keep:
+        raise RuntimeError(f"{var}: no overlap with [{t_start}, {t_end})")
+    return slice(min(keep), max(keep) + 1)
 
 
-def _aggregate_weather(cube: Cube, day0: datetime, n_days: int):
-    """Time-mean wind speed/dir, RH, T, and dead-fuel moistures."""
-    ws = _slice_3d(cube, "wind_speed_ms", day0, n_days).astype(np.float64).mean(0)
-    wd = _slice_3d(cube, "wind_dir_deg", day0, n_days).astype(np.float64)
-    wdr = np.deg2rad(wd)
-    wd_mean_rad = np.arctan2(np.sin(wdr).mean(0), np.cos(wdr).mean(0))
-    rh  = _slice_3d(cube, "rh", day0, n_days).astype(np.float64).mean(0)
-    t_c = _slice_3d(cube, "temp_c", day0, n_days).astype(np.float64).mean(0)
-    dfm1   = _slice_3d(cube, "dfm_1hr",   day0, n_days).astype(np.float64).mean(0)
-    dfm10  = _slice_3d(cube, "dfm_10hr",  day0, n_days).astype(np.float64).mean(0)
-    dfm100 = _slice_3d(cube, "dfm_100hr", day0, n_days).astype(np.float64).mean(0)
-    return (ws.astype(np.float32),
-            np.rad2deg(wd_mean_rad).astype(np.float32),
-            rh.astype(np.float32), t_c.astype(np.float32),
+def _aggregate_weather(cube: Cube, day0: datetime, n_days: int,
+                        tile: int = 256):
+    """Tile-streamed time-mean of weather + dead-fuel moisture.
+
+    Memory peak per tile is (T_hours x tile x tile x 4) per variable. At
+    256x256 tiles and 720 hours, that's ~190 MB working set, freed between
+    tiles, vs the full-grid sum which can be many GB.
+    """
+    H, W = cube.grid.shape
+    ws = np.empty((H, W), dtype=np.float32)
+    wd_sin_mean = np.empty((H, W), dtype=np.float32)
+    wd_cos_mean = np.empty((H, W), dtype=np.float32)
+    rh  = np.empty((H, W), dtype=np.float32)
+    t_c = np.empty((H, W), dtype=np.float32)
+    dfm1   = np.empty((H, W), dtype=np.float32)
+    dfm10  = np.empty((H, W), dtype=np.float32)
+    dfm100 = np.empty((H, W), dtype=np.float32)
+
+    sl_ws  = _window_slice(cube, "wind_speed_ms", day0, n_days)
+    sl_wd  = _window_slice(cube, "wind_dir_deg",  day0, n_days)
+    sl_rh  = _window_slice(cube, "rh",            day0, n_days)
+    sl_t   = _window_slice(cube, "temp_c",        day0, n_days)
+    sl_d1  = _window_slice(cube, "dfm_1hr",       day0, n_days)
+    sl_d10 = _window_slice(cube, "dfm_10hr",      day0, n_days)
+    sl_d100= _window_slice(cube, "dfm_100hr",     day0, n_days)
+
+    for y_sl, x_sl in cube.iter_spatial_tiles(tile=tile):
+        ws_t = cube.read_chunk_time("wind_speed_ms", sl_ws, y_sl, x_sl)
+        wd_t = cube.read_chunk_time("wind_dir_deg",  sl_wd, y_sl, x_sl)
+        wdr_t = np.deg2rad(wd_t.astype(np.float32))
+        ws[y_sl, x_sl]          = ws_t.mean(axis=0).astype(np.float32)
+        wd_sin_mean[y_sl, x_sl] = np.sin(wdr_t).mean(axis=0).astype(np.float32)
+        wd_cos_mean[y_sl, x_sl] = np.cos(wdr_t).mean(axis=0).astype(np.float32)
+        del ws_t, wd_t, wdr_t
+
+        rh[y_sl, x_sl]  = cube.read_chunk_time(
+            "rh", sl_rh, y_sl, x_sl).mean(axis=0).astype(np.float32)
+        t_c[y_sl, x_sl] = cube.read_chunk_time(
+            "temp_c", sl_t, y_sl, x_sl).mean(axis=0).astype(np.float32)
+        dfm1[y_sl, x_sl]   = cube.read_chunk_time(
+            "dfm_1hr",   sl_d1,   y_sl, x_sl).mean(axis=0).astype(np.float32)
+        dfm10[y_sl, x_sl]  = cube.read_chunk_time(
+            "dfm_10hr",  sl_d10,  y_sl, x_sl).mean(axis=0).astype(np.float32)
+        dfm100[y_sl, x_sl] = cube.read_chunk_time(
+            "dfm_100hr", sl_d100, y_sl, x_sl).mean(axis=0).astype(np.float32)
+
+    wd_mean_deg = (np.rad2deg(np.arctan2(wd_sin_mean, wd_cos_mean))
+                   % 360.0).astype(np.float32)
+    return (ws, wd_mean_deg, rh, t_c,
             (dfm1 / 100.0).astype(np.float32),
             (dfm10 / 100.0).astype(np.float32),
             (dfm100 / 100.0).astype(np.float32))
@@ -258,20 +296,36 @@ def run(cube: Cube, day0: datetime, n_days: int) -> dict[str, str]:
                       producer="fire_spread",
                       description="Time of arrival of fire (-1 = never)")
 
-    # --- hourly fire frames (binary mask) -- batch write
-    print(f"      writing hourly fire frames ({n_days*24+1})")
+    # --- hourly fire frames, written in chunks of 24 h x tile x tile.
+    # Memory peak is one chunk (24 x 256 x 256 x 1 byte = 1.6 MB).
     n_h = n_days * 24
     ts_fire = [day0 + timedelta(hours=hr) for hr in range(n_h + 1)]
-    fire_3d = np.zeros((n_h + 1, grid.height, grid.width), dtype=np.uint8)
+    chunk_t = 24
+    spatial_chunk = 256
+    cube.init_time_tiled(
+        "fire", ts=ts_fire, dtype="uint8", fill_value=0,
+        source="from arrival_s", native_res_m=cube.grid.pixel_m, units="bool",
+        producer="fire_spread",
+        description="Burning indicator at hourly cadence",
+        chunk=(chunk_t, spatial_chunk, spatial_chunk))
+
+    print(f"      writing hourly fire frames ({n_h+1}) in tiled chunks")
     finite = np.isfinite(arr_s)
-    for hr, t in enumerate(ts_fire):
-        thresh = hr * 3600.0
-        fire_3d[hr] = (finite & (arr_s <= thresh)).astype(np.uint8)
-    cube.write_3d("fire", ts_fire, fire_3d,
-                  source="from arrival_s",
-                  native_res_m=cube.grid.pixel_m, units="bool",
-                  producer="fire_spread",
-                  description="Burning indicator at hourly cadence")
+    n_tiles = sum(1 for _ in cube.iter_spatial_tiles(tile=spatial_chunk))
+    tile_no = 0
+    for y_sl, x_sl in cube.iter_spatial_tiles(tile=spatial_chunk):
+        tile_no += 1
+        arr_tile = arr_s[y_sl, x_sl]
+        finite_tile = finite[y_sl, x_sl]
+        for hr0 in range(0, n_h + 1, chunk_t):
+            hr1 = min(hr0 + chunk_t, n_h + 1)
+            thresh = (np.arange(hr0, hr1, dtype=np.float64) * 3600.0)[:, None, None]
+            fire_chunk = (finite_tile[None]
+                           & (arr_tile[None] <= thresh)).astype(np.uint8)
+            cube.write_chunk_time("fire", slice(hr0, hr1), y_sl, x_sl,
+                                   fire_chunk)
+            del fire_chunk
+        del arr_tile, finite_tile
     return {"ignition_effective_t0": "ignition_effective_t0",
             "R_head": "R_head", "LB": "LB",
             "fireline_intensity_kw_m": "fireline_intensity_kw_m",

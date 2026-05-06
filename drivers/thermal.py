@@ -51,7 +51,7 @@ class ThermalDriver(Driver):
         fluence, power, ig_t0, burnable, metrics = self._build_field(cube, damage)
         self._last_metrics = metrics
 
-        src = f"PDC2023_KMZ::{self.city}::{self.band}"
+        src = f"PDC2023_KMZ::{damage.city}::{damage.band}"
         nat = float(cube.grid.pixel_m)
         cube.write_static("thermal_fluence", fluence,
                           source=src, native_res_m=nat, units="MJ/m^2",

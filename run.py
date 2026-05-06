@@ -5,12 +5,13 @@ Default workflow (resolver engine, ARCO-ERA5 cloud weather, Landsat history):
 
     python run.py --city "Dallas TX USA" --scenario-date 2036-09-15 --days 30
 
-The simulation grid is centred on the chosen city's lon/lat (read from the
-KML's Sample-City-Locations folder). The grid radius defaults to a
-fire-spread-aware auto value of `max(200 km, n_days × 8 km/day)` so the
-domain is sized to whatever the run actually needs; pass --radius-km to
-override. With --auto-expand the run is repeated with a larger radius if
-the fire reaches the grid edge.
+The simulation grid is centered on the chosen city's lon/lat when the KML has
+a matching point Placemark. Simplified KMLs with only one thermal ring set are
+centered on the ring centroid instead. The grid radius defaults to a
+fire-spread-aware auto value of `max(200 km, n_days x 8 km/day)` so the domain
+is sized to whatever the run actually needs; pass --radius-km to override.
+With --auto-expand the run is repeated with a larger radius if the fire reaches
+the grid edge.
 """
 from __future__ import annotations
 
@@ -32,13 +33,14 @@ from cube.snapshot import (
     restore_snapshot,
     save_snapshot,
 )
+from drivers.kml import load_city_damage
 from run_logging import start_run_epoch_log
 
 
 KML_NS = "{http://www.opengis.net/kml/2.2}"
 
 
-def _city_lonlat(kml_path: str, city: str) -> tuple[float, float]:
+def _scenario_lonlat(kml_path: str, city: str, band: str) -> tuple[float, float]:
     tree = etree.parse(kml_path)
     for pm in tree.findall(f".//{KML_NS}Placemark"):
         n = pm.find(f"{KML_NS}name")
@@ -48,7 +50,12 @@ def _city_lonlat(kml_path: str, city: str) -> tuple[float, float]:
                 continue
             tok = coords.text.strip().split(",")
             return float(tok[0]), float(tok[1])
-    raise ValueError(f"city {city!r} not found in {kml_path}")
+
+    damage = load_city_damage(kml_path, city=city, band=band)
+    center = damage.rings[-1].polygon.centroid
+    print("[kml] city point not found; using thermal-ring centroid "
+          f"from {damage.band!r} ring set")
+    return float(center.x), float(center.y)
 
 
 def _emit_geotiffs(cube: Cube, out_dir: Path) -> None:
@@ -166,7 +173,7 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=30)
 
     ap.add_argument("--radius-km", type=float, default=None,
-                    help="grid half-width around city centroid; "
+                    help="grid half-width around scenario center; "
                          "default = max(200, days * 8) km")
     ap.add_argument("--max-radius-km", type=float, default=600.0,
                     help="upper bound on auto-expansion")
@@ -249,9 +256,9 @@ def main() -> None:
             else:
                 print("[snapshot] no fire outputs found to drop")
 
-    with run_logger.stage("parse scenario and city"):
+    with run_logger.stage("parse scenario geometry"):
         scenario_date = datetime.fromisoformat(args.scenario_date)
-        lon, lat = _city_lonlat(args.kml, args.city)
+        lon, lat = _scenario_lonlat(args.kml, args.city, args.band)
 
         radius_m = (args.radius_km * 1000.0 if args.radius_km
                     else pipe.auto_radius_m(args.days))

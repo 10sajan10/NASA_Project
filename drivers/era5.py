@@ -137,39 +137,52 @@ class ARCOERA5HistoryDriver(Driver):
         return ds.sel(longitude=slice(w - 0.5, e + 0.5),
                       latitude=slice(n + 0.5, s - 0.5))
 
+    # --------------------------------------------------------------------
+    # tile-streamed interpolation. ERA5 source is small (~7x7 cells); the
+    # blow-up happens when we materialise (T_days, H_grid, W_grid) at full
+    # grid scale. Instead we build a spatial interpolator per timestep and
+    # call it for one simulation tile at a time, so peak memory scales with
+    # the tile size, not the full grid.
     @staticmethod
-    def _interp_to_grid(da: xr.DataArray, grid) -> np.ndarray:
+    def _build_query_lonlat(grid, y_sl, x_sl
+                            ) -> tuple[np.ndarray, np.ndarray]:
         xs, ys = grid.cell_centers_xy()
-        XX, YY = np.meshgrid(xs, ys)
+        xs_t = xs[x_sl]; ys_t = ys[y_sl]
+        XX, YY = np.meshgrid(xs_t, ys_t)
         inv = Transformer.from_crs(grid.crs, 4326, always_xy=True).transform
         LON, LAT = inv(XX.ravel(), YY.ravel())
-        lat_q = np.asarray(LAT).reshape(XX.shape)
-        lon_q = np.asarray(LON).reshape(XX.shape)
-        # match the dataset's longitude convention
-        if float(da.longitude.max()) > 180:
+        return (np.asarray(LAT).reshape(XX.shape),
+                np.asarray(LON).reshape(XX.shape))
+
+    @staticmethod
+    def _interp_tile(daily_da: xr.DataArray, grid, y_sl, x_sl
+                     ) -> np.ndarray:
+        """Return (T_days, h_tile, w_tile) for one variable at one tile."""
+        lat_q, lon_q = ARCOERA5HistoryDriver._build_query_lonlat(
+            grid, y_sl, x_sl)
+        if float(daily_da.longitude.max()) > 180:
             lon_q = (lon_q + 360.0) % 360.0
 
-        lat_v = da.latitude.values
-        lon_v = da.longitude.values
+        lat_v = daily_da.latitude.values
+        lon_v = daily_da.longitude.values
         if lat_v[0] > lat_v[-1]:
             lat_v = lat_v[::-1]
-            arr = da.values[..., ::-1, :]
+            arr = daily_da.values[..., ::-1, :]
         else:
-            arr = da.values
+            arr = daily_da.values
         order = np.argsort(lon_v)
         lon_v = lon_v[order]
         arr = arr[..., :, order]
 
-        T = arr.shape[0] if arr.ndim == 3 else 1
-        if arr.ndim == 2:
-            arr = arr[None]
-        out = np.empty((T, grid.height, grid.width), dtype=np.float32)
+        T = arr.shape[0]
+        h = y_sl.stop - y_sl.start; w = x_sl.stop - x_sl.start
+        out = np.empty((T, h, w), dtype=np.float32)
         pts = np.stack([lat_q.ravel(), lon_q.ravel()], axis=-1)
         for k in range(T):
             f = RegularGridInterpolator(
                 (lat_v, lon_v), arr[k],
                 bounds_error=False, fill_value=np.nan)
-            out[k] = f(pts).reshape(grid.height, grid.width).astype(np.float32)
+            out[k] = f(pts).reshape(h, w).astype(np.float32)
         return out
 
     # ----------------------------------------------------------------- run
@@ -178,8 +191,6 @@ class ARCOERA5HistoryDriver(Driver):
               t_end: Optional[datetime] = None) -> list[str]:
         print("      opening ARCO-ERA5 (Google Cloud, anonymous read)")
         ds = self._open_arco()
-
-        # only keep variables we need (cheap; no I/O yet)
         keep = [v for v in _VARNAMES.values() if v in ds]
         missing = set(_VARNAMES.values()) - set(keep)
         if missing:
@@ -187,7 +198,6 @@ class ARCOERA5HistoryDriver(Driver):
                 f"ARCO-ERA5 missing variables {missing}; bucket may have moved")
         ds = ds[keep]
 
-        # spatial slice (lazy), then per-year window slicing
         ds = self._slice_bbox(ds, cube.grid.lonlat_bbox())
         windows = self._yearly_windows(ds)
         total_h = sum(w.sizes["time"] for w in windows)
@@ -195,9 +205,7 @@ class ARCOERA5HistoryDriver(Driver):
               f"{ds.sizes.get('longitude','?')} cells, "
               f"{total_h} hourly samples across {len(windows)} years")
 
-        # daily aggregation: do it per yearly window, then concat. This avoids
-        # the resample('1D') NaN-gap pathology when the time index is
-        # discontinuous.
+        # daily aggregation per yearly window (small in source resolution)
         per_window: list[xr.Dataset] = []
         for w in windows:
             t2m = w[_VARNAMES["t2m"]]
@@ -215,10 +223,10 @@ class ARCOERA5HistoryDriver(Driver):
             }))
         daily = xr.concat(per_window, dim="time").compute()
         print(f"      computed daily aggregations: {daily.sizes['time']} days")
-        print(f"      interpolating to {cube.grid.shape} sim grid")
 
         ts = [pd.Timestamp(t).to_pydatetime().replace(tzinfo=None)
               for t in daily.time.values]
+        n_days = len(ts)
 
         out_var_map = {
             "era5_t2m_max_hist":  ("t2m_max",  "C"),
@@ -228,15 +236,33 @@ class ARCOERA5HistoryDriver(Driver):
             "era5_v10_mean_hist": ("v10_mean", "m/s"),
             "era5_pr_total_hist": ("pr_total", "mm"),
         }
-
         src = (f"ARCO-ERA5 ({ARCO_ERA5_ZARR}); "
                f"target {self.target_date.date()}; "
                f"years {self._history_years()[0]}-{self._history_years()[-1]}; "
-               f"+/- {self.day_window} d")
+               f"+/- {self.day_window} d; tile-streamed")
+
+        # pre-allocate chunked Zarr stores so the (n_days, H, W) array per
+        # variable never lives in RAM
+        tile = 128
         for out_var, (key, units) in out_var_map.items():
-            arr = self._interp_to_grid(daily[key], cube.grid)
-            cube.write_3d(out_var, ts, arr,
-                          source=src, native_res_m=25_000.0,
-                          units=units, producer=self.name,
-                          description=f"Historical ARCO-ERA5 daily {key}")
+            cube.init_time_tiled(
+                out_var, ts=ts, dtype="float32",
+                source=src, native_res_m=25_000.0, units=units,
+                producer=self.name,
+                description=f"Historical ARCO-ERA5 daily {key}",
+                chunk=(min(64, n_days), tile, tile))
+
+        n_tiles = sum(1 for _ in cube.iter_spatial_tiles(tile=tile))
+        print(f"      streaming interpolation to {cube.grid.shape} grid "
+              f"in {n_tiles} {tile}x{tile} tiles")
+        tile_no = 0
+        for y_sl, x_sl in cube.iter_spatial_tiles(tile=tile):
+            tile_no += 1
+            if tile_no % max(1, n_tiles // 10) == 0 or tile_no == 1:
+                print(f"      tile {tile_no}/{n_tiles}")
+            for out_var, (key, _units) in out_var_map.items():
+                tile_arr = self._interp_tile(daily[key], cube.grid, y_sl, x_sl)
+                cube.write_chunk_time(out_var, slice(0, n_days), y_sl, x_sl,
+                                       tile_arr)
+                del tile_arr
         return list(self.produces)
