@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Generated scenario data and large raw inputs
+data/cube/
+data/raw/
+data/out/
+data/*.duckdb
+data/catalog.json
+data/grid.json
+*.zarr/
+*.tif
+*.tiff
+
+# LANDFIRE and other bulky local source rasters
+LANDFIRE/
+
+# Local notebooks/checkpoints
+.ipynb_checkpoints/
+
+# OS/editor noise
+.DS_Store
+*.swp
