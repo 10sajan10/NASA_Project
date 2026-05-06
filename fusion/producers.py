@@ -88,10 +88,23 @@ class BaseProducer:
 
 
 class DriverProducer(BaseProducer):
-    """Wrap an existing Driver in the producer interface."""
+    """Wrap an existing Driver in the producer interface.
 
-    def __init__(self, driver: Driver, *, requires: Optional[Iterable[str]] = None,
-                 time_end_mode: str = "as_requested"):
+    `time_check_mode` controls when this producer is considered satisfied:
+      - "as_requested"  (default) — requested t_start..t_end must be covered
+      - "any"           — satisfied if any tile exists for the variable
+                          (use for historical adapters whose timestamps are
+                          intentionally in the past)
+    `time_end_mode` controls how the requested t_end is mapped to the driver's
+    fetch call:
+      - "as_requested"  (default) — pass through unchanged
+      - "inclusive_day" — convert exclusive day-end to inclusive last day
+    """
+
+    def __init__(self, driver: Driver, *,
+                 requires: Optional[Iterable[str]] = None,
+                 time_end_mode: str = "as_requested",
+                 time_check_mode: str = "as_requested"):
         self.driver = driver
         self.name = driver.name
         self.produces = list(driver.produces)
@@ -99,6 +112,7 @@ class DriverProducer(BaseProducer):
         self.kind = "data"
         self.can_run_parallel = False
         self.time_end_mode = time_end_mode
+        self.time_check_mode = time_check_mode
 
     def _driver_end(self, request: VariableRequest) -> Optional[datetime]:
         if request.t_end is None:
@@ -108,6 +122,16 @@ class DriverProducer(BaseProducer):
 
             return request.t_end - timedelta(days=1)
         return request.t_end
+
+    def is_satisfied(self, cube: Cube, variable: str,
+                     request: VariableRequest) -> bool:
+        if request.force:
+            return False
+        if cube.has(variable):
+            return True
+        if self.time_check_mode == "any":
+            return bool(cube.catalog.list_times(variable))
+        return _time_range_is_covered(cube, variable, request)
 
     def run(self, cube: Cube, request: VariableRequest) -> list[str]:
         if getattr(self.driver, "is_static", False):
