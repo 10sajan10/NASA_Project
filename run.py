@@ -43,8 +43,9 @@ def _emit_geotiffs(cube: Cube, out_dir: Path) -> None:
     """Mirror key cube variables to GeoTIFF for QGIS / external viewing."""
     keys = ["thermal_fluence", "thermal_power", "ignition_t0", "burnable",
             "fbfm40", "dem", "slope_deg", "aspect_deg",
-            "ndvi", "ndwi", "lfmc_pct",
-            "R_head", "LB", "arrival_s"]
+            "ndvi", "ndwi", "nbr", "lfmc_pct",
+            "R_head", "LB", "arrival_s",
+            "population", "population_affected"]
     for k in keys:
         try:
             arr = cube.read_static(k)
@@ -115,19 +116,37 @@ def main() -> None:
     ap.add_argument("--pixel-m", type=float, default=100.0)
     ap.add_argument("--root", default="data",
                     help="cube root (catalog.duckdb + cube/*.zarr)")
+    ap.add_argument("--engine", choices=["resolver", "layered"],
+                    default="resolver",
+                    help="resolver builds model/data dependencies automatically")
     ap.add_argument("--landfire",
                     default="LANDFIRE/LF2024_FBFM40_CONUS/Tif/LF2024_FBFM40_CONUS.tif")
+    ap.add_argument("--satellite", choices=["landsat", "sentinel"],
+                    default="landsat")
     ap.add_argument("--sentinel-max-cloud", type=float, default=30.0)
     ap.add_argument("--sentinel-max-scenes", type=int, default=8)
+    ap.add_argument("--landsat-years-back", type=int, default=12)
+    ap.add_argument("--landsat-day-window", type=int, default=30)
+    ap.add_argument("--landsat-max-cloud", type=float, default=50.0)
+    ap.add_argument("--landsat-max-scenes-per-year", type=int, default=3)
     ap.add_argument("--cmip-model", default="ACCESS-CM2")
     ap.add_argument("--cmip-scenario", default="ssp370")
     ap.add_argument("--wind-dir-deg", type=float, default=180.0,
                     help="wind FROM direction (compass deg, CW from N)")
-    ap.add_argument("--weather", choices=["cmip6", "synthetic"], default="cmip6")
+    ap.add_argument("--weather", choices=["cmip6", "synthetic", "era5"],
+                    default="cmip6")
+    ap.add_argument("--era5-source",
+                    help="local ERA5 NetCDF/Zarr for resolver weather=era5")
+    ap.add_argument("--era5-years-back", type=int, default=20)
+    ap.add_argument("--era5-day-window", type=int, default=21)
     ap.add_argument("--syn-temp-c", type=float, default=30.0)
     ap.add_argument("--syn-rh-pct", type=float, default=30.0)
     ap.add_argument("--syn-wind-ms", type=float, default=7.0)
     ap.add_argument("--syn-precip-mm", type=float, default=0.0)
+    ap.add_argument("--population-raster",
+                    help="optional population-count raster for exposure overlay")
+    ap.add_argument("--no-plan", action="store_true",
+                    help="do not print the resolver execution plan")
     args = ap.parse_args()
 
     scenario_date = datetime.fromisoformat(args.scenario_date)
@@ -142,24 +161,52 @@ def main() -> None:
     cube.catalog.save_scenario(name=args.city, grid=grid,
                                scenario_date=scenario_date)
 
-    pipe.setup_drivers(
-        kml_path=args.kml, city=args.city, band=args.band,
-        pulse_seconds=args.pulse_s,
-        landfire_tif=args.landfire,
-        scenario_date=scenario_date,
-        sentinel_max_cloud=args.sentinel_max_cloud,
-        sentinel_max_scenes=args.sentinel_max_scenes,
-        cmip_model=args.cmip_model, cmip_scenario=args.cmip_scenario,
-        wind_dir_deg=args.wind_dir_deg,
-        weather_source=args.weather,
-        synthetic_kwargs={"temp_c": args.syn_temp_c,
-                           "rh_pct": args.syn_rh_pct,
-                           "wind_ms": args.syn_wind_ms,
-                           "daily_precip_mm": args.syn_precip_mm},
-    )
-
-    pipe.run_full(cube, day0=scenario_date, n_days=args.days,
-                  weather_source=args.weather)
+    synthetic_kwargs = {"temp_c": args.syn_temp_c,
+                        "rh_pct": args.syn_rh_pct,
+                        "wind_ms": args.syn_wind_ms,
+                        "daily_precip_mm": args.syn_precip_mm}
+    if args.engine == "resolver":
+        resolver = pipe.setup_resolver(
+            kml_path=args.kml, city=args.city, band=args.band,
+            pulse_seconds=args.pulse_s,
+            landfire_tif=args.landfire,
+            scenario_date=scenario_date,
+            satellite_source=args.satellite,
+            sentinel_max_cloud=args.sentinel_max_cloud,
+            sentinel_max_scenes=args.sentinel_max_scenes,
+            landsat_years_back=args.landsat_years_back,
+            landsat_day_window=args.landsat_day_window,
+            landsat_max_cloud=args.landsat_max_cloud,
+            landsat_max_scenes_per_year=args.landsat_max_scenes_per_year,
+            cmip_model=args.cmip_model, cmip_scenario=args.cmip_scenario,
+            wind_dir_deg=args.wind_dir_deg,
+            weather_source=args.weather,
+            synthetic_kwargs=synthetic_kwargs,
+            era5_source=args.era5_source,
+            era5_years_back=args.era5_years_back,
+            era5_day_window=args.era5_day_window,
+            population_raster=args.population_raster,
+        )
+        pipe.run_full_resolved(
+            cube, day0=scenario_date, n_days=args.days,
+            resolver=resolver,
+            include_population=args.population_raster is not None,
+            print_plan=not args.no_plan)
+    else:
+        pipe.setup_drivers(
+            kml_path=args.kml, city=args.city, band=args.band,
+            pulse_seconds=args.pulse_s,
+            landfire_tif=args.landfire,
+            scenario_date=scenario_date,
+            sentinel_max_cloud=args.sentinel_max_cloud,
+            sentinel_max_scenes=args.sentinel_max_scenes,
+            cmip_model=args.cmip_model, cmip_scenario=args.cmip_scenario,
+            wind_dir_deg=args.wind_dir_deg,
+            weather_source=args.weather,
+            synthetic_kwargs=synthetic_kwargs,
+        )
+        pipe.run_full(cube, day0=scenario_date, n_days=args.days,
+                      weather_source=args.weather)
 
     print("[output] writing GeoTIFFs and overview")
     out = Path(args.root) / "out"
