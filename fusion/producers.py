@@ -8,7 +8,7 @@ other variables. The resolver only cares about `produces`, `requires`, and
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable, Optional, Protocol
 
 from cube.store import Cube
@@ -61,7 +61,11 @@ def _time_range_is_covered(cube: Cube, variable: str,
     times = cube.catalog.list_times(variable)
     if not times:
         return False
-    return min(times) <= request.t_start and max(times) >= request.t_end
+    # `t_end` is exclusive. We only require coverage through the final
+    # requested date because cube variables may be daily (KBDI) or hourly
+    # (weather/fire), and cadence is producer-owned metadata.
+    last_needed = request.t_end - timedelta(microseconds=1)
+    return min(times) <= request.t_start and max(times).date() >= last_needed.date()
 
 
 class BaseProducer:
