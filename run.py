@@ -15,6 +15,7 @@ the fire reaches the grid edge.
 from __future__ import annotations
 
 import argparse
+import atexit
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,7 @@ import pipeline as pipe
 from cube.grid import SimulationGrid
 from cube.store import Cube
 from cube.raster import write_geotiff
+from run_logging import start_run_epoch_log
 
 
 KML_NS = "{http://www.opengis.net/kml/2.2}"
@@ -159,6 +161,8 @@ def main() -> None:
                          "and re-run until it doesn't (capped by --max-radius-km)")
     ap.add_argument("--pixel-m", type=float, default=100.0)
     ap.add_argument("--root", default="data")
+    ap.add_argument("--log-file", default="logs/run_epoch.log",
+                    help="append terminal output and stage markers here")
     ap.add_argument("--engine", choices=["resolver", "layered"],
                     default="resolver")
 
@@ -195,79 +199,97 @@ def main() -> None:
     ap.add_argument("--no-plan", action="store_true")
     args = ap.parse_args()
 
-    scenario_date = datetime.fromisoformat(args.scenario_date)
-    lon, lat = _city_lonlat(args.kml, args.city)
+    run_logger = start_run_epoch_log(args.log_file)
+    atexit.register(run_logger.close)
+    run_logger.log(
+        "arguments: "
+        f"city={args.city!r}, scenario_date={args.scenario_date}, "
+        f"days={args.days}, engine={args.engine}, satellite={args.satellite}, "
+        f"weather={args.weather}, root={args.root!r}")
 
-    radius_m = (args.radius_km * 1000.0 if args.radius_km
-                else pipe.auto_radius_m(args.days))
-    max_radius_m = args.max_radius_km * 1000.0
+    with run_logger.stage("parse scenario and city"):
+        scenario_date = datetime.fromisoformat(args.scenario_date)
+        lon, lat = _city_lonlat(args.kml, args.city)
+
+        radius_m = (args.radius_km * 1000.0 if args.radius_km
+                    else pipe.auto_radius_m(args.days))
+        max_radius_m = args.max_radius_km * 1000.0
     iteration = 0
 
     while True:
         iteration += 1
-        print(f"[grid] iter={iteration}  city {args.city} "
-              f"-> ({lon:.4f}, {lat:.4f})  radius={radius_m/1000:.0f} km  "
-              f"pixel={args.pixel_m} m")
-        grid = pipe.make_grid(lon, lat, radius_m, args.pixel_m)
-        print(f"[grid] CRS=EPSG:{grid.crs_epsg}  shape={grid.shape}")
+        with run_logger.stage(f"iteration {iteration}: build grid"):
+            print(f"[grid] iter={iteration}  city {args.city} "
+                  f"-> ({lon:.4f}, {lat:.4f})  radius={radius_m/1000:.0f} km  "
+                  f"pixel={args.pixel_m} m")
+            grid = pipe.make_grid(lon, lat, radius_m, args.pixel_m)
+            print(f"[grid] CRS=EPSG:{grid.crs_epsg}  shape={grid.shape}")
 
         # fresh root per iteration so producers re-run with new grid; previous
         # iteration's output is moved to root_iter{N}/
         if iteration > 1:
-            old = Path(args.root)
-            archive = old.with_name(f"{old.name}_iter{iteration-1}")
-            if old.exists():
-                old.rename(archive)
+            with run_logger.stage(f"iteration {iteration}: archive previous root"):
+                old = Path(args.root)
+                archive = old.with_name(f"{old.name}_iter{iteration-1}")
+                if old.exists():
+                    old.rename(archive)
 
-        cube = Cube(args.root, grid)
-        cube.catalog.save_scenario(name=args.city, grid=grid,
-                                   scenario_date=scenario_date)
+        with run_logger.stage(f"iteration {iteration}: create cube"):
+            cube = Cube(args.root, grid)
+            cube.catalog.save_scenario(name=args.city, grid=grid,
+                                       scenario_date=scenario_date)
 
-        if args.engine == "resolver":
-            resolver = _build_resolver(args, scenario_date)
-            pipe.run_full_resolved(
-                cube, day0=scenario_date, n_days=args.days,
-                resolver=resolver,
-                include_population=args.population_raster is not None,
-                print_plan=not args.no_plan)
-        else:
-            synthetic_kwargs = {"temp_c": args.syn_temp_c,
-                                "rh_pct": args.syn_rh_pct,
-                                "wind_ms": args.syn_wind_ms,
-                                "daily_precip_mm": args.syn_precip_mm}
-            pipe.setup_drivers(
-                kml_path=args.kml, city=args.city, band=args.band,
-                pulse_seconds=args.pulse_s,
-                landfire_tif=args.landfire,
-                scenario_date=scenario_date,
-                sentinel_max_cloud=args.sentinel_max_cloud,
-                sentinel_max_scenes=args.sentinel_max_scenes,
-                cmip_model=args.cmip_model, cmip_scenario=args.cmip_scenario,
-                wind_dir_deg=args.wind_dir_deg,
-                weather_source=args.weather,
-                synthetic_kwargs=synthetic_kwargs,
-            )
-            pipe.run_full(cube, day0=scenario_date, n_days=args.days,
-                          weather_source=args.weather)
-
-        if args.auto_expand and _fire_reached_edge(cube):
-            new_r = min(radius_m * 1.5, max_radius_m)
-            if new_r > radius_m + 1e-3:
-                cube.close()
-                print(f"[auto-expand] fire reached grid edge; "
-                      f"expanding radius {radius_m/1000:.0f} -> {new_r/1000:.0f} km")
-                radius_m = new_r
-                continue
+        with run_logger.stage(f"iteration {iteration}: run {args.engine} engine"):
+            if args.engine == "resolver":
+                resolver = _build_resolver(args, scenario_date)
+                pipe.run_full_resolved(
+                    cube, day0=scenario_date, n_days=args.days,
+                    resolver=resolver,
+                    include_population=args.population_raster is not None,
+                    print_plan=not args.no_plan)
             else:
-                print(f"[auto-expand] hit --max-radius-km={args.max_radius_km}; "
-                      f"stopping")
+                synthetic_kwargs = {"temp_c": args.syn_temp_c,
+                                    "rh_pct": args.syn_rh_pct,
+                                    "wind_ms": args.syn_wind_ms,
+                                    "daily_precip_mm": args.syn_precip_mm}
+                pipe.setup_drivers(
+                    kml_path=args.kml, city=args.city, band=args.band,
+                    pulse_seconds=args.pulse_s,
+                    landfire_tif=args.landfire,
+                    scenario_date=scenario_date,
+                    sentinel_max_cloud=args.sentinel_max_cloud,
+                    sentinel_max_scenes=args.sentinel_max_scenes,
+                    cmip_model=args.cmip_model, cmip_scenario=args.cmip_scenario,
+                    wind_dir_deg=args.wind_dir_deg,
+                    weather_source=args.weather,
+                    synthetic_kwargs=synthetic_kwargs,
+                )
+                pipe.run_full(cube, day0=scenario_date, n_days=args.days,
+                              weather_source=args.weather)
 
-        print("[output] writing GeoTIFFs and overview")
-        out = Path(args.root) / "out"
-        out.mkdir(parents=True, exist_ok=True)
-        _emit_geotiffs(cube, out)
-        _emit_overview(cube, out)
-        cube.close()
+        if args.auto_expand:
+            with run_logger.stage(f"iteration {iteration}: auto-expand check"):
+                reached_edge = _fire_reached_edge(cube)
+            if reached_edge:
+                new_r = min(radius_m * 1.5, max_radius_m)
+                if new_r > radius_m + 1e-3:
+                    cube.close()
+                    print(f"[auto-expand] fire reached grid edge; "
+                          f"expanding radius {radius_m/1000:.0f} -> "
+                          f"{new_r/1000:.0f} km")
+                    radius_m = new_r
+                    continue
+                else:
+                    print(f"[auto-expand] hit --max-radius-km={args.max_radius_km}; "
+                          f"stopping")
+
+        with run_logger.stage(f"iteration {iteration}: write outputs"):
+            print("[output] writing GeoTIFFs and overview")
+            out = Path(args.root) / "out"
+            out.mkdir(parents=True, exist_ok=True)
+            _emit_geotiffs(cube, out)
+            _emit_overview(cube, out)
+            cube.close()
         break
 
     print("[done]")

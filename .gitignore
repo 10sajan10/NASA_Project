@@ -30,6 +30,10 @@ LANDFIRE/
 # Local project notes / assistant context
 claude.md
 
+# Runtime logs
+logs/
+*.log
+
 # OS/editor noise
 .DS_Store
 *.swp
