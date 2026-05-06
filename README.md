@@ -65,3 +65,28 @@ For population exposure, provide a population-count raster:
 ```bash
 python run.py --engine resolver --population-raster /path/to/population.tif
 ```
+
+## Cube Snapshots
+
+The resolver already reuses any variable present in the active cube. For
+example, if `ndvi` exists in `data/cube/ndvi.zarr`, a later fire run will read
+that layer instead of re-running the satellite producer.
+
+Named snapshots make that reuse explicit:
+
+```bash
+python run.py --save-snapshot dallas_inputs_v1
+```
+
+Restore a snapshot into a run root:
+
+```bash
+python run.py \
+  --from-snapshot dallas_inputs_v1 \
+  --overwrite-root \
+  --recompute-fire
+```
+
+`--recompute-fire` removes only downstream fire outputs such as `arrival_s`,
+`fire`, `R_head`, and population exposure. Upstream inputs such as fuels, DEM,
+NDVI/NDWI/NBR, LFMC, weather, and threshold layers remain available for reuse.

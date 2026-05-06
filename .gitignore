@@ -34,6 +34,9 @@ claude.md
 logs/
 *.log
 
+# Named cube snapshots can be large generated artifacts
+cube_snapshots/
+
 # OS/editor noise
 .DS_Store
 *.swp

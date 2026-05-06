@@ -26,6 +26,12 @@ import pipeline as pipe
 from cube.grid import SimulationGrid
 from cube.store import Cube
 from cube.raster import write_geotiff
+from cube.snapshot import (
+    FIRE_OUTPUT_VARIABLES,
+    drop_cube_variables,
+    restore_snapshot,
+    save_snapshot,
+)
 from run_logging import start_run_epoch_log
 
 
@@ -118,6 +124,10 @@ def _fire_reached_edge(cube: Cube, margin_cells: int = 4) -> bool:
     return bool((edge >= 0).any())
 
 
+def _grid_radius_m(grid: SimulationGrid) -> float:
+    return max(grid.width, grid.height) * grid.pixel_m / 2.0
+
+
 def _build_resolver(args, scenario_date):
     synthetic_kwargs = {"temp_c": args.syn_temp_c,
                         "rh_pct": args.syn_rh_pct,
@@ -167,6 +177,18 @@ def main() -> None:
     ap.add_argument("--root", default="data")
     ap.add_argument("--log-file", default="logs/run_epoch.log",
                     help="append terminal output and stage markers here")
+    ap.add_argument("--from-snapshot",
+                    help="restore a named/path cube snapshot into --root before running")
+    ap.add_argument("--save-snapshot",
+                    help="save the finished --root cube as this snapshot name/path")
+    ap.add_argument("--snapshot-dir", default="cube_snapshots",
+                    help="directory for named cube snapshots")
+    ap.add_argument("--overwrite-root", action="store_true",
+                    help="allow --from-snapshot to replace an existing --root")
+    ap.add_argument("--overwrite-snapshot", action="store_true",
+                    help="allow --save-snapshot to replace an existing snapshot")
+    ap.add_argument("--recompute-fire", action="store_true",
+                    help="drop fire outputs before running, preserving upstream inputs")
     ap.add_argument("--engine", choices=["resolver", "layered"],
                     default="resolver")
 
@@ -211,6 +233,22 @@ def main() -> None:
         f"days={args.days}, engine={args.engine}, satellite={args.satellite}, "
         f"weather={args.weather}, root={args.root!r}")
 
+    if args.from_snapshot:
+        with run_logger.stage("restore cube snapshot"):
+            restored = restore_snapshot(
+                args.from_snapshot, args.root,
+                snapshot_dir=args.snapshot_dir,
+                overwrite_root=args.overwrite_root)
+            print(f"[snapshot] restored {args.from_snapshot!r} -> {restored}")
+
+    if args.recompute_fire:
+        with run_logger.stage("drop fire outputs"):
+            removed = drop_cube_variables(args.root, FIRE_OUTPUT_VARIABLES)
+            if removed:
+                print(f"[snapshot] dropped fire outputs: {', '.join(removed)}")
+            else:
+                print("[snapshot] no fire outputs found to drop")
+
     with run_logger.stage("parse scenario and city"):
         scenario_date = datetime.fromisoformat(args.scenario_date)
         lon, lat = _city_lonlat(args.kml, args.city)
@@ -223,10 +261,16 @@ def main() -> None:
     while True:
         iteration += 1
         with run_logger.stage(f"iteration {iteration}: build grid"):
-            print(f"[grid] iter={iteration}  city {args.city} "
-                  f"-> ({lon:.4f}, {lat:.4f})  radius={radius_m/1000:.0f} km  "
-                  f"pixel={args.pixel_m} m")
-            grid = pipe.make_grid(lon, lat, radius_m, args.pixel_m)
+            if args.from_snapshot and iteration == 1:
+                grid = SimulationGrid.load(Path(args.root) / "grid.json")
+                radius_m = _grid_radius_m(grid)
+                print(f"[grid] iter={iteration}  using restored snapshot grid  "
+                      f"radius~={radius_m/1000:.0f} km  pixel={grid.pixel_m} m")
+            else:
+                print(f"[grid] iter={iteration}  city {args.city} "
+                      f"-> ({lon:.4f}, {lat:.4f})  radius={radius_m/1000:.0f} km  "
+                      f"pixel={args.pixel_m} m")
+                grid = pipe.make_grid(lon, lat, radius_m, args.pixel_m)
             print(f"[grid] CRS=EPSG:{grid.crs_epsg}  shape={grid.shape}")
 
         # fresh root per iteration so producers re-run with new grid; previous
@@ -294,6 +338,14 @@ def main() -> None:
             _emit_geotiffs(cube, out)
             _emit_overview(cube, out)
             cube.close()
+
+        if args.save_snapshot:
+            with run_logger.stage(f"iteration {iteration}: save cube snapshot"):
+                saved = save_snapshot(
+                    args.root, args.save_snapshot,
+                    snapshot_dir=args.snapshot_dir,
+                    overwrite=args.overwrite_snapshot)
+                print(f"[snapshot] saved {args.root!r} -> {saved}")
         break
 
     print("[done]")
