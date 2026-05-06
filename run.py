@@ -49,6 +49,10 @@ def _emit_geotiffs(cube: Cube, out_dir: Path) -> None:
     keys = ["thermal_fluence", "thermal_power", "ignition_t0", "burnable",
             "fbfm40", "dem", "slope_deg", "aspect_deg",
             "ndvi", "ndwi", "nbr", "lfmc_pct",
+            "hard_barrier", "urban_mask", "surface_spread_class",
+            "ignition_threshold_mj_m2", "spread_threshold_kw_m",
+            "spread_rate_modifier", "ignition_effective_t0",
+            "fireline_intensity_kw_m",
             "R_head", "LB", "arrival_s",
             "population", "population_affected"]
     for k in keys:

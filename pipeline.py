@@ -41,6 +41,7 @@ from drivers.population import PopulationRasterDriver
 from models import lfmc_model, dead_fuel_model, drought_model, fire_spread
 from models.satellite_indices import SatelliteIndexRegression
 from models.climate_regression import ClimateRegression
+from models.fuel_thresholds import FuelThresholdProducer
 from models.population_exposure import PopulationExposureProducer
 
 from fusion.producers import (
@@ -161,16 +162,23 @@ def setup_resolver(*,
         requires=["precip_mm", "temp_c"],
         func=lambda cube, req: drought_model.run(
             cube, _require_start(req, "drought_model"), req.n_days)))
+    reg.register(FuelThresholdProducer())
 
     # ---- Layer 3: fire spread ---------------------------------------------
     reg.register(FunctionProducer(
         name="fire_spread",
-        produces=["R_head", "LB", "arrival_s", "fire"],
+        produces=[
+            "ignition_effective_t0", "R_head", "LB",
+            "fireline_intensity_kw_m", "arrival_s", "fire",
+        ],
         requires=[
             "fbfm40", "dem", "slope_deg", "aspect_deg",
-            "burnable", "ignition_t0", "lfmc_pct",
+            "burnable", "thermal_fluence", "lfmc_pct",
             "wind_speed_ms", "wind_dir_deg", "rh", "temp_c",
             "dfm_1hr", "dfm_10hr", "dfm_100hr", "kbdi",
+            "hard_barrier", "urban_mask", "surface_spread_class",
+            "ignition_threshold_mj_m2", "spread_threshold_kw_m",
+            "spread_rate_modifier",
         ],
         func=lambda cube, req: list(fire_spread.run(
             cube, _require_start(req, "fire_spread"), req.n_days).keys())))
@@ -195,7 +203,10 @@ def run_full_resolved(cube: Cube, day0: datetime, n_days: int,
                       include_population: bool = False,
                       print_plan: bool = True) -> None:
     t_end = day0 + timedelta(days=n_days)
-    targets = ["fire", "arrival_s", "R_head", "LB"]
+    targets = [
+        "fire", "arrival_s", "R_head", "LB",
+        "fireline_intensity_kw_m", "ignition_effective_t0",
+    ]
     if include_population:
         targets.append("population_affected")
     if print_plan:

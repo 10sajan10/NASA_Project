@@ -13,8 +13,8 @@ The current implementation uses:
 - A fixed UTM simulation grid per scenario.
 - Data adapters for thermal ignition, LANDFIRE fuels, DEM, Landsat/Sentinel
   indices, CMIP6/synthetic/ERA5 weather, and population rasters.
-- Models for LFMC, dead-fuel moisture, drought, and Rothermel/Dijkstra fire
-  spread.
+- Models for LFMC, dead-fuel moisture, drought, fuel-dependent ignition/spread
+  thresholds, and Rothermel/Dijkstra fire spread.
 - A dependency resolver that lets a model request variables and automatically
   runs the data/model chain needed to create missing cube layers.
 
@@ -48,13 +48,16 @@ fire
   -> weather
   -> dead fuel moisture
   -> KBDI
+  -> fuel thresholds / hard barriers / urban resistance
   -> fire spread
 ```
 
-For ERA5-driven future weather, provide a local ERA5 NetCDF/Zarr:
+The threshold layer separates surface behavior into:
 
-```bash
-python run.py --engine resolver --weather era5 --era5-source /path/to/era5.zarr
+```text
+hard barriers: snow/ice, maintained agriculture, water, bare ground
+wildland: grass, shrub, timber, slash via Rothermel spread
+urban/WUI: high ignition/spread threshold with slower spread
 ```
 
 For population exposure, provide a population-count raster:

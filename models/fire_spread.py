@@ -13,6 +13,8 @@ rest of the cube/driver/catalog plumbing.
 Outputs to the cube:
   - R_head     [m/min]               static
   - LB         [-]                   static (length-to-breadth)
+  - fireline_intensity_kw_m [kW/m]   static
+  - ignition_effective_t0 [0,1]      static
   - arrival_s  [s since t=0]         static (inf if never burned)
   - fire(t)    [{0,1}]               hourly time-varying
 """
@@ -87,8 +89,11 @@ def _wind_to_heading_math_rad(wind_from_deg: np.ndarray) -> np.ndarray:
 def _compute_arrival(R_head_mpmin: np.ndarray,
                      LB: np.ndarray,
                      heading_rad: np.ndarray,
+                     fireline_intensity_kw_m: np.ndarray,
+                     spread_threshold_kw_m: np.ndarray,
+                     spread_rate_modifier: np.ndarray,
                      ig0: np.ndarray,
-                     burnable: np.ndarray,
+                     hard_barrier: np.ndarray,
                      pixel_m: float) -> np.ndarray:
     H, W = R_head_mpmin.shape
     arrival = np.full((H, W), np.inf, dtype=np.float64)
@@ -117,12 +122,15 @@ def _compute_arrival(R_head_mpmin: np.ndarray,
             jj = j + DJ[k]; ii = i + DI[k]
             if jj < 0 or jj >= H or ii < 0 or ii >= W:
                 continue
-            if not burnable[jj, ii]:
+            if hard_barrier[jj, ii]:
+                continue
+            if fireline_intensity_kw_m[j, i] < spread_threshold_kw_m[jj, ii]:
                 continue
             theta = DIR[k] - wd
             sint = math.sin(theta); cost = math.cos(theta)
             denom = math.sqrt(lb*lb*sint*sint + cost*cost)
             R = Rh / denom if denom > 0 else 0.0
+            R *= spread_rate_modifier[jj, ii]
             if R <= 0:
                 continue
             dt_s = (DIST[k] / R) * 60.0
@@ -140,7 +148,6 @@ def run(cube: Cube, day0: datetime, n_days: int) -> dict[str, str]:
     # --- pull static layers
     fbfm = get_static(cube, "fbfm40")
     burnable = get_static(cube, "burnable").astype(bool)
-    ig0 = get_static(cube, "ignition_t0").astype(bool)
     slope_deg = get_static(cube, "slope_deg")
     slope_tan = np.tan(np.deg2rad(np.clip(slope_deg, 0, 75)))
 
@@ -156,6 +163,33 @@ def run(cube: Cube, day0: datetime, n_days: int) -> dict[str, str]:
     # --- fuel parameter arrays
     fuel = fuel_arrays(fbfm)
 
+    if cube.has("hard_barrier"):
+        hard_barrier = cube.read_static("hard_barrier").astype(bool)
+    else:
+        hard_barrier = (~fuel["burnable"]).astype(bool)
+    if cube.has("urban_mask"):
+        urban_mask = cube.read_static("urban_mask").astype(bool)
+    else:
+        urban_mask = np.zeros(grid.shape, dtype=bool)
+    if cube.has("spread_threshold_kw_m"):
+        spread_threshold = cube.read_static("spread_threshold_kw_m").astype(np.float32)
+    else:
+        spread_threshold = np.where(hard_barrier, 1.0e9, 0.0).astype(np.float32)
+    if cube.has("spread_rate_modifier"):
+        spread_modifier = cube.read_static("spread_rate_modifier").astype(np.float32)
+    else:
+        spread_modifier = np.where(hard_barrier, 0.0, 1.0).astype(np.float32)
+
+    # Initial ignition is fuel/moisture-threshold based when threshold layers
+    # are available. Legacy runs fall back to the thermal ring mask.
+    if cube.has("ignition_threshold_mj_m2") and cube.has("thermal_fluence"):
+        thermal = cube.read_static("thermal_fluence").astype(np.float32)
+        ignition_threshold = cube.read_static(
+            "ignition_threshold_mj_m2").astype(np.float32)
+        ig0 = (thermal >= ignition_threshold) & burnable & ~hard_barrier
+    else:
+        ig0 = get_static(cube, "ignition_t0").astype(bool) & ~hard_barrier
+
     # --- wind reduction to midflame height
     sheltered = (fbfm >= 161) & (fbfm <= 189)   # TU + TL ~ canopy-sheltered
     waf = _midflame_factor(fuel["depth_m"], sheltered)
@@ -164,13 +198,40 @@ def run(cube: Cube, day0: datetime, n_days: int) -> dict[str, str]:
     # --- Rothermel
     R_head, LB = rothermel_R(fuel, dfm1, dfm10, dfm100, m_lh, m_lw,
                               U_mid, slope_tan)
-    # mask non-burnable to be safe
-    R_head = np.where(burnable & fuel["burnable"], R_head, 0.0).astype(np.float32)
+
+    # Urban/WUI cells are not Rothermel fuels. Treat them as slow,
+    # threshold-gated spread cells until a dedicated structure model is added.
+    urban_R = np.clip(0.12 + 0.08 * ws, 0.12, 1.20).astype(np.float32)
+    urban_LB = np.clip(1.0 + 0.18 * ws, 1.0, 3.0).astype(np.float32)
+    R_head = np.where(urban_mask & burnable & ~hard_barrier, urban_R, R_head)
+    LB = np.where(urban_mask & burnable & ~hard_barrier, urban_LB, LB)
+
+    # mask hard barriers and asteroid dead zone to be safe
+    spreadable = burnable & ~hard_barrier
+    R_head = np.where(spreadable, R_head, 0.0).astype(np.float32)
     LB = np.where(R_head > 0, LB, 1.0).astype(np.float32)
+    spread_modifier = np.where(spreadable, spread_modifier, 0.0).astype(np.float32)
+
+    available_load = (
+        fuel["load_1h"] + 0.5 * fuel["load_10h"] + 0.2 * fuel["load_100h"]
+        + 0.35 * fuel["load_lh"] + 0.35 * fuel["load_lw"]
+    )
+    fireline_intensity = (
+        fuel["heat_kJkg"] * available_load * (R_head / 60.0)
+    ).astype(np.float32)
+    urban_intensity = (900.0 + 650.0 * R_head).astype(np.float32)
+    fireline_intensity = np.where(
+        urban_mask & (R_head > 0), urban_intensity, fireline_intensity)
+    fireline_intensity = np.where(spreadable, fireline_intensity, 0.0).astype(np.float32)
 
     heading = _wind_to_heading_math_rad(wd_deg)
 
     # write static spread fields
+    cube.write_static("ignition_effective_t0", ig0.astype(np.uint8),
+                      source="thermal_fluence >= fuel ignition threshold",
+                      native_res_m=cube.grid.pixel_m, units="bool",
+                      producer="fire_spread",
+                      description="Initial ignition after fuel thresholds/barriers")
     cube.write_static("R_head", R_head, source="Rothermel1972/Albini1976",
                       native_res_m=cube.grid.pixel_m, units="m/min",
                       producer="fire_spread",
@@ -179,11 +240,17 @@ def run(cube: Cube, day0: datetime, n_days: int) -> dict[str, str]:
                       native_res_m=cube.grid.pixel_m, units="-",
                       producer="fire_spread",
                       description="Length-to-breadth ratio of fire ellipse")
+    cube.write_static("fireline_intensity_kw_m", fireline_intensity,
+                      source="Byram-style intensity from R_head and fuel load",
+                      native_res_m=cube.grid.pixel_m, units="kW/m",
+                      producer="fire_spread",
+                      description="Approximate fireline intensity for spread thresholds")
 
     # --- Dijkstra
     print(f"      fast-marching on {grid.height} x {grid.width} grid")
-    arr_s = _compute_arrival(R_head, LB, heading, ig0, burnable & fuel["burnable"],
-                             grid.pixel_m)
+    arr_s = _compute_arrival(R_head, LB, heading, fireline_intensity,
+                             spread_threshold, spread_modifier, ig0,
+                             hard_barrier, grid.pixel_m)
     arr_s_out = np.where(np.isfinite(arr_s), arr_s, np.float32(-1.0)).astype(np.float32)
     cube.write_static("arrival_s", arr_s_out,
                       source="anisotropic Dijkstra fast-marching",
@@ -205,5 +272,7 @@ def run(cube: Cube, day0: datetime, n_days: int) -> dict[str, str]:
                   native_res_m=cube.grid.pixel_m, units="bool",
                   producer="fire_spread",
                   description="Burning indicator at hourly cadence")
-    return {"R_head": "R_head", "LB": "LB", "arrival_s": "arrival_s",
-            "fire": "fire"}
+    return {"ignition_effective_t0": "ignition_effective_t0",
+            "R_head": "R_head", "LB": "LB",
+            "fireline_intensity_kw_m": "fireline_intensity_kw_m",
+            "arrival_s": "arrival_s", "fire": "fire"}
