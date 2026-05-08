@@ -17,6 +17,7 @@ data/out/
 data/*.duckdb
 data/catalog.json
 data/grid.json
+data_*/
 *.zarr/
 *.tif
 *.tiff

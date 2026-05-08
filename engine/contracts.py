@@ -1,0 +1,208 @@
+"""ProducerV2 contract: the orchestration substrate everything else rides on.
+
+A producer declares:
+
+  * `produces`     - VarSpecs it materialises, each with a merge policy
+  * `requires`     - VarSpecs it reads
+  * `capabilities` - halo, tile-parallelism, iterativeness, cost class
+
+and provides three hooks:
+
+  * `extract(cube, request)         -> inputs dict`
+  * `compute(inputs, request)       -> outputs dict`         # pure-ish, worker-safe
+  * `update(cube, outputs, request) -> {var: version}`       # writes through cube
+
+The default `run` chains the three. Custom producers can override `run`
+directly when extract/compute/update is awkward (e.g. drivers that stream
+external data and never materialise inputs).
+
+The contract is intentionally model-agnostic. The scheduler inspects the
+declared metadata, never the variable semantics.
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Optional
+
+
+class MergePolicy(str, Enum):
+    """How concurrent / overlapping writes to a variable combine.
+
+    Declared per-variable on the VarSpec, not globally. The scheduler picks
+    the policy when collapsing tile writes from parallel workers.
+    """
+    LAST_WRITER = "last_writer"      # default; later write wins (weather, indices)
+    MONOTONE_MIN = "monotone_min"    # arrival time, time-to-event
+    MONOTONE_MAX = "monotone_max"    # peak intensity, burned area, fluence
+    ACCUMULATE = "accumulate"        # counters, integrated quantities
+    UNION = "union"                  # event sets
+
+
+class CostHint(str, Enum):
+    """Coarse routing hint for the scheduler. Drives pool selection."""
+    IO = "io"     # network / disk-bound -> threads
+    CPU = "cpu"   # numpy / numerics     -> processes
+    GPU = "gpu"   # device-bound         -> dedicated worker
+
+
+@dataclass(frozen=True)
+class VarSpec:
+    """Declared variable contract."""
+    name: str
+    kind: str = "static"             # "static" | "time"
+    dtype: str = "float32"
+    units: str = ""
+    merge_policy: MergePolicy = MergePolicy.LAST_WRITER
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class ProducerCapabilities:
+    """Static, declared scheduler hints. Inspected before invocation."""
+    halo_cells: int = 0
+    tile_parallel: bool = True
+    boundary_coupled: bool = False
+    iterative: bool = False
+    requires_barrier: bool = False
+    cost_hint: CostHint = CostHint.CPU
+    memory_budget_mb: int = 1024     # advisory; scheduler may pack workers
+
+    def __post_init__(self):
+        if self.boundary_coupled and self.halo_cells == 0:
+            raise ValueError(
+                "boundary_coupled producer must declare halo_cells > 0")
+        if self.halo_cells < 0:
+            raise ValueError("halo_cells must be non-negative")
+        if self.memory_budget_mb <= 0:
+            raise ValueError("memory_budget_mb must be positive")
+
+
+@dataclass(frozen=True)
+class TileSpec:
+    """A spatial+temporal work unit. `t` is None for static producers."""
+    y: slice
+    x: slice
+    t: Optional[slice] = None
+    halo: int = 0
+
+    def with_halo(self, height: int, width: int) -> "TileSpec":
+        h = self.halo
+        if h == 0:
+            return self
+        return TileSpec(
+            y=slice(max(0, self.y.start - h), min(height, self.y.stop + h)),
+            x=slice(max(0, self.x.start - h), min(width, self.x.stop + h)),
+            t=self.t,
+            halo=0,
+        )
+
+
+@dataclass
+class Request:
+    """Invocation envelope. `tile=None` means whole-grid invocation."""
+    t_start: Optional[datetime] = None
+    t_end: Optional[datetime] = None
+    force: bool = False
+    tile: Optional[TileSpec] = None
+    context: dict[str, Any] = field(default_factory=dict)
+
+
+class ProducerV2(ABC):
+    """Generic adapter base.
+
+    Subclasses set the class attributes `name`, `produces`, `requires`,
+    `capabilities`, then either:
+
+      (a) override `compute()` (and optionally `extract` / `update`), letting
+          the default `run()` chain them, or
+      (b) override `run()` directly when the three-step split is unnatural
+          (e.g. drivers that stream data from a remote service).
+    """
+
+    name: str = ""
+    produces: tuple[VarSpec, ...] = ()
+    requires: tuple[VarSpec, ...] = ()
+    capabilities: ProducerCapabilities = ProducerCapabilities()
+
+    # --- public entrypoint ------------------------------------------------
+    def run(self, cube, request: Request) -> dict[str, int]:
+        """Default invocation: extract -> compute -> update. Returns
+        `{variable_name: new_version}` for each produced variable.
+
+        Custom producers may override this directly; the scheduler only
+        cares about the (name, produces, requires, capabilities) contract
+        plus this entrypoint."""
+        inputs = self.extract(cube, request)
+        outputs = self.compute(inputs, request)
+        return self.update(cube, outputs, request)
+
+    # --- default three-step pipeline --------------------------------------
+    def extract(self, cube, request: Request) -> dict[str, Any]:
+        """Read declared inputs. Default: empty (drivers and zero-input
+        producers). Override to return `{var.name: array}`."""
+        return {}
+
+    @abstractmethod
+    def compute(self, inputs: dict[str, Any],
+                request: Request) -> dict[str, Any]:
+        """Pure-ish transform. Returns `{var.name: array}` for every var
+        in `self.produces`. Must NOT touch the cube; runs on workers."""
+        raise NotImplementedError
+
+    def update(self, cube, outputs: dict[str, Any],
+               request: Request) -> dict[str, int]:
+        """Write outputs back through the cube. Default uses static/3D
+        bulk writes; producers with custom write paths override this."""
+        produced_names = {v.name for v in self.produces}
+        missing = produced_names - set(outputs.keys())
+        if missing:
+            raise RuntimeError(
+                f"{self.name}: compute did not return {sorted(missing)}; "
+                f"declared produces={[v.name for v in self.produces]}")
+        unexpected = set(outputs.keys()) - produced_names
+        if unexpected:
+            raise RuntimeError(
+                f"{self.name}: compute returned undeclared vars "
+                f"{sorted(unexpected)}")
+
+        versions: dict[str, int] = {}
+        for spec in self.produces:
+            arr = outputs[spec.name]
+            if spec.kind == "static":
+                cube.write_static(
+                    spec.name, arr,
+                    source=f"producer:{self.name}",
+                    native_res_m=float(cube.grid.pixel_m),
+                    units=spec.units,
+                    producer=self.name,
+                    description=spec.description)
+            elif spec.kind == "time":
+                ts = request.context.get("t_axis") or []
+                cube.write_3d(
+                    spec.name, ts, arr,
+                    source=f"producer:{self.name}",
+                    native_res_m=float(cube.grid.pixel_m),
+                    units=spec.units,
+                    producer=self.name,
+                    description=spec.description)
+            else:
+                raise ValueError(f"unknown var kind {spec.kind!r}")
+            versions[spec.name] = self._latest_version(cube, spec.name)
+        return versions
+
+    @staticmethod
+    def _latest_version(cube, variable: str) -> int:
+        """Best-effort lookup of the variable's current version row.
+
+        Catalog already stores a `version` column on tiles; default to 0
+        if the cube doesn't expose it."""
+        try:
+            rows = cube.catalog.con.execute(
+                "SELECT MAX(version) FROM tiles WHERE variable=?",
+                [variable]).fetchone()
+            return int(rows[0]) if rows and rows[0] is not None else 0
+        except Exception:
+            return 0

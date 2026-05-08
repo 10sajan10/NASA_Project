@@ -1,0 +1,71 @@
+# Default Dallas 2036-09-15 scenario config.
+#
+# Two runs with the same config produce the same `config_hash` in the run
+# manifest, which is the reproducibility anchor. CLI flags override these.
+
+scenario:
+  kml: Dallas.kml
+  city: "Dallas TX USA"
+  band: Mean
+  pulse_s: 10.0
+  scenario_date: "2036-09-15"
+  days: 30
+
+grid:
+  radius_km: null            # null -> auto = max(200, days*8)
+  max_radius_km: 600.0
+  pixel_m: 100.0
+  auto_expand: false
+
+storage:
+  root: data
+  log_file: logs/run_epoch.log
+  scratch_dir: null          # null -> $CUBE_SCRATCH or $TMPDIR
+
+execution:
+  # Backend for tile fan-out. The scheduler (Phase 2) reads this.
+  #   serial  -> single-thread (debugging, small grids)
+  #   thread  -> ThreadPoolExecutor (I/O-bound: Zarr/GCS reads)
+  #   process -> ProcessPoolExecutor (CPU-bound: regression solves, KBDI)
+  #   dask    -> dask.distributed LocalCluster
+  #   slurm   -> dask_jobqueue.SLURMCluster (HPC)
+  mode: serial
+  max_workers: null          # null -> os.cpu_count()-1
+  spill_threshold_mb: 1024   # working buffers above this go to memmap
+  # Forwarded to dask cluster_kwargs when mode in (dask, slurm). Examples:
+  #   slurm: { queue: notchpeak, cores: 16, memory: "64GB", walltime: "02:00:00",
+  #            account: smithp-rw }
+  cluster_kwargs: {}
+
+inputs:
+  landfire: LANDFIRE/LF2024_FBFM40_CONUS/Tif/LF2024_FBFM40_CONUS.tif
+  landfire_fbfm13: LANDFIRE/LF2024_FBFM13_CONUS/Tif/LF2024_FBFM13_CONUS.tif
+  population_raster: null
+
+satellite:
+  source: landsat            # landsat | sentinel
+  landsat_years_back: 12
+  landsat_day_window: 30
+  landsat_max_cloud: 50.0
+  landsat_max_scenes_per_year: 3
+  sentinel_max_cloud: 30.0
+  sentinel_max_scenes: 8
+
+weather:
+  source: era5               # era5 | cmip6 | synthetic
+  era5_years_back: 12
+  era5_day_window: 21
+  cmip_model: ACCESS-CM2
+  cmip_scenario: ssp370
+  wind_dir_deg: 180.0
+  synthetic:
+    temp_c: 30.0
+    rh_pct: 30.0
+    wind_ms: 7.0
+    daily_precip_mm: 0.0
+
+regression:
+  harmonics: 2
+
+fire:
+  model: rothermel           # rothermel | (future adapters)
