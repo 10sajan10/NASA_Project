@@ -372,10 +372,26 @@ class PipelineRunner:
         t0 = time.monotonic()
         try:
             producer.init(cube, request)
-            tiles = list(producer.tile_iter(cube, request))
+            all_tiles = list(producer.tile_iter(cube, request))
+            # Active-set filter: skip tiles whose predicate is False.
+            tiles: list = []
+            skipped_inactive = 0
+            for t in all_tiles:
+                try:
+                    active = producer.tile_predicate(cube, request, t)
+                except Exception:
+                    # A misbehaving predicate must not silently drop work.
+                    active = True
+                if active:
+                    tiles.append(t)
+                else:
+                    skipped_inactive += 1
             n_tiles = len(tiles)
             if self.verbose:
-                print(f"[step] {name}  {n_tiles} tiles")
+                msg = f"[step] {name}  {n_tiles} active tiles"
+                if skipped_inactive:
+                    msg += f" ({skipped_inactive} inactive skipped)"
+                print(msg)
 
             worker_cube = (CubeRef.from_cube(cube)
                            if is_cross_process_backend(self.backend)

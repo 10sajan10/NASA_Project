@@ -278,3 +278,135 @@ def test_layer_with_tile_aware_and_whole_grid_producers(tmp_path):
         assert cube.has("whole_var")
     finally:
         cube.close()
+
+
+# -------------------------------------------------------- active set
+class _ActiveSetProducer(TiledProducer):
+    """Predicate skips tiles whose y_start is odd: only even y rows run."""
+    name = "active_set"
+    produces = ("filled",)
+    requires = ()
+    capabilities = ProducerCapabilities(tile_parallel=True)
+    tile_size = 32
+
+    def __init__(self):
+        self.processed_tiles: list[tuple[int, int]] = []
+
+    def init(self, cube, request):
+        cube.init_static_tiled(
+            "filled", dtype="float32",
+            source="test", native_res_m=float(cube.grid.pixel_m),
+            units="", producer=self.name,
+            chunk=(self.tile_size, self.tile_size))
+
+    def tile_predicate(self, cube, request, tile):
+        # Active only when y_start is divisible by 64 (every other tile row
+        # at tile_size=32). Sparse work pattern.
+        return (tile.y.start // self.tile_size) % 2 == 0
+
+    def process_tile(self, cube, request, tile):
+        self.processed_tiles.append((tile.y.start, tile.x.start))
+        h = tile.y.stop - tile.y.start
+        w = tile.x.stop - tile.x.start
+        cube.write_chunk_static(
+            "filled", tile.y, tile.x,
+            np.full((h, w), 1.0, dtype="float32"))
+
+
+def test_active_set_predicate_filters_inactive_tiles(tmp_path):
+    """Tiles with predicate=False must NOT call process_tile."""
+    from cube.grid import SimulationGrid
+    from cube.store import Cube
+    grid = SimulationGrid.from_center_radius(-96.797, 32.776, 50_000.0, 500.0)
+    cube = Cube(tmp_path, grid)
+    try:
+        prod = _ActiveSetProducer()
+        reg = to_engine_registry([prod])
+        pipeline = Pipeline().add("active_set")
+        runner = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+        res = runner.run(cube, pipeline)
+        assert res.ok
+        # Only even tile rows should have been processed.
+        for y_start, _ in prod.processed_tiles:
+            assert (y_start // prod.tile_size) % 2 == 0, (
+                f"inactive tile {y_start} processed")
+        # Sanity: at least some tiles ran (non-empty active set)
+        assert len(prod.processed_tiles) > 0
+    finally:
+        cube.close()
+
+
+def test_active_set_predicate_can_skip_all_tiles(tmp_path):
+    """Predicate returning False everywhere is valid; finalize still runs."""
+    cube = _real_cube(tmp_path)
+    try:
+        class _AllInactive(TiledProducer):
+            name = "skip_all"
+            produces = ("v",)
+            requires = ()
+            capabilities = ProducerCapabilities(tile_parallel=True)
+            tile_size = 16
+            calls: list = []
+            def init(self, cube, request):
+                cube.init_static_tiled(
+                    "v", dtype="float32",
+                    source="t",
+                    native_res_m=float(cube.grid.pixel_m),
+                    units="", producer=self.name,
+                    chunk=(self.tile_size, self.tile_size))
+            def tile_predicate(self, cube, request, tile): return False
+            def process_tile(self, cube, request, tile):
+                _AllInactive.calls.append(tile)
+            def finalize(self, cube, request):
+                return {"v": 1}
+
+        reg = to_engine_registry([_AllInactive()])
+        pipeline = Pipeline().add("skip_all")
+        runner = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+        res = runner.run(cube, pipeline)
+        assert res.ok
+        # process_tile never called; finalize did run (produced reported)
+        assert _AllInactive.calls == []
+        assert res.by_name()["skip_all"].produced == {"v": 1}
+    finally:
+        cube.close()
+
+
+def test_predicate_exception_treated_as_active(tmp_path):
+    """A misbehaving predicate must NOT silently drop work — it falls
+    back to active=True so we don't accidentally skip required computation."""
+    cube = _real_cube(tmp_path)
+    try:
+        class _FlakyPredicate(TiledProducer):
+            name = "flaky"
+            produces = ("v",)
+            requires = ()
+            capabilities = ProducerCapabilities(tile_parallel=True)
+            tile_size = 16
+            processed: list = []
+            def init(self, cube, request):
+                cube.init_static_tiled(
+                    "v", dtype="float32",
+                    source="t",
+                    native_res_m=float(cube.grid.pixel_m),
+                    units="", producer=self.name,
+                    chunk=(self.tile_size, self.tile_size))
+            def tile_predicate(self, cube, request, tile):
+                raise RuntimeError("predicate blew up")
+            def process_tile(self, cube, request, tile):
+                _FlakyPredicate.processed.append(tile)
+                h = tile.y.stop - tile.y.start
+                w = tile.x.stop - tile.x.start
+                cube.write_chunk_static(
+                    "v", tile.y, tile.x,
+                    np.zeros((h, w), dtype="float32"))
+
+        reg = to_engine_registry([_FlakyPredicate()])
+        pipeline = Pipeline().add("flaky")
+        runner = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+        res = runner.run(cube, pipeline)
+        assert res.ok
+        # Even though predicate raised, all tiles got processed.
+        assert len(_FlakyPredicate.processed) > 0
+    finally:
+        cube.close()

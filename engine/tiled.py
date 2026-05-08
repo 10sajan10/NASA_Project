@@ -70,6 +70,22 @@ class TiledProducer:
             yield TileSpec(y=y_sl, x=x_sl,
                            halo=self.capabilities.halo_cells)
 
+    def tile_predicate(self, cube, request: Request,
+                        tile: TileSpec) -> bool:
+        """Active-set filter: return True if `tile` needs computation.
+
+        Default: True (all tiles active). Producers with sparse work
+        (fire spread fronts, hotspot detection, change-driven retraining)
+        override this to skip cold tiles. The runner filters via this
+        predicate before dispatching, so cost scales with the active
+        set, not the full grid.
+
+        Predicate runs in the parent process before fan-out, so it
+        sees the live cube and any state the runner has already
+        produced. Side effects are discouraged.
+        """
+        return True
+
     # ---- adapter to the runner's standard run() entrypoint -----------
     def run(self, cube, request: Request) -> dict[str, int]:
         """Default whole-grid invocation: init, sequential tile loop,
