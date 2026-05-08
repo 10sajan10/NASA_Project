@@ -109,6 +109,16 @@ class Request:
     tile: Optional[TileSpec] = None
     context: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def n_days(self) -> int:
+        """Inclusive day count between t_start and t_end. Mirrors the legacy
+        fusion.VariableRequest contract so legacy producers can run unchanged
+        through the engine runner."""
+        if self.t_start is None or self.t_end is None:
+            raise ValueError("time range is required for n_days")
+        days = (self.t_end.date() - self.t_start.date()).days
+        return max(1, days)
+
 
 class ProducerV2(ABC):
     """Generic adapter base.

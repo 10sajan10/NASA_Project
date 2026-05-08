@@ -36,7 +36,12 @@ from .contract_test import (
     check_io_isolation,
     check_producer,
 )
-from .registry import ProducerRegistry, producer_produces, producer_requires
+from .registry import (
+    ProducerRegistry,
+    producer_produces,
+    producer_requires,
+    to_engine_registry,
+)
 from .pipeline import Pipeline, PipelineNode, Trigger, parallel
 from .scheduler import PipelineRunner, RunResult, StepResult
 
@@ -74,6 +79,7 @@ __all__ = [
     "ProducerRegistry",
     "producer_produces",
     "producer_requires",
+    "to_engine_registry",
     "Pipeline",
     "PipelineNode",
     "Trigger",

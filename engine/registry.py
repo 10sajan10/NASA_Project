@@ -110,3 +110,26 @@ class ProducerRegistry:
 
     def __len__(self) -> int:
         return len(self._by_name)
+
+
+def to_engine_registry(source: Any) -> ProducerRegistry:
+    """Bridge any registry-like object (or iterable of producers) into an
+    engine ProducerRegistry.
+
+    Accepts:
+      * a fusion.ProducerRegistry (or any object with a `producers()` method
+        returning an iterable of producers)
+      * a plain iterable of producer-shaped objects
+
+    The producers themselves don't need to change. Engine accepts anything
+    with `name`, `produces`, `requires`, and `run(cube, request)`, which is
+    exactly the legacy fusion.Producer protocol.
+    """
+    if hasattr(source, "producers") and callable(source.producers):
+        items = source.producers()
+    else:
+        items = source
+    eng = ProducerRegistry()
+    for p in items:
+        eng.register(p)
+    return eng

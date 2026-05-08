@@ -231,6 +231,17 @@ def main() -> None:
                     help="drop fire outputs before running, preserving upstream inputs")
     ap.add_argument("--engine", choices=["resolver", "layered"],
                     default="resolver")
+    ap.add_argument("--orchestrator", choices=["legacy", "engine"],
+                    default="legacy",
+                    help="legacy = fusion DependencyResolver (proven path); "
+                         "engine = new model-agnostic PipelineRunner over a "
+                         "swappable Backend (serial/thread/process/dask/slurm)")
+    ap.add_argument("--engine-backend",
+                    choices=["serial", "thread", "process", "dask", "slurm"],
+                    default="serial",
+                    help="execution backend when --orchestrator=engine")
+    ap.add_argument("--engine-workers", type=int, default=None,
+                    help="max workers for thread/process/dask backends")
     ap.add_argument("--fire-model", choices=pipe.available_fire_models(),
                     default="rothermel",
                     help="fire-model adapter to use; each adapter declares "
@@ -278,7 +289,10 @@ def main() -> None:
     run_logger.log(
         "arguments: "
         f"city={args.city!r}, scenario_date={args.scenario_date}, "
-        f"days={args.days}, engine={args.engine}, satellite={args.satellite}, "
+        f"days={args.days}, engine={args.engine}, "
+        f"orchestrator={args.orchestrator}, "
+        f"engine_backend={args.engine_backend}, "
+        f"satellite={args.satellite}, "
         f"weather={args.weather}, fire_model={args.fire_model}, "
         f"root={args.root!r}")
 
@@ -339,14 +353,31 @@ def main() -> None:
             cube.catalog.save_scenario(name=args.city, grid=grid,
                                        scenario_date=scenario_date)
 
-        with run_logger.stage(f"iteration {iteration}: run {args.engine} engine"):
+        stage_label = (f"run {args.engine} engine "
+                       f"[{args.orchestrator}"
+                       + (f"/{args.engine_backend}" if args.orchestrator == "engine"
+                          else "") + "]")
+        with run_logger.stage(f"iteration {iteration}: {stage_label}"):
             if args.engine == "resolver":
                 resolver = _build_resolver(args, scenario_date)
-                pipe.run_full_resolved(
-                    cube, day0=scenario_date, n_days=args.days,
-                    resolver=resolver,
-                    include_population=args.population_raster is not None,
-                    print_plan=not args.no_plan)
+                if args.orchestrator == "engine":
+                    backend_kwargs = ({"max_workers": args.engine_workers}
+                                      if args.engine_backend
+                                      in ("thread", "process")
+                                      and args.engine_workers else {})
+                    pipe.run_full_via_engine(
+                        cube, day0=scenario_date, n_days=args.days,
+                        resolver=resolver,
+                        backend_mode=args.engine_backend,
+                        backend_kwargs=backend_kwargs,
+                        include_population=args.population_raster is not None,
+                        print_plan=not args.no_plan)
+                else:
+                    pipe.run_full_resolved(
+                        cube, day0=scenario_date, n_days=args.days,
+                        resolver=resolver,
+                        include_population=args.population_raster is not None,
+                        print_plan=not args.no_plan)
             else:
                 synthetic_kwargs = {"temp_c": args.syn_temp_c,
                                     "rh_pct": args.syn_rh_pct,

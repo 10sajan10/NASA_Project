@@ -208,6 +208,60 @@ def run_full_resolved(cube: Cube, day0: datetime, n_days: int,
     cube.export_catalog()
 
 
+def run_full_via_engine(cube: Cube, day0: datetime, n_days: int,
+                        resolver: DependencyResolver, *,
+                        backend_mode: str = "serial",
+                        backend_kwargs: Optional[dict] = None,
+                        include_population: bool = False,
+                        print_plan: bool = True,
+                        verbose: bool = True) -> None:
+    """Resolver-equivalent run through the new engine PipelineRunner.
+
+    Same producer registry, same target inference, same satisfaction-skip
+    behaviour — but the DAG is built explicitly and dispatched through a
+    swappable Backend (serial / thread / process / dask / slurm).
+
+    The legacy `run_full_resolved` path is untouched; this is opt-in via
+    the run.py `--orchestrator engine` flag.
+    """
+    from engine import (
+        Pipeline,
+        PipelineRunner,
+        make_backend,
+        to_engine_registry,
+    )
+
+    t_end = day0 + timedelta(days=n_days)
+    targets = list(resolver.registry.get("fire_model").produces)
+    if include_population:
+        targets.append("population_affected")
+
+    eng_registry = to_engine_registry(resolver.registry)
+    pipeline = Pipeline.from_targets(targets, registry=eng_registry,
+                                     name="resolver-equivalent")
+    backend = make_backend(backend_mode, **(backend_kwargs or {}))
+    runner = PipelineRunner(eng_registry, backend=backend, verbose=verbose)
+    if print_plan:
+        print("[engine] execution plan")
+        print(pipeline.explain())
+
+    try:
+        result = runner.run(cube, pipeline, t_start=day0, t_end=t_end)
+    finally:
+        backend.shutdown(wait=True)
+
+    if verbose:
+        ok = sum(1 for s in result.steps if s.status == "ok")
+        sk = sum(1 for s in result.steps if s.status == "skipped")
+        er = sum(1 for s in result.steps if s.status == "error")
+        print(f"[engine] done: {ok} ran, {sk} skipped, {er} failed; "
+              f"backend={backend.name}")
+    if not result.ok:
+        bad = [s.name for s in result.steps if s.status == "error"]
+        raise RuntimeError(f"engine run failed for: {', '.join(bad)}")
+    cube.export_catalog()
+
+
 # ------------------------------------------------------- legacy layered API
 # kept for the --engine layered code path; uses the same drivers but skips
 # the resolver. Useful for debugging.

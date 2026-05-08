@@ -32,14 +32,14 @@ from typing import Any, Optional
 from .backends import Backend, SerialBackend
 from .contracts import Request
 from .pipeline import Pipeline, Trigger
-from .registry import ProducerRegistry
+from .registry import ProducerRegistry, producer_produces
 
 
 # --------------------------------------------------------------- results
 @dataclass
 class StepResult:
     name: str
-    status: str                                  # "ok" | "error"
+    status: str                                  # "ok" | "skipped" | "error"
     elapsed_s: float
     produced: dict[str, int] = field(default_factory=dict)
     error: Optional[str] = None
@@ -83,6 +83,41 @@ def _run_one(producer, cube, request: Request) -> dict[str, int]:
     return _coerce_produced(producer.run(cube, request))
 
 
+def _producer_already_satisfied(producer, cube, request: Request) -> bool:
+    """Best-effort 'is the cube already in the desired state for this producer?'.
+
+    Honors two contract shapes without coupling to either:
+
+      * legacy fusion: `is_satisfied(cube, variable, request)` - per-variable
+      * engine v2 (future): `is_satisfied(cube, request)` - producer-level
+
+    A producer is treated as satisfied only when ALL its declared `produces`
+    are satisfied. Any error in the predicate is treated as 'not satisfied'
+    so we re-run rather than silently skip.
+
+    Returns False when the producer doesn't expose `is_satisfied` at all.
+    """
+    method = getattr(producer, "is_satisfied", None)
+    if method is None:
+        return False
+    if request is not None and getattr(request, "force", False):
+        return False
+    produces = producer_produces(producer)
+    if not produces:
+        return False
+    try:
+        # Try the per-variable signature first (legacy).
+        return all(method(cube, var, request) for var in produces)
+    except TypeError:
+        try:
+            # Producer-level signature.
+            return bool(method(cube, request))
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------- the runner
 class PipelineRunner:
     """Run a `Pipeline` through a `Backend`."""
@@ -92,11 +127,13 @@ class PipelineRunner:
                  backend: Optional[Backend] = None,
                  *,
                  verbose: bool = True,
-                 fail_fast: bool = False) -> None:
+                 fail_fast: bool = False,
+                 skip_when_satisfied: bool = True) -> None:
         self.registry = registry
         self.backend = backend or SerialBackend()
         self.verbose = verbose
         self.fail_fast = fail_fast
+        self.skip_when_satisfied = skip_when_satisfied
 
     # ------------------------------------------------------------------
     def run(self,
@@ -168,6 +205,10 @@ class PipelineRunner:
                     self._fire_triggers(sr.name, cube,
                                         triggers_by_source.get(sr.name, ()),
                                         node_after, completed, result)
+                elif sr.status == "skipped":
+                    # already-satisfied: dependents can proceed; triggers do
+                    # NOT fire (the source step didn't actually run).
+                    completed.add(sr.name)
                 else:
                     failed.add(sr.name)
                     if self.fail_fast:
@@ -218,9 +259,23 @@ class PipelineRunner:
         if isinstance(self.backend, SerialBackend) or len(names) == 1:
             return [self._run_step(name, cube, request) for name in names]
 
+        # Pre-pass: mark satisfied nodes as skipped without submitting.
+        results: list[StepResult] = []
+        to_submit: list[str] = []
+        for name in names:
+            producer = self.registry.get(name)
+            if self.skip_when_satisfied and _producer_already_satisfied(
+                    producer, cube, request):
+                if self.verbose:
+                    print(f"[step] {name}  skipped (already satisfied)")
+                results.append(StepResult(
+                    name=name, status="skipped", elapsed_s=0.0))
+                continue
+            to_submit.append(name)
+
         # Parallel via backend.submit so we collect per-task timing/errors.
         futs: list[tuple[str, Future, float]] = []
-        for name in names:
+        for name in to_submit:
             producer = self.registry.get(name)
             if self.verbose:
                 print(f"[step] {name}  submit ({self.backend.name})")
@@ -228,7 +283,6 @@ class PipelineRunner:
             futs.append((name, self.backend.submit(
                 _run_one, producer, cube, request), t0))
 
-        results: list[StepResult] = []
         for name, fut, t0 in futs:
             try:
                 produced = fut.result()
@@ -250,6 +304,11 @@ class PipelineRunner:
 
     def _run_step(self, name: str, cube, request: Request) -> StepResult:
         producer = self.registry.get(name)
+        if self.skip_when_satisfied and _producer_already_satisfied(
+                producer, cube, request):
+            if self.verbose:
+                print(f"[step] {name}  skipped (already satisfied)")
+            return StepResult(name=name, status="skipped", elapsed_s=0.0)
         if self.verbose:
             print(f"[step] {name}  start")
         t0 = time.monotonic()
