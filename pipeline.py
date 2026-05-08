@@ -29,7 +29,7 @@ from cube.store import Cube
 
 from drivers.base import register, _REGISTRY
 from drivers.thermal import ThermalDriver
-from drivers.landfire import LandfireDriver
+from drivers.landfire import LandfireDriver, LandfireFBFM13Driver
 from drivers.dem import DEMDriver
 from drivers.sentinel import SentinelDriver
 from drivers.cmip6 import CMIP6Driver
@@ -38,7 +38,12 @@ from drivers.landsat import LandsatHistoryDriver
 from drivers.era5 import ARCOERA5HistoryDriver
 from drivers.population import PopulationRasterDriver
 
-from models import lfmc_model, dead_fuel_model, drought_model, fire_spread
+from models import lfmc_model, dead_fuel_model, drought_model
+from models.fire_adapters import (
+    available_fire_models,
+    build_fire_model_producer,
+    fire_model_outputs,
+)
 from models.satellite_indices import SatelliteIndexRegression
 from models.climate_regression import ClimateRegression
 from models.fuel_thresholds import FuelThresholdProducer
@@ -76,6 +81,7 @@ def setup_resolver(*,
                    band: str,
                    pulse_seconds: float,
                    landfire_tif: str | Path,
+                   landfire_fbfm13_tif: str | Path,
                    scenario_date: datetime,
                    satellite_source: str,
                    sentinel_max_cloud: float,
@@ -92,7 +98,8 @@ def setup_resolver(*,
                    era5_years_back: int = 12,
                    era5_day_window: int = 21,
                    regression_n_harmonics: int = 2,
-                   population_raster: str | Path | None = None
+                   population_raster: str | Path | None = None,
+                   fire_model: str = "rothermel",
                    ) -> DependencyResolver:
     """Build the producer graph used by the resolver engine."""
     reg = ProducerRegistry()
@@ -102,6 +109,7 @@ def setup_resolver(*,
         ThermalDriver(kml_path, city=city, band=band,
                       pulse_seconds=pulse_seconds)))
     reg.register(DriverProducer(LandfireDriver(landfire_tif)))
+    reg.register(DriverProducer(LandfireFBFM13Driver(landfire_fbfm13_tif)))
     reg.register(DriverProducer(DEMDriver()))
 
     # ---- Layer 1: satellite history + per-pixel regression -----------------
@@ -165,23 +173,10 @@ def setup_resolver(*,
     reg.register(FuelThresholdProducer())
 
     # ---- Layer 3: fire spread ---------------------------------------------
-    reg.register(FunctionProducer(
-        name="fire_spread",
-        produces=[
-            "ignition_effective_t0", "R_head", "LB",
-            "fireline_intensity_kw_m", "arrival_s", "fire",
-        ],
-        requires=[
-            "fbfm40", "dem", "slope_deg", "aspect_deg",
-            "burnable", "thermal_fluence", "lfmc_pct",
-            "wind_speed_ms", "wind_dir_deg", "rh", "temp_c",
-            "dfm_1hr", "dfm_10hr", "dfm_100hr", "kbdi",
-            "hard_barrier", "urban_mask", "surface_spread_class",
-            "ignition_threshold_mj_m2", "spread_threshold_kw_m",
-            "spread_rate_modifier",
-        ],
-        func=lambda cube, req: list(fire_spread.run(
-            cube, _require_start(req, "fire_spread"), req.n_days).keys())))
+    # Fire models are pluggable adapters. The selected adapter owns its
+    # required/produced variable contract, so the resolver only fetches the
+    # data that fire model actually needs.
+    reg.register(build_fire_model_producer(fire_model))
 
     # ---- optional population layer ----------------------------------------
     if population_raster is not None:
@@ -203,10 +198,7 @@ def run_full_resolved(cube: Cube, day0: datetime, n_days: int,
                       include_population: bool = False,
                       print_plan: bool = True) -> None:
     t_end = day0 + timedelta(days=n_days)
-    targets = [
-        "fire", "arrival_s", "R_head", "LB",
-        "fireline_intensity_kw_m", "ignition_effective_t0",
-    ]
+    targets = list(resolver.registry.get("fire_model").produces)
     if include_population:
         targets.append("population_affected")
     if print_plan:

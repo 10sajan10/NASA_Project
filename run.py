@@ -68,6 +68,11 @@ def _emit_geotiffs(cube: Cube, out_dir: Path) -> None:
             "fireline_intensity_kw_m",
             "R_head", "LB", "arrival_s",
             "population", "population_affected"]
+    seen = set(keys)
+    for meta in cube.catalog.list_variables():
+        if meta["kind"] == "static" and meta["name"] not in seen:
+            keys.append(meta["name"])
+            seen.add(meta["name"])
     for k in keys:
         try:
             arr = cube.read_static(k)
@@ -98,22 +103,44 @@ def _emit_overview(cube: Cube, out_dir: Path) -> None:
         im = ax.imshow(arr, extent=extent, origin="upper", **kw)
         ax.set_title(title); plt.colorbar(im, ax=ax, fraction=0.046)
 
-    show(axes[0, 0], cube.read_static("thermal_fluence"),
-         "Thermal fluence (MJ/m^2)",
-         norm=mc.LogNorm(vmin=0.05, vmax=1.5), cmap="inferno")
-    show(axes[0, 1], cube.read_static("fbfm40"),
-         "FBFM40 fuel code", cmap="terrain")
-    show(axes[0, 2], cube.read_static("dem"), "DEM (m)", cmap="gist_earth")
-    show(axes[1, 0], cube.read_static("ndvi"), "NDVI",
-         cmap="YlGn", vmin=-0.2, vmax=0.9)
-    R = cube.read_static("R_head")
-    show(axes[1, 1], R, "Rothermel R_head (m/min)",
-         norm=mc.LogNorm(vmin=0.01, vmax=max(0.1, float(R.max()))),
-         cmap="magma")
-    arr_s = cube.read_static("arrival_s")
-    arr_h = np.where(arr_s >= 0, arr_s / 3600.0, np.nan)
-    show(axes[1, 2], arr_h, "Arrival time (h)",
-         cmap="rainbow", vmin=0, vmax=float(np.nanpercentile(arr_h, 99)))
+    def show_optional(ax, variable, title, **kw):
+        if not cube.has(variable):
+            ax.set_title(title)
+            ax.text(0.5, 0.5, f"{variable} not produced",
+                    ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return None
+        return show(ax, cube.read_static(variable), title, **kw)
+
+    show_optional(axes[0, 0], "thermal_fluence",
+                  "Thermal fluence (MJ/m^2)",
+                  norm=mc.LogNorm(vmin=0.05, vmax=1.5), cmap="inferno")
+    show_optional(axes[0, 1], "fbfm40", "FBFM40 fuel code", cmap="terrain")
+    show_optional(axes[0, 2], "dem", "DEM (m)", cmap="gist_earth")
+    show_optional(axes[1, 0], "ndvi", "NDVI",
+                  cmap="YlGn", vmin=-0.2, vmax=0.9)
+    if cube.has("R_head"):
+        R = cube.read_static("R_head")
+        show(axes[1, 1], R, "Rothermel R_head (m/min)",
+             norm=mc.LogNorm(vmin=0.01, vmax=max(0.1, float(R.max()))),
+             cmap="magma")
+    else:
+        axes[1, 1].set_title("Spread rate")
+        axes[1, 1].text(0.5, 0.5, "R_head not produced",
+                        ha="center", va="center",
+                        transform=axes[1, 1].transAxes)
+        axes[1, 1].set_axis_off()
+    if cube.has("arrival_s"):
+        arr_s = cube.read_static("arrival_s")
+        arr_h = np.where(arr_s >= 0, arr_s / 3600.0, np.nan)
+        show(axes[1, 2], arr_h, "Arrival time (h)",
+             cmap="rainbow", vmin=0, vmax=float(np.nanpercentile(arr_h, 99)))
+    else:
+        axes[1, 2].set_title("Arrival time (h)")
+        axes[1, 2].text(0.5, 0.5, "arrival_s not produced",
+                        ha="center", va="center",
+                        transform=axes[1, 2].transAxes)
+        axes[1, 2].set_axis_off()
 
     plt.tight_layout()
     plt.savefig(out_dir / "overview.png", dpi=120, bbox_inches="tight")
@@ -123,6 +150,10 @@ def _emit_overview(cube: Cube, out_dir: Path) -> None:
 
 def _fire_reached_edge(cube: Cube, margin_cells: int = 4) -> bool:
     """True if any cell within `margin_cells` of the grid edge has burned."""
+    if not cube.has("arrival_s"):
+        print("[auto-expand] selected fire model did not produce arrival_s; "
+              "skipping edge check")
+        return False
     arr = cube.read_static("arrival_s")
     m = margin_cells
     edge = np.concatenate([
@@ -144,6 +175,7 @@ def _build_resolver(args, scenario_date):
         kml_path=args.kml, city=args.city, band=args.band,
         pulse_seconds=args.pulse_s,
         landfire_tif=args.landfire,
+        landfire_fbfm13_tif=args.landfire_fbfm13,
         scenario_date=scenario_date,
         satellite_source=args.satellite,
         sentinel_max_cloud=args.sentinel_max_cloud,
@@ -160,6 +192,7 @@ def _build_resolver(args, scenario_date):
         era5_day_window=args.era5_day_window,
         regression_n_harmonics=args.harmonics,
         population_raster=args.population_raster,
+        fire_model=args.fire_model,
     )
 
 
@@ -198,9 +231,17 @@ def main() -> None:
                     help="drop fire outputs before running, preserving upstream inputs")
     ap.add_argument("--engine", choices=["resolver", "layered"],
                     default="resolver")
+    ap.add_argument("--fire-model", choices=pipe.available_fire_models(),
+                    default="rothermel",
+                    help="fire-model adapter to use; each adapter declares "
+                         "the cube variables it needs")
 
     ap.add_argument("--landfire",
                     default="LANDFIRE/LF2024_FBFM40_CONUS/Tif/LF2024_FBFM40_CONUS.tif")
+    ap.add_argument("--landfire-fbfm13",
+                    default="LANDFIRE/LF2024_FBFM13_CONUS/Tif/LF2024_FBFM13_CONUS.tif",
+                    help="LANDFIRE FBFM13 raster used by WRF-Fire-style "
+                         "adapters that request nfuel_cat")
 
     ap.add_argument("--satellite", choices=["landsat", "sentinel"],
                     default="landsat")
@@ -238,7 +279,8 @@ def main() -> None:
         "arguments: "
         f"city={args.city!r}, scenario_date={args.scenario_date}, "
         f"days={args.days}, engine={args.engine}, satellite={args.satellite}, "
-        f"weather={args.weather}, root={args.root!r}")
+        f"weather={args.weather}, fire_model={args.fire_model}, "
+        f"root={args.root!r}")
 
     if args.from_snapshot:
         with run_logger.stage("restore cube snapshot"):
@@ -250,7 +292,10 @@ def main() -> None:
 
     if args.recompute_fire:
         with run_logger.stage("drop fire outputs"):
-            removed = drop_cube_variables(args.root, FIRE_OUTPUT_VARIABLES)
+            fire_outputs = sorted(
+                set(FIRE_OUTPUT_VARIABLES)
+                | set(pipe.fire_model_outputs(args.fire_model)))
+            removed = drop_cube_variables(args.root, fire_outputs)
             if removed:
                 print(f"[snapshot] dropped fire outputs: {', '.join(removed)}")
             else:
