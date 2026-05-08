@@ -35,6 +35,13 @@ from .schema import (
     register_migration,
 )
 from .checkpoint import CheckpointStore
+from .datasource import (
+    DataAsset,
+    DataQuery,
+    DataSource,
+    DataSourceRegistry,
+    LocalRasterSource,
+)
 from .config import load_config, merge_overrides
 from .contract_test import (
     FakeCube,
@@ -85,6 +92,12 @@ __all__ = [
     "get_schema_version",
     "register_migration",
     "CheckpointStore",
+    # data sources
+    "DataAsset",
+    "DataQuery",
+    "DataSource",
+    "DataSourceRegistry",
+    "LocalRasterSource",
     # config
     "load_config",
     "merge_overrides",
