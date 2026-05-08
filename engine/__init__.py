@@ -28,6 +28,12 @@ from .backends import (
 )
 from .spill import spill_array, workspace
 from .manifest import RunManifest
+from .schema import (
+    CURRENT_SCHEMA_VERSION,
+    ensure_schema,
+    get_schema_version,
+    register_migration,
+)
 from .config import load_config, merge_overrides
 from .contract_test import (
     FakeCube,
@@ -71,8 +77,12 @@ __all__ = [
     # spill
     "spill_array",
     "workspace",
-    # manifest
+    # manifest + schema
     "RunManifest",
+    "CURRENT_SCHEMA_VERSION",
+    "ensure_schema",
+    "get_schema_version",
+    "register_migration",
     # config
     "load_config",
     "merge_overrides",

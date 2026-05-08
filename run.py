@@ -34,6 +34,8 @@ from cube.snapshot import (
     save_snapshot,
 )
 from drivers.kml import load_city_damage
+from engine import RunManifest
+from engine.schema import CURRENT_SCHEMA_VERSION, ensure_schema
 from run_logging import start_run_epoch_log
 
 
@@ -352,51 +354,86 @@ def main() -> None:
             cube = Cube(args.root, grid)
             cube.catalog.save_scenario(name=args.city, grid=grid,
                                        scenario_date=scenario_date)
+            ensure_schema(cube.catalog.path,
+                          target=CURRENT_SCHEMA_VERSION)
+            print(f"[cube] schema_version={CURRENT_SCHEMA_VERSION}")
+
+        with run_logger.stage(f"iteration {iteration}: open run manifest"):
+            manifest = RunManifest.create(
+                cube.catalog.path, vars(args),
+                git_root=Path(__file__).resolve().parent)
+            for role, path in (("kml", args.kml),
+                               ("landfire_fbfm40", args.landfire),
+                               ("landfire_fbfm13", args.landfire_fbfm13),
+                               ("population", args.population_raster)):
+                if path:
+                    manifest.record_input(role, path)
+            print(f"[manifest] run_id={manifest.run_id} "
+                  f"config_hash={manifest.summary().get('config_hash', '')[:12]}")
 
         stage_label = (f"run {args.engine} engine "
                        f"[{args.orchestrator}"
                        + (f"/{args.engine_backend}" if args.orchestrator == "engine"
                           else "") + "]")
-        with run_logger.stage(f"iteration {iteration}: {stage_label}"):
-            if args.engine == "resolver":
-                resolver = _build_resolver(args, scenario_date)
-                if args.orchestrator == "engine":
-                    backend_kwargs = ({"max_workers": args.engine_workers}
-                                      if args.engine_backend
-                                      in ("thread", "process")
-                                      and args.engine_workers else {})
-                    pipe.run_full_via_engine(
-                        cube, day0=scenario_date, n_days=args.days,
-                        resolver=resolver,
-                        backend_mode=args.engine_backend,
-                        backend_kwargs=backend_kwargs,
-                        include_population=args.population_raster is not None,
-                        print_plan=not args.no_plan)
+        run_status = "ok"
+        run_notes = ""
+        try:
+            with run_logger.stage(f"iteration {iteration}: {stage_label}"):
+                if args.engine == "resolver":
+                    resolver = _build_resolver(args, scenario_date)
+                    if args.orchestrator == "engine":
+                        backend_kwargs = ({"max_workers": args.engine_workers}
+                                          if args.engine_backend
+                                          in ("thread", "process")
+                                          and args.engine_workers else {})
+                        pipe.run_full_via_engine(
+                            cube, day0=scenario_date, n_days=args.days,
+                            resolver=resolver,
+                            backend_mode=args.engine_backend,
+                            backend_kwargs=backend_kwargs,
+                            include_population=args.population_raster is not None,
+                            print_plan=not args.no_plan)
+                    else:
+                        pipe.run_full_resolved(
+                            cube, day0=scenario_date, n_days=args.days,
+                            resolver=resolver,
+                            include_population=args.population_raster is not None,
+                            print_plan=not args.no_plan)
                 else:
-                    pipe.run_full_resolved(
-                        cube, day0=scenario_date, n_days=args.days,
-                        resolver=resolver,
-                        include_population=args.population_raster is not None,
-                        print_plan=not args.no_plan)
-            else:
-                synthetic_kwargs = {"temp_c": args.syn_temp_c,
-                                    "rh_pct": args.syn_rh_pct,
-                                    "wind_ms": args.syn_wind_ms,
-                                    "daily_precip_mm": args.syn_precip_mm}
-                pipe.setup_drivers(
-                    kml_path=args.kml, city=args.city, band=args.band,
-                    pulse_seconds=args.pulse_s,
-                    landfire_tif=args.landfire,
-                    scenario_date=scenario_date,
-                    sentinel_max_cloud=args.sentinel_max_cloud,
-                    sentinel_max_scenes=args.sentinel_max_scenes,
-                    cmip_model=args.cmip_model, cmip_scenario=args.cmip_scenario,
-                    wind_dir_deg=args.wind_dir_deg,
-                    weather_source=args.weather,
-                    synthetic_kwargs=synthetic_kwargs,
-                )
-                pipe.run_full(cube, day0=scenario_date, n_days=args.days,
-                              weather_source=args.weather)
+                    synthetic_kwargs = {"temp_c": args.syn_temp_c,
+                                        "rh_pct": args.syn_rh_pct,
+                                        "wind_ms": args.syn_wind_ms,
+                                        "daily_precip_mm": args.syn_precip_mm}
+                    pipe.setup_drivers(
+                        kml_path=args.kml, city=args.city, band=args.band,
+                        pulse_seconds=args.pulse_s,
+                        landfire_tif=args.landfire,
+                        scenario_date=scenario_date,
+                        sentinel_max_cloud=args.sentinel_max_cloud,
+                        sentinel_max_scenes=args.sentinel_max_scenes,
+                        cmip_model=args.cmip_model, cmip_scenario=args.cmip_scenario,
+                        wind_dir_deg=args.wind_dir_deg,
+                        weather_source=args.weather,
+                        synthetic_kwargs=synthetic_kwargs,
+                    )
+                    pipe.run_full(cube, day0=scenario_date, n_days=args.days,
+                                  weather_source=args.weather)
+        except BaseException as e:
+            run_status = "error"
+            run_notes = f"{type(e).__name__}: {e}"
+            manifest.finalize(status=run_status, notes=run_notes)
+            raise
+        finally:
+            if run_status == "ok":
+                # Record produced variables (best-effort).
+                try:
+                    for meta in cube.list_variables():
+                        manifest.record_output(
+                            meta["name"], version=0,
+                            producer=meta.get("producer", "") or "")
+                except Exception:
+                    pass
+                manifest.finalize(status="ok")
 
         if args.auto_expand:
             with run_logger.stage(f"iteration {iteration}: auto-expand check"):
