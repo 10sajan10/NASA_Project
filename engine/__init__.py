@@ -36,8 +36,12 @@ from .contract_test import (
     check_io_isolation,
     check_producer,
 )
+from .registry import ProducerRegistry, producer_produces, producer_requires
+from .pipeline import Pipeline, PipelineNode, Trigger, parallel
+from .scheduler import PipelineRunner, RunResult, StepResult
 
 __all__ = [
+    # contracts
     "CostHint",
     "MergePolicy",
     "ProducerCapabilities",
@@ -45,20 +49,36 @@ __all__ = [
     "Request",
     "TileSpec",
     "VarSpec",
+    # backends
     "Backend",
     "DaskBackend",
     "ProcessBackend",
     "SerialBackend",
     "ThreadBackend",
     "make_backend",
+    # spill
     "spill_array",
     "workspace",
+    # manifest
     "RunManifest",
+    # config
     "load_config",
     "merge_overrides",
+    # contract tests
     "FakeCube",
     "check_capabilities",
     "check_idempotency",
     "check_io_isolation",
     "check_producer",
+    # registry + pipeline + runner
+    "ProducerRegistry",
+    "producer_produces",
+    "producer_requires",
+    "Pipeline",
+    "PipelineNode",
+    "Trigger",
+    "parallel",
+    "PipelineRunner",
+    "RunResult",
+    "StepResult",
 ]
