@@ -31,6 +31,7 @@ from typing import Any, Optional
 
 from .backends import Backend, SerialBackend
 from .contracts import Request
+from .cube_ref import CubeRef, is_cross_process_backend
 from .pipeline import Pipeline, Trigger
 from .registry import ProducerRegistry, producer_produces
 
@@ -78,9 +79,16 @@ def _coerce_produced(out: Any) -> dict[str, int]:
     return {}
 
 
-def _run_one(producer, cube, request: Request) -> dict[str, int]:
-    """Worker entry: call the producer, normalize its return shape."""
-    return _coerce_produced(producer.run(cube, request))
+def _run_one(producer, cube_or_ref, request: Request) -> dict[str, int]:
+    """Worker entry: call the producer, normalize its return shape.
+
+    Accepts either a live Cube (in-process backends) or a CubeRef
+    (cross-process backends — worker reopens the cube here). Either way
+    the producer sees a real cube object."""
+    if isinstance(cube_or_ref, CubeRef):
+        with cube_or_ref.opened() as cube:
+            return _coerce_produced(producer.run(cube, request))
+    return _coerce_produced(producer.run(cube_or_ref, request))
 
 
 def _producer_already_satisfied(producer, cube, request: Request) -> bool:
@@ -273,6 +281,12 @@ class PipelineRunner:
                 continue
             to_submit.append(name)
 
+        # Cross-process backends get a picklable CubeRef instead of the
+        # live Cube object (DuckDB connections don't pickle reliably).
+        worker_cube = (CubeRef.from_cube(cube)
+                       if is_cross_process_backend(self.backend)
+                       else cube)
+
         # Parallel via backend.submit so we collect per-task timing/errors.
         futs: list[tuple[str, Future, float]] = []
         for name in to_submit:
@@ -281,7 +295,7 @@ class PipelineRunner:
                 print(f"[step] {name}  submit ({self.backend.name})")
             t0 = time.monotonic()
             futs.append((name, self.backend.submit(
-                _run_one, producer, cube, request), t0))
+                _run_one, producer, worker_cube, request), t0))
 
         for name, fut, t0 in futs:
             try:

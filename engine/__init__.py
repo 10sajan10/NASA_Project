@@ -42,6 +42,7 @@ from .registry import (
     producer_requires,
     to_engine_registry,
 )
+from .cube_ref import CubeRef, is_cross_process_backend
 from .pipeline import Pipeline, PipelineNode, Trigger, parallel
 from .scheduler import PipelineRunner, RunResult, StepResult
 
@@ -87,4 +88,7 @@ __all__ = [
     "PipelineRunner",
     "RunResult",
     "StepResult",
+    # cube cross-process
+    "CubeRef",
+    "is_cross_process_backend",
 ]
