@@ -164,8 +164,12 @@ class ProducerV2(ABC):
 
     def update(self, cube, outputs: dict[str, Any],
                request: Request) -> dict[str, int]:
-        """Write outputs back through the cube. Default uses static/3D
-        bulk writes; producers with custom write paths override this."""
+        """Write outputs back through the cube, honoring each VarSpec's
+        declared merge_policy. Producers with custom write paths override
+        this."""
+        # Local import: avoids a circular reference (merge -> contracts).
+        from .merge import merge as _merge
+
         produced_names = {v.name for v in self.produces}
         missing = produced_names - set(outputs.keys())
         if missing:
@@ -181,7 +185,11 @@ class ProducerV2(ABC):
         versions: dict[str, int] = {}
         for spec in self.produces:
             arr = outputs[spec.name]
+            policy = spec.merge_policy
             if spec.kind == "static":
+                if (policy is not MergePolicy.LAST_WRITER
+                        and cube.has(spec.name)):
+                    arr = _merge(cube.read_static(spec.name), arr, policy)
                 cube.write_static(
                     spec.name, arr,
                     source=f"producer:{self.name}",
@@ -191,6 +199,10 @@ class ProducerV2(ABC):
                     description=spec.description)
             elif spec.kind == "time":
                 ts = request.context.get("t_axis") or []
+                if (policy is not MergePolicy.LAST_WRITER
+                        and cube.has(spec.name)):
+                    _, existing = cube.read_3d(spec.name)
+                    arr = _merge(existing, arr, policy)
                 cube.write_3d(
                     spec.name, ts, arr,
                     source=f"producer:{self.name}",

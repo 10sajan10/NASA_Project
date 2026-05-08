@@ -44,6 +44,11 @@ from .registry import (
 )
 from .cube_ref import CubeRef, is_cross_process_backend
 from .tiled import TiledProducer, is_tile_aware
+from .merge import (
+    merge as merge_arrays,
+    write_chunk_static_with_policy,
+    write_chunk_time_with_policy,
+)
 from .pipeline import Pipeline, PipelineNode, Trigger, parallel
 from .scheduler import PipelineRunner, RunResult, StepResult
 
@@ -95,4 +100,8 @@ __all__ = [
     # tile-level fan-out
     "TiledProducer",
     "is_tile_aware",
+    # merge policies
+    "merge_arrays",
+    "write_chunk_static_with_policy",
+    "write_chunk_time_with_policy",
 ]
