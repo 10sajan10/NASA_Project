@@ -34,6 +34,7 @@ from .schema import (
     get_schema_version,
     register_migration,
 )
+from .checkpoint import CheckpointStore
 from .config import load_config, merge_overrides
 from .contract_test import (
     FakeCube,
@@ -77,12 +78,13 @@ __all__ = [
     # spill
     "spill_array",
     "workspace",
-    # manifest + schema
+    # manifest + schema + checkpoint
     "RunManifest",
     "CURRENT_SCHEMA_VERSION",
     "ensure_schema",
     "get_schema_version",
     "register_migration",
+    "CheckpointStore",
     # config
     "load_config",
     "merge_overrides",
