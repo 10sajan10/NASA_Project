@@ -43,6 +43,7 @@ from .registry import (
     to_engine_registry,
 )
 from .cube_ref import CubeRef, is_cross_process_backend
+from .tiled import TiledProducer, is_tile_aware
 from .pipeline import Pipeline, PipelineNode, Trigger, parallel
 from .scheduler import PipelineRunner, RunResult, StepResult
 
@@ -91,4 +92,7 @@ __all__ = [
     # cube cross-process
     "CubeRef",
     "is_cross_process_backend",
+    # tile-level fan-out
+    "TiledProducer",
+    "is_tile_aware",
 ]

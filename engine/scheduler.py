@@ -34,6 +34,7 @@ from .contracts import Request
 from .cube_ref import CubeRef, is_cross_process_backend
 from .pipeline import Pipeline, Trigger
 from .registry import ProducerRegistry, producer_produces
+from .tiled import _run_tile, is_tile_aware
 
 
 # --------------------------------------------------------------- results
@@ -267,7 +268,10 @@ class PipelineRunner:
         if isinstance(self.backend, SerialBackend) or len(names) == 1:
             return [self._run_step(name, cube, request) for name in names]
 
-        # Pre-pass: mark satisfied nodes as skipped without submitting.
+        # Pre-pass: classify nodes into skipped / tile-aware / submit.
+        # Tile-aware producers drive their own backend fan-out (one
+        # producer's tiles in parallel) and run sequentially within the
+        # layer to avoid double-tapping the backend.
         results: list[StepResult] = []
         to_submit: list[str] = []
         for name in names:
@@ -278,6 +282,10 @@ class PipelineRunner:
                     print(f"[step] {name}  skipped (already satisfied)")
                 results.append(StepResult(
                     name=name, status="skipped", elapsed_s=0.0))
+                continue
+            if is_tile_aware(producer):
+                results.append(
+                    self._run_tiled_step(name, producer, cube, request))
                 continue
             to_submit.append(name)
 
@@ -323,6 +331,14 @@ class PipelineRunner:
             if self.verbose:
                 print(f"[step] {name}  skipped (already satisfied)")
             return StepResult(name=name, status="skipped", elapsed_s=0.0)
+
+        # Route tile-aware producers through the tile fan-out path. Tiles
+        # of a single producer get dispatched to the backend in parallel;
+        # producers themselves run one-at-a-time within a layer (already
+        # ordered by the DAG).
+        if is_tile_aware(producer):
+            return self._run_tiled_step(name, producer, cube, request)
+
         if self.verbose:
             print(f"[step] {name}  start")
         t0 = time.monotonic()
@@ -333,6 +349,80 @@ class PipelineRunner:
                 print(f"[step] {name}  ok in {elapsed:.2f}s -> {produced}")
             return StepResult(name=name, status="ok",
                               elapsed_s=elapsed, produced=produced)
+        except BaseException as e:
+            elapsed = time.monotonic() - t0
+            if self.verbose:
+                print(f"[step] {name}  ERROR after {elapsed:.2f}s: {e}")
+            return StepResult(name=name, status="error",
+                              elapsed_s=elapsed,
+                              error=f"{type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    def _run_tiled_step(self, name: str, producer, cube,
+                        request: Request) -> StepResult:
+        """Fan one producer's spatial tiles across the backend.
+
+        The producer's `init` runs in the parent (pre-allocates output
+        Zarrs), each tile is dispatched as an independent backend task
+        that calls `process_tile`, then `finalize` runs in the parent.
+        """
+        if self.verbose:
+            print(f"[step] {name}  start (tile fan-out, "
+                  f"backend={self.backend.name})")
+        t0 = time.monotonic()
+        try:
+            producer.init(cube, request)
+            tiles = list(producer.tile_iter(cube, request))
+            n_tiles = len(tiles)
+            if self.verbose:
+                print(f"[step] {name}  {n_tiles} tiles")
+
+            worker_cube = (CubeRef.from_cube(cube)
+                           if is_cross_process_backend(self.backend)
+                           else cube)
+
+            tile_errors: list[str] = []
+            if isinstance(self.backend, SerialBackend) or n_tiles == 1:
+                for i, tile in enumerate(tiles):
+                    try:
+                        _run_tile(producer, worker_cube, request, tile)
+                    except BaseException as e:
+                        tile_errors.append(
+                            f"tile[{i}] {type(e).__name__}: {e}")
+            else:
+                futs: list[Future] = [
+                    self.backend.submit(
+                        _run_tile, producer, worker_cube, request, tile)
+                    for tile in tiles
+                ]
+                for i, f in enumerate(futs):
+                    try:
+                        f.result()
+                    except BaseException as e:
+                        tile_errors.append(
+                            f"tile[{i}] {type(e).__name__}: {e}")
+
+            if tile_errors:
+                # Don't run finalize if tile errors occurred.
+                err = ("; ".join(tile_errors[:3])
+                       + (f"  (+ {len(tile_errors) - 3} more)"
+                          if len(tile_errors) > 3 else ""))
+                elapsed = time.monotonic() - t0
+                if self.verbose:
+                    print(f"[step] {name}  ERROR after {elapsed:.2f}s "
+                          f"({len(tile_errors)} tile failures)")
+                return StepResult(name=name, status="error",
+                                  elapsed_s=elapsed, error=err)
+
+            produced = producer.finalize(cube, request) or {}
+            elapsed = time.monotonic() - t0
+            if self.verbose:
+                print(f"[step] {name}  ok in {elapsed:.2f}s "
+                      f"({n_tiles} tiles) -> {produced}")
+            return StepResult(name=name, status="ok",
+                              elapsed_s=elapsed,
+                              produced={str(k): int(v)
+                                         for k, v in produced.items()})
         except BaseException as e:
             elapsed = time.monotonic() - t0
             if self.verbose:
