@@ -1,23 +1,20 @@
 """Cross-cube content-addressable cache.
 
-External downloads (Landsat scenes, ARCO-ERA5 chunks, DEM tiles, LANDFIRE
-rasters) shouldn't be re-fetched when a new cube root is created. The
-cube is per-scenario; the cache is per-machine (or per-cluster on shared
-scratch) and survives cube deletion.
+External downloads (any remote raster, archive chunk, tile, or scene)
+shouldn't be re-fetched when a new cube root is created. The cube is
+per-scenario; the cache is per-machine (or per-cluster on shared scratch)
+and survives cube deletion.
 
 Key idea: hash the *query* (source + variable + AOI + time + params) into
 a stable SHA-256 and use it as the filename. Same query -> same key ->
 same file, deterministically, across cubes / users / machines / runs.
 
-Layout:
+Layout (one bucket per source name, source names are caller-defined):
 
     $CUBE_CACHE/
-        landsat/
+        <source_name>/
             <hash>.payload         # raw bytes
             <hash>.meta.json       # query, fetched_at, size, content_type
-        arco_era5/
-            <hash>.payload
-            <hash>.meta.json
         ...
 
 Concurrency safe: writes go to `<hash>.tmp` and atomically rename. If two

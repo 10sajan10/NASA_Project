@@ -6,18 +6,18 @@ ordering constraints: edge `u -> v` means `v` runs after `u` completes.
 Three ways to build a pipeline:
 
     # 1. Chain (sequential, with optional parallel layers as nested seqs)
-    Pipeline.chain(["thermal", "landfire", ("ndvi", "weather"), "fire"])
+    Pipeline.chain(["step_a", "step_b", ("step_c1", "step_c2"), "step_d"])
 
     # 2. Explicit DAG
     Pipeline().add("a").add("b", after="a").add("c", after=["a"])
 
     # 3. Inferred from a registry (target-driven, like the legacy resolver)
-    Pipeline.from_targets(["arrival_s"], registry=reg)
+    Pipeline.from_targets(["some_output_var"], registry=reg)
 
 Triggers attach event-driven follow-up steps:
 
-    pipeline.on_complete("fire_spread", run="auto_expand",
-                         when=lambda cube: edge_reached(cube))
+    pipeline.on_complete("some_producer", run="follow_up_producer",
+                         when=lambda cube: state_predicate(cube))
 
 The pipeline holds *names*, not producer objects. A `ProducerRegistry`
 resolves names to runnable producers at execution time, so the same

@@ -114,9 +114,9 @@ def restore_snapshot(snapshot: str | Path, root: str | Path, *,
 def drop_cube_variables(root: str | Path, variables: Iterable[str]) -> list[str]:
     """Remove variables from the cube root and catalog.
 
-    This is useful for rerunning downstream models from a restored snapshot:
-    keep expensive inputs such as NDVI/NDWI/weather, drop fire outputs, and let
-    the resolver recompute only what is missing.
+    This is useful for re-running downstream producers from a restored
+    snapshot: keep expensive inputs, drop the specific outputs you want to
+    recompute, and let the resolver / engine fill in only what is missing.
     """
     root = Path(root)
     removed: list[str] = []

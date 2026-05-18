@@ -1,8 +1,9 @@
 """Checkpoint/resume for iterative producers.
 
-Producers that integrate forward in time (KBDI, fire spread, anything with
-internal state) can periodically save their state and resume from the last
-checkpoint after a crash or interrupt — instead of restarting from scratch.
+Any producer that maintains forward state across steps (time-integrators,
+iterative solvers, accumulators) can periodically save state and resume
+from the last checkpoint after a crash or interrupt — instead of restarting
+from scratch.
 
 Checkpoints live as a BLOB column in the cube's DuckDB so the cube artifact
 stays self-contained: snapshot the cube, you snapshot the checkpoints too.

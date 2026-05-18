@@ -18,29 +18,29 @@ from engine.cache import ContentCache, default_cache_root
 # ----------------------------------------------------- keys
 def test_key_is_deterministic(tmp_path):
     c = ContentCache(tmp_path)
-    k1 = c.key("landsat", scene="L8_1234", asset="red")
-    k2 = c.key("landsat", scene="L8_1234", asset="red")
+    k1 = c.key("remote_a", scene="asset_1234", asset="red")
+    k2 = c.key("remote_a", scene="asset_1234", asset="red")
     assert k1 == k2 and len(k1) == 64  # SHA-256 hex
 
 
 def test_key_order_independent(tmp_path):
     c = ContentCache(tmp_path)
-    a = c.key("landsat", scene="X", asset="red")
-    b = c.key("landsat", asset="red", scene="X")
+    a = c.key("remote_a", scene="X", asset="red")
+    b = c.key("remote_a", asset="red", scene="X")
     assert a == b
 
 
 def test_key_distinguishes_params(tmp_path):
     c = ContentCache(tmp_path)
-    a = c.key("landsat", scene="X", asset="red")
-    b = c.key("landsat", scene="X", asset="nir")
-    c2 = c.key("sentinel", scene="X", asset="red")
+    a = c.key("remote_a", scene="X", asset="red")
+    b = c.key("remote_a", scene="X", asset="nir")
+    c2 = c.key("remote_b", scene="X", asset="red")
     assert len({a, b, c2}) == 3
 
 
 def test_key_handles_nested_params(tmp_path):
     c = ContentCache(tmp_path)
-    k = c.key("landsat",
+    k = c.key("remote_a",
               bbox=(-97.0, 32.0, -96.0, 33.0),
               t_range=("2024-09-01", "2024-09-15"))
     assert isinstance(k, str) and len(k) == 64
@@ -49,22 +49,22 @@ def test_key_handles_nested_params(tmp_path):
 # ----------------------------------------------------- get / put
 def test_missing_key_returns_none(tmp_path):
     c = ContentCache(tmp_path)
-    assert c.get_path("landsat", "doesnotexist") is None
-    assert c.has("landsat", "doesnotexist") is False
-    assert c.metadata("landsat", "doesnotexist") is None
+    assert c.get_path("remote_a", "doesnotexist") is None
+    assert c.has("remote_a", "doesnotexist") is False
+    assert c.metadata("remote_a", "doesnotexist") is None
 
 
 def test_put_file_round_trip(tmp_path):
     c = ContentCache(tmp_path)
     src = tmp_path / "raw.tif"
     src.write_bytes(b"GeoTIFF placeholder")
-    key = c.key("landsat", scene="X")
-    path = c.put_file("landsat", key, src,
+    key = c.key("remote_a", scene="X")
+    path = c.put_file("remote_a", key, src,
                       metadata={"scene_id": "X"})
     assert path.exists()
-    assert c.has("landsat", key)
-    assert c.get_path("landsat", key) == path
-    meta = c.metadata("landsat", key)
+    assert c.has("remote_a", key)
+    assert c.get_path("remote_a", key) == path
+    meta = c.metadata("remote_a", key)
     assert meta["scene_id"] == "X"
     assert meta["size"] == len(b"GeoTIFF placeholder")
 
@@ -82,10 +82,10 @@ def test_put_is_idempotent_does_not_overwrite(tmp_path):
     c = ContentCache(tmp_path)
     src = tmp_path / "raw.tif"
     src.write_bytes(b"first")
-    key = c.key("landsat", scene="X")
-    p1 = c.put_file("landsat", key, src)
+    key = c.key("remote_a", scene="X")
+    p1 = c.put_file("remote_a", key, src)
     src.write_bytes(b"second")
-    p2 = c.put_file("landsat", key, src)
+    p2 = c.put_file("remote_a", key, src)
     assert p1 == p2
     assert p1.read_bytes() == b"first"
 
@@ -112,20 +112,20 @@ def test_cross_cube_reuse_pattern(tmp_path):
 
     # Cube A run: cache miss, populate.
     cache_a = ContentCache(cache_dir)
-    key = cache_a.key("landsat", scene="L8_001", bbox=(-97, 32, -96, 33))
-    assert cache_a.get_path("landsat", key) is None
+    key = cache_a.key("remote_a", scene="asset_001", bbox=(-97, 32, -96, 33))
+    assert cache_a.get_path("remote_a", key) is None
     src = tmp_path / "downloaded.tif"
-    src.write_bytes(b"raw_landsat_bytes")
-    cache_a.put_file("landsat", key, src,
-                     metadata={"scene_id": "L8_001"})
+    src.write_bytes(b"raw_remote_bytes")
+    cache_a.put_file("remote_a", key, src,
+                     metadata={"scene_id": "asset_001"})
 
     # Cube B run: independent instance, same cache dir, key matches.
     cache_b = ContentCache(cache_dir)
-    key_b = cache_b.key("landsat", scene="L8_001", bbox=(-97, 32, -96, 33))
+    key_b = cache_b.key("remote_a", scene="asset_001", bbox=(-97, 32, -96, 33))
     assert key == key_b
-    p = cache_b.get_path("landsat", key_b)
+    p = cache_b.get_path("remote_a", key_b)
     assert p is not None
-    assert p.read_bytes() == b"raw_landsat_bytes"
+    assert p.read_bytes() == b"raw_remote_bytes"
 
 
 def test_default_cache_root_honors_cube_cache_env(monkeypatch, tmp_path):

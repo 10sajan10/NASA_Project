@@ -6,9 +6,10 @@ Two write APIs are provided:
     pre-allocate a chunked Zarr and stream the array in spatial / temporal
     tiles. Memory scales with the chunk size, not the full grid.
 
-Producers that materialise large arrays (ERA5 interp, climate regression,
-hourly dead-fuel, KBDI, fire frames) use the chunked path so a 1000 x 1000
-grid x 720 hourly steps no longer needs to fit in RAM.
+Any producer that materialises large arrays should use the chunked path
+so a 1000 x 1000 grid x N time steps no longer needs to fit in RAM. The
+cube doesn't care what variables are stored or which model produced them;
+that's the orchestration engine's concern.
 """
 from __future__ import annotations
 import shutil

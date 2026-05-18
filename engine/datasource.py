@@ -1,31 +1,29 @@
 """Data discovery + access abstraction.
 
-Today every driver hard-codes its source: LANDFIRE local path,
-ARCO-ERA5 GCS URI, Planetary Computer STAC for Landsat/Sentinel, USGS
-3DEP for DEM. Eleven drivers, eleven access patterns. This module
-introduces a unified discovery layer:
+Producers shouldn't hard-code where their inputs live. This module gives
+the engine a unified way to ask:
 
-    query = DataQuery("ndvi", bbox=..., t_start=..., t_end=...)
-    asset = registry.first_hit(query)              # search
-    arr   = source.fetch(asset, grid)              # access
+    query = DataQuery(variable, bbox=..., t_start=..., t_end=...)
+    asset = registry.first_hit(query)              # discovery
+    arr   = source.fetch(asset, grid)              # access (returns ndarray
+                                                   # reprojected onto grid)
 
 A `DataSource` answers two questions: does it cover a query, and what
-assets satisfy it. A `DataSourceRegistry` ranks sources per variable
-so the engine can fall back across providers.
+assets satisfy it. A `DataSourceRegistry` ranks sources per variable so
+the engine can fall back across providers.
 
-Phase F deliverables (this file):
+Today's deliverables:
   * DataQuery / DataAsset value types
   * DataSource abstract base
   * DataSourceRegistry with priority + per-variable filters
-  * LocalRasterSource backend (file-on-disk, GeoTIFF/etc) — proven
-    against the LANDFIRE workflow
+  * LocalRasterSource backend (file-on-disk, any rasterio-readable format)
 
-Future Phase F follow-ups (not yet built):
-  * StacSource (Microsoft Planetary Computer, Earth Search)
-  * GcsZarrSource (ARCO-ERA5)
-  * Discovery-driven producer wiring (today producers still wire their
-    own inputs; the next step is a generic producer that consumes
-    `requires=["ndvi"]` and routes through the registry)
+Follow-on backends a concrete deployment can add:
+  * STAC-based sources (Microsoft Planetary Computer, Earth Search, etc.)
+  * Cloud Zarr-archive sources (S3 / GCS hosted analysis-ready cubes)
+  * Discovery-driven producer wiring (a generic producer that consumes
+    `requires=[variable_name]` and routes through the registry instead
+    of being hand-wired to one specific upstream driver)
 """
 from __future__ import annotations
 
@@ -159,8 +157,9 @@ class LocalRasterSource(DataSource):
     Search ignores AOI / time and returns the configured asset (or none);
     fetch reprojects onto the target grid via rasterio.
 
-    Useful for static layers (LANDFIRE FBFM40/FBFM13, DEM cache, urban
-    masks). For time-varying or AOI-tiled archives use a richer source.
+    Useful for any static layer that's already a single raster on disk
+    (fuels, terrain, masks, classifications). For time-varying or
+    AOI-tiled archives use a richer source.
     """
 
     def __init__(self, name: str, paths: dict[str, str | Path]):
