@@ -234,10 +234,14 @@ def main() -> None:
     ap.add_argument("--engine", choices=["resolver", "layered"],
                     default="resolver")
     ap.add_argument("--orchestrator", choices=["legacy", "engine"],
-                    default="legacy",
-                    help="legacy = fusion DependencyResolver (proven path); "
-                         "engine = new model-agnostic PipelineRunner over a "
-                         "swappable Backend (serial/thread/process/dask/slurm)")
+                    default="engine",
+                    help="engine (default) = model-agnostic PipelineRunner "
+                         "over a swappable Backend (serial/thread/process/"
+                         "dask/slurm) with cube.satisfies-aware skip, "
+                         "merge-policy enforcement, retries, tile metrics, "
+                         "and dirty propagation. legacy = deprecated fusion "
+                         "DependencyResolver path, kept for emergency "
+                         "fallback.")
     ap.add_argument("--engine-backend",
                     choices=["serial", "thread", "process", "dask", "slurm"],
                     default="serial",
@@ -288,6 +292,12 @@ def main() -> None:
 
     run_logger = start_run_epoch_log(args.log_file)
     atexit.register(run_logger.close)
+    if args.orchestrator == "legacy":
+        run_logger.log(
+            "WARNING: --orchestrator=legacy is deprecated. The engine "
+            "orchestrator is the default (model-agnostic, scales, retries, "
+            "lineage). Drop --orchestrator=legacy to use the recommended "
+            "path. Legacy will be removed in a future release.")
     run_logger.log(
         "arguments: "
         f"city={args.city!r}, scenario_date={args.scenario_date}, "
