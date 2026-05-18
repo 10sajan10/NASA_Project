@@ -393,6 +393,15 @@ class Cube:
     def has(self, variable: str, t: Optional[datetime] = None) -> bool:
         return self.catalog.has(variable, t)
 
+    def is_output_stale(self, output_var: str,
+                         required_vars) -> bool:
+        """True if any required input has been written more recently than
+        `output_var`. Used by the engine scheduler to invalidate
+        cached outputs whose upstream variables have been re-fetched."""
+        names = [r if isinstance(r, str) else str(getattr(r, "name", r))
+                 for r in (required_vars or ())]
+        return self.catalog.is_output_stale(output_var, names)
+
     def satisfies(self, spec, request=None) -> bool:
         """Return True if this cube already satisfies a variable request.
 

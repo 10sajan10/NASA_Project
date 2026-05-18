@@ -134,6 +134,37 @@ class Catalog:
         keys = ["variable", "t", "source", "native_res_m", "version", "fetched_at"]
         return [dict(zip(keys, r)) for r in rs]
 
+    def is_output_stale(self, output_var: str,
+                         required_vars: list[str]) -> bool:
+        """True if any required input has been written more recently than
+        `output_var`. Lightweight dirty-propagation check; no explicit
+        provenance table needed — leverages the existing tiles.fetched_at
+        timestamp.
+
+        Conservative on edges:
+          * If `output_var` has no tiles, returns False (the standard
+            'absent -> not satisfied' check kicks in higher up).
+          * If `required_vars` is empty, returns False.
+          * If a required input is missing, it can't have bumped, so
+            returns False.
+        """
+        if not required_vars:
+            return False
+        out_row = self.con.execute(
+            "SELECT MAX(fetched_at) FROM tiles WHERE variable = ?",
+            [output_var]).fetchone()
+        if not out_row or out_row[0] is None:
+            return False
+        out_t = out_row[0]
+        placeholders = ",".join("?" * len(required_vars))
+        in_row = self.con.execute(
+            f"SELECT MAX(fetched_at) FROM tiles "
+            f"WHERE variable IN ({placeholders})",
+            list(required_vars)).fetchone()
+        if not in_row or in_row[0] is None:
+            return False
+        return in_row[0] > out_t
+
     def save_scenario(self, name: str, grid, scenario_date: Optional[datetime]) -> None:
         self.con.execute(
             "INSERT OR REPLACE INTO scenarios "

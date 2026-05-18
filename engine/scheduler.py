@@ -33,7 +33,7 @@ from .backends import Backend, SerialBackend
 from .contracts import Request
 from .cube_ref import CubeRef, is_cross_process_backend
 from .pipeline import Pipeline, Trigger
-from .registry import ProducerRegistry, producer_produces
+from .registry import ProducerRegistry, producer_produces, producer_requires
 from .retry import RetryPolicy, attempt_with_retry
 from .tiled import _run_tile, is_tile_aware
 
@@ -147,34 +147,52 @@ def _producer_already_satisfied(producer, cube, request: Request) -> bool:
     if not produces:
         return False
 
+    # Cache-hit decision -----------------------------------------------
     method = getattr(producer, "is_satisfied", None)
+    satisfied = False
     if method is not None:
         try:
-            # Try the per-variable signature first (legacy).
-            return all(method(cube, var, request) for var in produces)
+            # Per-variable signature (legacy fusion).
+            satisfied = all(method(cube, var, request) for var in produces)
         except TypeError:
             try:
-                # Producer-level signature.
-                return bool(method(cube, request))
+                satisfied = bool(method(cube, request))
             except Exception:
-                return False
+                satisfied = False
         except Exception:
-            return False
-
-    # Generic ProducerV2 path: the cube owns static/time/resolution coverage.
-    # If the producer declared raw VarSpecs, pass them through. If it declared
-    # plain strings, pass the name and let the cube infer the stored kind.
-    if hasattr(cube, "satisfies"):
+            satisfied = False
+    elif hasattr(cube, "satisfies"):
         specs = raw_produces if raw_produces else produces
         try:
-            return all(cube.satisfies(spec, request) for spec in specs)
+            satisfied = all(cube.satisfies(spec, request) for spec in specs)
         except Exception:
-            return False
+            satisfied = False
+    else:
+        try:
+            satisfied = all(cube.has(var) for var in produces)
+        except Exception:
+            satisfied = False
 
-    try:
-        return all(cube.has(var) for var in produces)
-    except Exception:
+    if not satisfied:
         return False
+
+    # Dirty propagation: even if the cube has the output, treat it as
+    # stale (not satisfied) when any required input has been written
+    # AFTER the cached output. This catches the "user re-fetched
+    # upstream data; downstream caches are now wrong" case.
+    if hasattr(cube, "is_output_stale"):
+        requires_names = producer_requires(producer)
+        if requires_names:
+            try:
+                for out in produces:
+                    if cube.is_output_stale(out, requires_names):
+                        return False
+            except Exception:
+                # Conservative: if the staleness check itself fails,
+                # don't skip — re-run.
+                return False
+
+    return True
 
 
 # ---------------------------------------------------------- the runner
