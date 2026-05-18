@@ -105,6 +105,23 @@ class Catalog:
         keys = ["name", "kind", "units", "dtype", "description", "producer"]
         return [dict(zip(keys, r)) for r in rs]
 
+    def get_variable(self, name: str) -> Optional[dict]:
+        row = self.con.execute(
+            "SELECT name, kind, units, dtype, description, producer "
+            "FROM variables WHERE name=?", [name]).fetchone()
+        if row is None:
+            return None
+        keys = ["name", "kind", "units", "dtype", "description", "producer"]
+        return dict(zip(keys, row))
+
+    def native_resolution_m(self, variable: str) -> Optional[float]:
+        row = self.con.execute(
+            "SELECT MAX(native_res_m) FROM tiles WHERE variable=?",
+            [variable]).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return float(row[0])
+
     def list_tiles(self, variable: Optional[str] = None) -> list[dict]:
         sql = ("SELECT variable, t, source, native_res_m, version, fetched_at "
                "FROM tiles ")

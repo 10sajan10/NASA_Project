@@ -12,7 +12,7 @@ grid x 720 hourly steps no longer needs to fit in RAM.
 """
 from __future__ import annotations
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -310,6 +310,59 @@ class Cube:
     # ------------------------------------------------------------------
     def has(self, variable: str, t: Optional[datetime] = None) -> bool:
         return self.catalog.has(variable, t)
+
+    def satisfies(self, spec, request=None) -> bool:
+        """Return True if this cube already satisfies a variable request.
+
+        `spec` may be a variable name or any VarSpec-like object with
+        `name`, `kind`, and optional `max_native_res_m` attributes. The cube
+        owns the cache/reuse decision: producers and schedulers can ask this
+        one question instead of reimplementing static/time/resolution checks.
+        """
+        if isinstance(spec, str):
+            name = spec
+            kind = None
+            max_native_res_m = None
+        else:
+            name = str(getattr(spec, "name"))
+            kind = getattr(spec, "kind", None)
+            max_native_res_m = getattr(spec, "max_native_res_m", None)
+
+        meta = self.catalog.get_variable(name)
+        if meta is None:
+            return False
+        stored_kind = meta.get("kind")
+        effective_kind = kind or stored_kind
+        if kind is not None and stored_kind != kind:
+            return False
+
+        if max_native_res_m is not None:
+            native = self.catalog.native_resolution_m(name)
+            if native is None or native > float(max_native_res_m):
+                return False
+
+        if effective_kind == "static":
+            return self.catalog.has(name)
+
+        if effective_kind == "time":
+            times = self.catalog.list_times(name)
+            if not times:
+                return False
+            t_start = getattr(request, "t_start", None)
+            t_end = getattr(request, "t_end", None)
+            if t_start is None:
+                return True
+            if t_end is None:
+                return self.catalog.has(name, t_start)
+            # Treat t_end as exclusive. Cadence is producer-owned metadata, so
+            # daily and hourly products both satisfy the same date window when
+            # they cover the requested start and final requested date.
+            last_needed = t_end - timedelta(microseconds=1)
+            return (min(times) <= t_start
+                    and max(times).date() >= last_needed.date())
+
+        # Unknown kinds are intentionally not guessed.
+        return False
 
     def list_variables(self) -> list[dict]:
         return self.catalog.list_variables()

@@ -99,30 +99,45 @@ def _producer_already_satisfied(producer, cube, request: Request) -> bool:
 
       * legacy fusion: `is_satisfied(cube, variable, request)` - per-variable
       * engine v2 (future): `is_satisfied(cube, request)` - producer-level
+      * cube-native: `cube.satisfies(VarSpec, request)` for every output
 
     A producer is treated as satisfied only when ALL its declared `produces`
     are satisfied. Any error in the predicate is treated as 'not satisfied'
     so we re-run rather than silently skip.
-
-    Returns False when the producer doesn't expose `is_satisfied` at all.
     """
-    method = getattr(producer, "is_satisfied", None)
-    if method is None:
-        return False
     if request is not None and getattr(request, "force", False):
         return False
+    raw_produces = tuple(getattr(producer, "produces", ()) or ())
     produces = producer_produces(producer)
     if not produces:
         return False
-    try:
-        # Try the per-variable signature first (legacy).
-        return all(method(cube, var, request) for var in produces)
-    except TypeError:
+
+    method = getattr(producer, "is_satisfied", None)
+    if method is not None:
         try:
-            # Producer-level signature.
-            return bool(method(cube, request))
+            # Try the per-variable signature first (legacy).
+            return all(method(cube, var, request) for var in produces)
+        except TypeError:
+            try:
+                # Producer-level signature.
+                return bool(method(cube, request))
+            except Exception:
+                return False
         except Exception:
             return False
+
+    # Generic ProducerV2 path: the cube owns static/time/resolution coverage.
+    # If the producer declared raw VarSpecs, pass them through. If it declared
+    # plain strings, pass the name and let the cube infer the stored kind.
+    if hasattr(cube, "satisfies"):
+        specs = raw_produces if raw_produces else produces
+        try:
+            return all(cube.satisfies(spec, request) for spec in specs)
+        except Exception:
+            return False
+
+    try:
+        return all(cube.has(var) for var in produces)
     except Exception:
         return False
 

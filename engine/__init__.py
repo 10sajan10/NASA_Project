@@ -18,6 +18,7 @@ from .contracts import (
     TileSpec,
     VarSpec,
 )
+from .adapters import DataDriverAdapter, ModelFunctionAdapter
 from .backends import (
     Backend,
     DaskBackend,
@@ -75,6 +76,9 @@ __all__ = [
     "Request",
     "TileSpec",
     "VarSpec",
+    # producer adapters
+    "DataDriverAdapter",
+    "ModelFunctionAdapter",
     # backends
     "Backend",
     "DaskBackend",

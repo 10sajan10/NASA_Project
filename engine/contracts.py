@@ -57,6 +57,8 @@ class VarSpec:
     units: str = ""
     merge_policy: MergePolicy = MergePolicy.LAST_WRITER
     description: str = ""
+    max_native_res_m: Optional[float] = None
+    required: bool = True
 
 
 @dataclass(frozen=True)
