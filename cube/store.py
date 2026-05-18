@@ -285,6 +285,88 @@ class Cube:
                 yield slice(y0, y1), slice(x0, x1)
 
     # ------------------------------------------------------------------
+    # halo I/O: read a tile padded with neighbouring cells; write back only
+    # the inner (non-halo) region. Boundary-coupled producers (fire spread,
+    # diffusion, convolutional stencils) need this to compute correctly at
+    # tile edges without seam artifacts.
+    # ------------------------------------------------------------------
+    def _halo_bounds(self, y_slice: slice, x_slice: slice,
+                     halo: int) -> tuple[slice, slice, slice, slice]:
+        """Compute halo-expanded outer slice and the inner slice WITHIN the
+        halo'd array that corresponds to the original (y_slice, x_slice).
+
+        Returns (outer_y, outer_x, inner_y_in_arr, inner_x_in_arr).
+        Halo is clipped at grid edges so cells outside the grid aren't
+        invented; the inner slice still points at the original tile,
+        possibly closer to the array edge."""
+        if halo < 0:
+            raise ValueError("halo must be non-negative")
+        H, W = self.grid.shape
+        y0 = max(0, y_slice.start - halo)
+        y1 = min(H, y_slice.stop + halo)
+        x0 = max(0, x_slice.start - halo)
+        x1 = min(W, x_slice.stop + halo)
+        outer_y = slice(y0, y1)
+        outer_x = slice(x0, x1)
+        inner_y = slice(y_slice.start - y0, y_slice.stop - y0)
+        inner_x = slice(x_slice.start - x0, x_slice.stop - x0)
+        return outer_y, outer_x, inner_y, inner_x
+
+    def read_chunk_static_with_halo(self, variable: str,
+                                     y_slice: slice, x_slice: slice,
+                                     halo: int
+                                     ) -> tuple[np.ndarray,
+                                                 tuple[slice, slice]]:
+        """Read (y_slice, x_slice) padded with `halo` cells on each side.
+
+        Returns (data, inner) where `data` is the halo'd ndarray (slightly
+        smaller than 2*halo+tile if the tile sits against the grid edge)
+        and `inner = (inner_y_in_arr, inner_x_in_arr)` is the slice
+        within `data` that maps back to the original tile bounds. After
+        the producer computes over `data`, it writes `data[inner]`
+        back via `write_chunk_static`.
+        """
+        outer_y, outer_x, inner_y, inner_x = self._halo_bounds(
+            y_slice, x_slice, halo)
+        data = self.read_chunk_static(variable, outer_y, outer_x)
+        return data, (inner_y, inner_x)
+
+    def read_chunk_time_with_halo(self, variable: str,
+                                   t_slice: slice,
+                                   y_slice: slice, x_slice: slice,
+                                   halo: int
+                                   ) -> tuple[np.ndarray,
+                                              tuple[slice, slice, slice]]:
+        """Time-3D version. Returns (data, (full_t, inner_y, inner_x))."""
+        outer_y, outer_x, inner_y, inner_x = self._halo_bounds(
+            y_slice, x_slice, halo)
+        data = self.read_chunk_time(variable, t_slice, outer_y, outer_x)
+        full_t = slice(0, data.shape[0])
+        return data, (full_t, inner_y, inner_x)
+
+    def write_inner_static(self, variable: str,
+                            y_slice: slice, x_slice: slice,
+                            halo_data: np.ndarray,
+                            halo: int) -> None:
+        """Write only the inner (non-halo) region of `halo_data` to the
+        target tile. Caller computed over a halo'd extent; this drops the
+        halo before persisting so neighbouring tiles' inner regions
+        aren't clobbered by overlapping halos."""
+        _, _, inner_y, inner_x = self._halo_bounds(y_slice, x_slice, halo)
+        inner = halo_data[inner_y, inner_x]
+        self.write_chunk_static(variable, y_slice, x_slice, inner)
+
+    def write_inner_time(self, variable: str,
+                          t_slice: slice,
+                          y_slice: slice, x_slice: slice,
+                          halo_data: np.ndarray,
+                          halo: int) -> None:
+        """Time-3D version of write_inner_static."""
+        _, _, inner_y, inner_x = self._halo_bounds(y_slice, x_slice, halo)
+        inner = halo_data[:, inner_y, inner_x]
+        self.write_chunk_time(variable, t_slice, y_slice, x_slice, inner)
+
+    # ------------------------------------------------------------------
     # reads
     # ------------------------------------------------------------------
     def read_static(self, variable: str) -> np.ndarray:
