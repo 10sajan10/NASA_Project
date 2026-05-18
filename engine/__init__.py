@@ -36,6 +36,7 @@ from .schema import (
     register_migration,
 )
 from .checkpoint import CheckpointStore
+from .cache import ContentCache, default_cache_root
 from .datasource import (
     DataAsset,
     DataQuery,
@@ -96,6 +97,8 @@ __all__ = [
     "get_schema_version",
     "register_migration",
     "CheckpointStore",
+    "ContentCache",
+    "default_cache_root",
     # data sources
     "DataAsset",
     "DataQuery",
