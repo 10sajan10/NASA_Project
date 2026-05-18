@@ -228,7 +228,7 @@ def run_full_via_engine(cube: Cube, day0: datetime, n_days: int,
         Pipeline,
         PipelineRunner,
         make_backend,
-        to_engine_registry,
+        to_adapter_registry,
     )
 
     t_end = day0 + timedelta(days=n_days)
@@ -236,7 +236,10 @@ def run_full_via_engine(cube: Cube, day0: datetime, n_days: int,
     if include_population:
         targets.append("population_affected")
 
-    eng_registry = to_engine_registry(resolver.registry)
+    # Auto-promote legacy fusion DriverProducer / FunctionProducer into
+    # engine adapters so they pick up cube.satisfies-aware skip + merge
+    # policy at the cube-write boundary.
+    eng_registry = to_adapter_registry(resolver.registry)
     pipeline = Pipeline.from_targets(targets, registry=eng_registry,
                                      name="resolver-equivalent")
     backend = make_backend(backend_mode, **(backend_kwargs or {}))

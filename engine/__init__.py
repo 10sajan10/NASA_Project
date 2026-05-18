@@ -56,6 +56,7 @@ from .registry import (
     ProducerRegistry,
     producer_produces,
     producer_requires,
+    to_adapter_registry,
     to_engine_registry,
 )
 from .cube_ref import CubeRef, is_cross_process_backend
@@ -119,6 +120,7 @@ __all__ = [
     "producer_produces",
     "producer_requires",
     "to_engine_registry",
+    "to_adapter_registry",
     "Pipeline",
     "PipelineNode",
     "Trigger",

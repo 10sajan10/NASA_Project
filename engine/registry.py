@@ -114,16 +114,16 @@ class ProducerRegistry:
 
 def to_engine_registry(source: Any) -> ProducerRegistry:
     """Bridge any registry-like object (or iterable of producers) into an
-    engine ProducerRegistry.
+    engine ProducerRegistry without modifying the producers.
 
     Accepts:
       * a fusion.ProducerRegistry (or any object with a `producers()` method
         returning an iterable of producers)
       * a plain iterable of producer-shaped objects
 
-    The producers themselves don't need to change. Engine accepts anything
-    with `name`, `produces`, `requires`, and `run(cube, request)`, which is
-    exactly the legacy fusion.Producer protocol.
+    Producers pass through unchanged. Use `to_adapter_registry` if you
+    want fusion-shaped producers auto-promoted to engine adapters
+    (cube.satisfies-aware skip + merge-policy benefits).
     """
     if hasattr(source, "producers") and callable(source.producers):
         items = source.producers()
@@ -132,4 +132,74 @@ def to_engine_registry(source: Any) -> ProducerRegistry:
     eng = ProducerRegistry()
     for p in items:
         eng.register(p)
+    return eng
+
+
+def _maybe_wrap_legacy(producer) -> Any:
+    """Promote a legacy fusion producer to an engine adapter when we can
+    recognise the shape; otherwise pass through.
+
+    Detection is duck-typed (we check for `.driver` with `.fetch`, or for
+    a callable `.func`) so this works against fusion.DriverProducer /
+    fusion.FunctionProducer without importing fusion here.
+    """
+    # Already an engine-side producer: pass through.
+    from .contracts import ProducerV2
+    if isinstance(producer, ProducerV2):
+        return producer
+
+    # DriverProducer-shaped: wraps a Driver with .fetch.
+    driver = getattr(producer, "driver", None)
+    if driver is not None and hasattr(driver, "fetch"):
+        from .adapters import DataDriverAdapter
+        return DataDriverAdapter(
+            driver=driver,
+            name=getattr(producer, "name", driver.name),
+            produces=getattr(producer, "produces", driver.produces),
+            requires=getattr(producer, "requires", ()),
+            time_end_mode=getattr(producer, "time_end_mode",
+                                  "as_requested"),
+            time_check_mode=getattr(producer, "time_check_mode",
+                                    "as_requested"),
+        )
+
+    # FunctionProducer-shaped: holds a callable .func(cube, request).
+    func = getattr(producer, "func", None)
+    if callable(func):
+        from .adapters import ModelFunctionAdapter
+        return ModelFunctionAdapter(
+            name=producer.name,
+            produces=producer.produces,
+            requires=getattr(producer, "requires", ()),
+            func=func,
+        )
+
+    return producer
+
+
+def to_adapter_registry(source: Any) -> ProducerRegistry:
+    """Bridge a fusion registry (or iterable of producers) into an engine
+    ProducerRegistry, AUTO-PROMOTING legacy fusion-shaped producers to
+    engine adapters.
+
+    A producer wrapped as a ``DataDriverAdapter`` or
+    ``ModelFunctionAdapter`` picks up:
+
+      * cube.satisfies-aware skip on re-runs (resolution + time window
+        coverage), not just cube.has
+      * merge_policy enforcement on writes (when produces declares a
+        VarSpec with a non-default policy)
+      * the ProducerV2 contract, so future scheduler features
+        (checkpointing, halo I/O, version tracking) apply uniformly
+
+    Producers that already look like ProducerV2 — or that can't be
+    safely recognised — pass through unchanged.
+    """
+    if hasattr(source, "producers") and callable(source.producers):
+        items = source.producers()
+    else:
+        items = source
+    eng = ProducerRegistry()
+    for p in items:
+        eng.register(_maybe_wrap_legacy(p))
     return eng
