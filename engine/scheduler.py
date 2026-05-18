@@ -34,6 +34,7 @@ from .contracts import Request
 from .cube_ref import CubeRef, is_cross_process_backend
 from .pipeline import Pipeline, Trigger
 from .registry import ProducerRegistry, producer_produces
+from .retry import RetryPolicy, attempt_with_retry
 from .tiled import _run_tile, is_tile_aware
 
 
@@ -45,6 +46,8 @@ class StepResult:
     elapsed_s: float
     produced: dict[str, int] = field(default_factory=dict)
     error: Optional[str] = None
+    attempts: int = 1                            # times tried (1..max)
+    dead_letter: bool = False                    # ran out of retries
 
 
 @dataclass
@@ -152,12 +155,16 @@ class PipelineRunner:
                  *,
                  verbose: bool = True,
                  fail_fast: bool = False,
-                 skip_when_satisfied: bool = True) -> None:
+                 skip_when_satisfied: bool = True,
+                 retry_policy: Optional[RetryPolicy] = None) -> None:
         self.registry = registry
         self.backend = backend or SerialBackend()
         self.verbose = verbose
         self.fail_fast = fail_fast
         self.skip_when_satisfied = skip_when_satisfied
+        # Default: single attempt (back-compat). Producers + the runner
+        # can override per-step via the policy.
+        self.retry_policy = retry_policy or RetryPolicy()
 
     # ------------------------------------------------------------------
     def run(self,
@@ -311,6 +318,8 @@ class PipelineRunner:
                        else cube)
 
         # Parallel via backend.submit so we collect per-task timing/errors.
+        # Retries run INSIDE the worker (sleeps don't block the parent),
+        # so the future result is a (produced, exc, attempts) tuple.
         futs: list[tuple[str, Future, float]] = []
         for name in to_submit:
             producer = self.registry.get(name)
@@ -318,25 +327,49 @@ class PipelineRunner:
                 print(f"[step] {name}  submit ({self.backend.name})")
             t0 = time.monotonic()
             futs.append((name, self.backend.submit(
-                _run_one, producer, worker_cube, request), t0))
+                attempt_with_retry, _run_one, producer, worker_cube,
+                request, policy=self.retry_policy), t0))
 
+        max_attempts = self.retry_policy.max_attempts
         for name, fut, t0 in futs:
             try:
-                produced = fut.result()
-                elapsed = time.monotonic() - t0
-                results.append(StepResult(
-                    name=name, status="ok",
-                    elapsed_s=elapsed, produced=produced))
-                if self.verbose:
-                    print(f"[step] {name}  ok in {elapsed:.2f}s -> {produced}")
+                produced, exc, attempts = fut.result()
             except BaseException as e:
+                # Backend-level failure (e.g. worker crash). Treat as
+                # immediate dead-letter — we can't retry through a crashed
+                # worker safely.
                 elapsed = time.monotonic() - t0
                 results.append(StepResult(
                     name=name, status="error",
                     elapsed_s=elapsed,
-                    error=f"{type(e).__name__}: {e}"))
+                    error=f"{type(e).__name__}: {e}",
+                    attempts=1, dead_letter=True))
                 if self.verbose:
-                    print(f"[step] {name}  ERROR after {elapsed:.2f}s: {e}")
+                    print(f"[step] {name}  ERROR (backend) after "
+                          f"{elapsed:.2f}s: {e}")
+                continue
+            elapsed = time.monotonic() - t0
+            if exc is None:
+                tag = f" (after {attempts} attempts)" if attempts > 1 else ""
+                results.append(StepResult(
+                    name=name, status="ok",
+                    elapsed_s=elapsed, produced=produced,
+                    attempts=attempts))
+                if self.verbose:
+                    print(f"[step] {name}  ok in {elapsed:.2f}s{tag} -> "
+                          f"{produced}")
+            else:
+                dead_letter = attempts >= max_attempts
+                results.append(StepResult(
+                    name=name, status="error",
+                    elapsed_s=elapsed,
+                    error=f"{type(exc).__name__}: {exc}",
+                    attempts=attempts,
+                    dead_letter=dead_letter))
+                if self.verbose:
+                    dtag = " (dead-letter)" if dead_letter else ""
+                    print(f"[step] {name}  ERROR after {elapsed:.2f}s "
+                          f"({attempts} attempts){dtag}: {exc}")
         return results
 
     def _run_step(self, name: str, cube, request: Request) -> StepResult:
@@ -357,20 +390,26 @@ class PipelineRunner:
         if self.verbose:
             print(f"[step] {name}  start")
         t0 = time.monotonic()
-        try:
-            produced = _run_one(producer, cube, request)
-            elapsed = time.monotonic() - t0
+        produced, exc, attempts = attempt_with_retry(
+            _run_one, producer, cube, request,
+            policy=self.retry_policy)
+        elapsed = time.monotonic() - t0
+        if exc is None:
+            tag = f" (after {attempts} attempts)" if attempts > 1 else ""
             if self.verbose:
-                print(f"[step] {name}  ok in {elapsed:.2f}s -> {produced}")
+                print(f"[step] {name}  ok in {elapsed:.2f}s{tag} -> {produced}")
             return StepResult(name=name, status="ok",
-                              elapsed_s=elapsed, produced=produced)
-        except BaseException as e:
-            elapsed = time.monotonic() - t0
-            if self.verbose:
-                print(f"[step] {name}  ERROR after {elapsed:.2f}s: {e}")
-            return StepResult(name=name, status="error",
-                              elapsed_s=elapsed,
-                              error=f"{type(e).__name__}: {e}")
+                              elapsed_s=elapsed, produced=produced,
+                              attempts=attempts)
+        dead_letter = attempts >= self.retry_policy.max_attempts
+        if self.verbose:
+            tag = f" (dead-letter after {attempts} attempts)" if dead_letter else ""
+            print(f"[step] {name}  ERROR after {elapsed:.2f}s{tag}: {exc}")
+        return StepResult(name=name, status="error",
+                          elapsed_s=elapsed,
+                          error=f"{type(exc).__name__}: {exc}",
+                          attempts=attempts,
+                          dead_letter=dead_letter)
 
     # ------------------------------------------------------------------
     def _run_tiled_step(self, name: str, producer, cube,
@@ -413,47 +452,70 @@ class PipelineRunner:
                            else cube)
 
             tile_errors: list[str] = []
+            tile_attempts: list[int] = []
             if isinstance(self.backend, SerialBackend) or n_tiles == 1:
                 for i, tile in enumerate(tiles):
-                    try:
-                        _run_tile(producer, worker_cube, request, tile)
-                    except BaseException as e:
+                    _, exc, attempts = attempt_with_retry(
+                        _run_tile, producer, worker_cube, request, tile,
+                        policy=self.retry_policy)
+                    tile_attempts.append(attempts)
+                    if exc is not None:
                         tile_errors.append(
-                            f"tile[{i}] {type(e).__name__}: {e}")
+                            f"tile[{i}] {type(exc).__name__}: {exc}")
             else:
-                futs: list[Future] = [
+                # Retries run inside each worker so sleeps don't block
+                # the parent's gather loop.
+                futs = [
                     self.backend.submit(
-                        _run_tile, producer, worker_cube, request, tile)
+                        attempt_with_retry, _run_tile, producer,
+                        worker_cube, request, tile,
+                        policy=self.retry_policy)
                     for tile in tiles
                 ]
                 for i, f in enumerate(futs):
                     try:
-                        f.result()
+                        _, exc, attempts = f.result()
                     except BaseException as e:
+                        # backend-level failure (worker crash)
                         tile_errors.append(
-                            f"tile[{i}] {type(e).__name__}: {e}")
+                            f"tile[{i}] backend {type(e).__name__}: {e}")
+                        tile_attempts.append(1)
+                        continue
+                    tile_attempts.append(attempts)
+                    if exc is not None:
+                        tile_errors.append(
+                            f"tile[{i}] {type(exc).__name__}: {exc}")
 
+            max_tile_attempts = (max(tile_attempts) if tile_attempts
+                                  else 1)
             if tile_errors:
                 # Don't run finalize if tile errors occurred.
                 err = ("; ".join(tile_errors[:3])
                        + (f"  (+ {len(tile_errors) - 3} more)"
                           if len(tile_errors) > 3 else ""))
                 elapsed = time.monotonic() - t0
+                dead_letter = max_tile_attempts >= self.retry_policy.max_attempts
                 if self.verbose:
+                    dtag = " (some dead-letter)" if dead_letter else ""
                     print(f"[step] {name}  ERROR after {elapsed:.2f}s "
-                          f"({len(tile_errors)} tile failures)")
+                          f"({len(tile_errors)} tile failures){dtag}")
                 return StepResult(name=name, status="error",
-                                  elapsed_s=elapsed, error=err)
+                                  elapsed_s=elapsed, error=err,
+                                  attempts=max_tile_attempts,
+                                  dead_letter=dead_letter)
 
             produced = producer.finalize(cube, request) or {}
             elapsed = time.monotonic() - t0
             if self.verbose:
+                rt = (f" (max {max_tile_attempts} tile attempts)"
+                      if max_tile_attempts > 1 else "")
                 print(f"[step] {name}  ok in {elapsed:.2f}s "
-                      f"({n_tiles} tiles) -> {produced}")
+                      f"({n_tiles} tiles){rt} -> {produced}")
             return StepResult(name=name, status="ok",
                               elapsed_s=elapsed,
                               produced={str(k): int(v)
-                                         for k, v in produced.items()})
+                                         for k, v in produced.items()},
+                              attempts=max_tile_attempts)
         except BaseException as e:
             elapsed = time.monotonic() - t0
             if self.verbose:

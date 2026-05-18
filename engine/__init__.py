@@ -67,6 +67,7 @@ from .merge import (
     write_chunk_time_with_policy,
 )
 from .pipeline import Pipeline, PipelineNode, Trigger, parallel
+from .retry import RetryPolicy, attempt_with_retry
 from .scheduler import PipelineRunner, RunResult, StepResult
 
 __all__ = [
@@ -128,6 +129,8 @@ __all__ = [
     "PipelineRunner",
     "RunResult",
     "StepResult",
+    "RetryPolicy",
+    "attempt_with_retry",
     # cube cross-process
     "CubeRef",
     "is_cross_process_backend",
