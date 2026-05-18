@@ -40,6 +40,16 @@ from .tiled import _run_tile, is_tile_aware
 
 # --------------------------------------------------------------- results
 @dataclass
+class TileMetric:
+    """Per-tile execution record for a tile-aware producer."""
+    index: int
+    elapsed_s: float
+    attempts: int
+    status: str                                  # "ok" | "error"
+    error: Optional[str] = None
+
+
+@dataclass
 class StepResult:
     name: str
     status: str                                  # "ok" | "skipped" | "error"
@@ -48,6 +58,28 @@ class StepResult:
     error: Optional[str] = None
     attempts: int = 1                            # times tried (1..max)
     dead_letter: bool = False                    # ran out of retries
+    tile_count: int = 0                          # how many tiles ran
+    tile_metrics: list[TileMetric] = field(default_factory=list)
+
+    @property
+    def tile_latency_summary(self) -> dict:
+        """Min/median/max/total of per-tile elapsed seconds, plus error
+        count. Empty dict if there were no tiles."""
+        if not self.tile_metrics:
+            return {}
+        times = sorted(t.elapsed_s for t in self.tile_metrics)
+        n = len(times)
+        median = times[n // 2] if n % 2 == 1 else (
+            (times[n // 2 - 1] + times[n // 2]) / 2.0)
+        return {
+            "n": n,
+            "min_s": times[0],
+            "median_s": median,
+            "max_s": times[-1],
+            "total_s": sum(times),
+            "errors": sum(1 for t in self.tile_metrics
+                          if t.status == "error"),
+        }
 
 
 @dataclass
@@ -156,7 +188,8 @@ class PipelineRunner:
                  verbose: bool = True,
                  fail_fast: bool = False,
                  skip_when_satisfied: bool = True,
-                 retry_policy: Optional[RetryPolicy] = None) -> None:
+                 retry_policy: Optional[RetryPolicy] = None,
+                 max_inflight_tiles: Optional[int] = None) -> None:
         self.registry = registry
         self.backend = backend or SerialBackend()
         self.verbose = verbose
@@ -165,6 +198,11 @@ class PipelineRunner:
         # Default: single attempt (back-compat). Producers + the runner
         # can override per-step via the policy.
         self.retry_policy = retry_policy or RetryPolicy()
+        # Backpressure: cap concurrent in-flight tile tasks per producer.
+        # None = unbounded (submit all tiles). Useful for grids with
+        # thousands of tiles to avoid building up large in-flight result
+        # buffers in the parent process.
+        self.max_inflight_tiles = max_inflight_tiles
 
     # ------------------------------------------------------------------
     def run(self,
@@ -453,38 +491,80 @@ class PipelineRunner:
 
             tile_errors: list[str] = []
             tile_attempts: list[int] = []
+            tile_metrics: list[TileMetric] = []
+
+            def _record(i: int, started_at: float, exc, attempts: int,
+                        backend_error: bool = False) -> None:
+                elapsed = max(0.0, time.monotonic() - started_at)
+                tile_attempts.append(attempts)
+                if exc is None:
+                    tile_metrics.append(TileMetric(
+                        index=i, elapsed_s=elapsed,
+                        attempts=attempts, status="ok"))
+                else:
+                    err_text = (f"backend {type(exc).__name__}: {exc}"
+                                if backend_error
+                                else f"{type(exc).__name__}: {exc}")
+                    tile_errors.append(f"tile[{i}] {err_text}")
+                    tile_metrics.append(TileMetric(
+                        index=i, elapsed_s=elapsed,
+                        attempts=attempts, status="error",
+                        error=err_text))
+
             if isinstance(self.backend, SerialBackend) or n_tiles == 1:
                 for i, tile in enumerate(tiles):
+                    t_tile = time.monotonic()
                     _, exc, attempts = attempt_with_retry(
                         _run_tile, producer, worker_cube, request, tile,
                         policy=self.retry_policy)
-                    tile_attempts.append(attempts)
-                    if exc is not None:
-                        tile_errors.append(
-                            f"tile[{i}] {type(exc).__name__}: {exc}")
+                    _record(i, t_tile, exc, attempts)
             else:
-                # Retries run inside each worker so sleeps don't block
-                # the parent's gather loop.
-                futs = [
-                    self.backend.submit(
+                # Bounded sliding window so backpressure caps concurrent
+                # in-flight tile futures (memory hygiene at thousands of
+                # tiles). Retries run inside workers so the sleep doesn't
+                # block the parent's gather.
+                cap = self.max_inflight_tiles or n_tiles
+                cap = max(1, min(cap, n_tiles))
+                pending: dict = {}  # future -> (i, t_start)
+                enumerated = list(enumerate(tiles))
+                cursor = 0
+
+                def _submit_next() -> None:
+                    nonlocal cursor
+                    if cursor >= n_tiles:
+                        return
+                    i, tile = enumerated[cursor]
+                    cursor += 1
+                    t = time.monotonic()
+                    fut = self.backend.submit(
                         attempt_with_retry, _run_tile, producer,
                         worker_cube, request, tile,
                         policy=self.retry_policy)
-                    for tile in tiles
-                ]
-                for i, f in enumerate(futs):
+                    pending[fut] = (i, t)
+
+                for _ in range(cap):
+                    _submit_next()
+
+                while pending:
+                    # Poll for the first done future. Polling beats
+                    # concurrent.futures.wait because Dask futures aren't
+                    # always drop-in compatible — but they do implement
+                    # done() and result().
+                    done = None
+                    for fut in list(pending.keys()):
+                        if fut.done():
+                            done = fut
+                            break
+                    if done is None:
+                        # No one's done yet; block on the oldest.
+                        done = next(iter(pending))
+                    i, t_start = pending.pop(done)
                     try:
-                        _, exc, attempts = f.result()
+                        _, exc, attempts = done.result()
+                        _record(i, t_start, exc, attempts)
                     except BaseException as e:
-                        # backend-level failure (worker crash)
-                        tile_errors.append(
-                            f"tile[{i}] backend {type(e).__name__}: {e}")
-                        tile_attempts.append(1)
-                        continue
-                    tile_attempts.append(attempts)
-                    if exc is not None:
-                        tile_errors.append(
-                            f"tile[{i}] {type(exc).__name__}: {exc}")
+                        _record(i, t_start, e, 1, backend_error=True)
+                    _submit_next()
 
             max_tile_attempts = (max(tile_attempts) if tile_attempts
                                   else 1)
@@ -502,7 +582,9 @@ class PipelineRunner:
                 return StepResult(name=name, status="error",
                                   elapsed_s=elapsed, error=err,
                                   attempts=max_tile_attempts,
-                                  dead_letter=dead_letter)
+                                  dead_letter=dead_letter,
+                                  tile_count=n_tiles,
+                                  tile_metrics=tile_metrics)
 
             produced = producer.finalize(cube, request) or {}
             elapsed = time.monotonic() - t0
@@ -511,11 +593,19 @@ class PipelineRunner:
                       if max_tile_attempts > 1 else "")
                 print(f"[step] {name}  ok in {elapsed:.2f}s "
                       f"({n_tiles} tiles){rt} -> {produced}")
+                if tile_metrics:
+                    summary_times = sorted(t.elapsed_s for t in tile_metrics)
+                    print(f"[step] {name}  tile latency: "
+                          f"min={summary_times[0]*1000:.0f}ms "
+                          f"median={summary_times[len(summary_times)//2]*1000:.0f}ms "
+                          f"max={summary_times[-1]*1000:.0f}ms")
             return StepResult(name=name, status="ok",
                               elapsed_s=elapsed,
                               produced={str(k): int(v)
                                          for k, v in produced.items()},
-                              attempts=max_tile_attempts)
+                              attempts=max_tile_attempts,
+                              tile_count=n_tiles,
+                              tile_metrics=tile_metrics)
         except BaseException as e:
             elapsed = time.monotonic() - t0
             if self.verbose:

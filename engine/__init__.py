@@ -68,7 +68,7 @@ from .merge import (
 )
 from .pipeline import Pipeline, PipelineNode, Trigger, parallel
 from .retry import RetryPolicy, attempt_with_retry
-from .scheduler import PipelineRunner, RunResult, StepResult
+from .scheduler import PipelineRunner, RunResult, StepResult, TileMetric
 
 __all__ = [
     # contracts
@@ -129,6 +129,7 @@ __all__ = [
     "PipelineRunner",
     "RunResult",
     "StepResult",
+    "TileMetric",
     "RetryPolicy",
     "attempt_with_retry",
     # cube cross-process
