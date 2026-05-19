@@ -16,8 +16,8 @@ glue. You bring the model and the data; the engine wires them together.
 | [cube/](cube/) | Per-variable Zarr storage indexed by a DuckDB catalog. Resolution-aware satisfaction checks, schema versioning, halo I/O, snapshots. |
 | [engine/](engine/) | Orchestration substrate. ProducerV2 contract, DAG pipeline DSL, pluggable execution backends (serial / thread / process / dask / SLURM), tile fan-out, retries with dead-letter, dirty propagation, run lineage, content-addressable cache, disk-spill workspace. |
 | [drivers/](drivers/) | Data-source-specific fetchers (KML, thermal-pulse, DEM, weather reanalysis, etc). These are scenario-specific — keep what you need, write more as you go. |
-| [models/](models/) | `external_model_template.py` shows how to plug a new model in. `wrf_sfire_v2.py` is a worked example (WRF-SFIRE plugged in via `ModelAdapter`). |
-| [tests/](tests/) | 158 tests covering every engine guarantee end-to-end. |
+| [models/](models/) | `external_model_template.py` — drop-in template for plugging in a new model. The substrate ships no concrete models; you bring them. |
+| [tests/](tests/) | Engine guarantees end-to-end. |
 
 ## Plugging in a new model
 
@@ -59,25 +59,6 @@ That's the contract. The engine handles:
 - **Cross-cube cache**: `ContentCache` keyed by `SHA-256(source, params)`
   so external fetches survive cube deletion + are shared across runs.
 
-## Worked example: WRF-SFIRE
-
-[models/wrf_sfire_v2.py](models/wrf_sfire_v2.py) shows the full pattern
-for an external Fortran model:
-
-1. `DataAdapter` declares `ignition_t0`, `nfuel_cat`, `dem`, optional
-   wind/moisture.
-2. `stage_inputs` builds the WRF-SFIRE stage directory: copies
-   namelist templates, patches them with cube-derived grid/time/
-   `fire_tign_in_time`, writes `TIGN_IN` / `NFUEL_CAT` / `ZSF` on the
-   fire mesh inside `wrfinput_d01.nc`.
-3. `run_model` subprocesses `wrf.exe`.
-4. `parse_outputs` extracts `TIGN_G` and `FIRE_AREA` from the wrfout
-   and downsamples back to the cube grid.
-
-[tests/test_wrf_sfire_v2.py](tests/test_wrf_sfire_v2.py) validates the
-full data flow without requiring a built WRF binary (uses a Python
-stand-in subprocess).
-
 ## Setup
 
 ```bash
@@ -93,7 +74,6 @@ cube/           storage + catalog + halo + snapshot
 drivers/        data-source fetchers (scenario-specific)
 models/         model plug-ins
   external_model_template.py    drop-in template
-  wrf_sfire_v2.py               WRF-SFIRE worked example
 tests/          engine + adapter integration tests
 configs/        example configs
 ```
