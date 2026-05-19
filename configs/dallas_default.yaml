@@ -37,35 +37,11 @@ execution:
   #            account: smithp-rw }
   cluster_kwargs: {}
 
-inputs:
-  landfire: LANDFIRE/LF2024_FBFM40_CONUS/Tif/LF2024_FBFM40_CONUS.tif
-  landfire_fbfm13: LANDFIRE/LF2024_FBFM13_CONUS/Tif/LF2024_FBFM13_CONUS.tif
-  population_raster: null
+# Scenario-specific inputs are deliberately not enumerated here.
+# Add fields for the data fetchers and model adapters your scenario
+# actually uses (see drivers/ and models/external_model_template.py).
+# The engine reads only fields its registered producers ask for.
 
-satellite:
-  source: landsat            # landsat | sentinel
-  landsat_years_back: 12
-  landsat_day_window: 30
-  landsat_max_cloud: 50.0
-  landsat_max_scenes_per_year: 3
-  sentinel_max_cloud: 30.0
-  sentinel_max_scenes: 8
-
-weather:
-  source: era5               # era5 | cmip6 | synthetic
-  era5_years_back: 12
-  era5_day_window: 21
-  cmip_model: ACCESS-CM2
-  cmip_scenario: ssp370
-  wind_dir_deg: 180.0
-  synthetic:
-    temp_c: 30.0
-    rh_pct: 30.0
-    wind_ms: 7.0
-    daily_precip_mm: 0.0
-
-regression:
-  harmonics: 2
-
-fire:
-  model: rothermel           # rothermel | (future adapters)
+inputs: {}
+weather: {}
+fire: {}

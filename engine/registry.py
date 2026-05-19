@@ -7,9 +7,9 @@ Accepts anything that quacks like a producer:
   * `requires` : iterable of variable names (strings) or VarSpec objects
   * `run(cube, request)` -> dict[str, int] | list[str] | None
 
-This keeps the orchestration engine model-agnostic. Legacy `fusion.Producer`
-instances and new `engine.ProducerV2` instances coexist in the same
-registry, and the pipeline runner treats them uniformly.
+This keeps the orchestration engine model-agnostic. Legacy producer-shape
+objects (per-variable contract) and `engine.ProducerV2` instances coexist
+in the same registry, and the pipeline runner treats them uniformly.
 """
 from __future__ import annotations
 
@@ -117,12 +117,12 @@ def to_engine_registry(source: Any) -> ProducerRegistry:
     engine ProducerRegistry without modifying the producers.
 
     Accepts:
-      * a fusion.ProducerRegistry (or any object with a `producers()` method
-        returning an iterable of producers)
+      * any registry-like object exposing a `producers()` method that
+        returns an iterable of producers
       * a plain iterable of producer-shaped objects
 
     Producers pass through unchanged. Use `to_adapter_registry` if you
-    want fusion-shaped producers auto-promoted to engine adapters
+    want legacy-shape producers auto-promoted to engine adapters
     (cube.satisfies-aware skip + merge-policy benefits).
     """
     if hasattr(source, "producers") and callable(source.producers):
@@ -136,12 +136,13 @@ def to_engine_registry(source: Any) -> ProducerRegistry:
 
 
 def _maybe_wrap_legacy(producer) -> Any:
-    """Promote a legacy fusion producer to an engine adapter when we can
+    """Promote a legacy-shape producer to an engine adapter when we can
     recognise the shape; otherwise pass through.
 
     Detection is duck-typed (we check for `.driver` with `.fetch`, or for
-    a callable `.func`) so this works against fusion.DriverProducer /
-    fusion.FunctionProducer without importing fusion here.
+    a callable `.func`) so this works against any producer carrying a
+    fetch-style driver or a callable-style function, without depending
+    on any specific producer base class.
     """
     # Already an engine-side producer: pass through.
     from .contracts import ProducerV2
@@ -178,8 +179,8 @@ def _maybe_wrap_legacy(producer) -> Any:
 
 
 def to_adapter_registry(source: Any) -> ProducerRegistry:
-    """Bridge a fusion registry (or iterable of producers) into an engine
-    ProducerRegistry, AUTO-PROMOTING legacy fusion-shaped producers to
+    """Bridge any registry-like object (or iterable of producers) into an
+    engine ProducerRegistry, AUTO-PROMOTING legacy-shape producers to
     engine adapters.
 
     A producer wrapped as a ``DataDriverAdapter`` or

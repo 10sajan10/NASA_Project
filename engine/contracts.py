@@ -114,7 +114,7 @@ class Request:
     @property
     def n_days(self) -> int:
         """Inclusive day count between t_start and t_end. Mirrors the legacy
-        fusion.VariableRequest contract so legacy producers can run unchanged
+        legacy per-variable producer protocol so older code can run unchanged
         through the engine runner."""
         if self.t_start is None or self.t_end is None:
             raise ValueError("time range is required for n_days")

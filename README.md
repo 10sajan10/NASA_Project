@@ -1,92 +1,99 @@
-# NASA Wildfire Scenario Prototype
+# Wildfire Simulation Engine
 
-This project is a geospatial wildfire-spread prototype for a future
-planetary-defense thermal ignition scenario. It builds a central simulation
-cube, writes source data and model outputs into that cube, and runs downstream
-models by reading required variables from storage rather than calling other
-models directly.
+A model-agnostic, dependency-resolved, variable-centric orchestration
+engine for spatial / spatiotemporal scientific simulations. Plug in any
+external model; the engine handles dependency resolution, caching,
+parallelism, retries, lineage, and reproducibility.
 
-The current implementation uses:
+This repository is the substrate, not a fixed pipeline. There is no
+baked-in fire-spread algorithm, no required data source, no scenario
+glue. You bring the model and the data; the engine wires them together.
 
-- Zarr arrays for per-variable raster storage.
-- DuckDB for the cube catalog.
-- A fixed UTM simulation grid per scenario.
-- Data adapters for thermal ignition, LANDFIRE fuels, DEM, Landsat/Sentinel
-  indices, CMIP6/synthetic/ERA5 weather, and population rasters.
-- Models for LFMC, dead-fuel moisture, drought, fuel-dependent ignition/spread
-  thresholds, and Rothermel/Dijkstra fire spread.
-- A dependency resolver that lets a model request variables and automatically
-  runs the data/model chain needed to create missing cube layers.
+## Components
 
-Large generated data products, local virtual environments, and LANDFIRE raster
-downloads are intentionally ignored by Git.
+| Layer | Purpose |
+|---|---|
+| [cube/](cube/) | Per-variable Zarr storage indexed by a DuckDB catalog. Resolution-aware satisfaction checks, schema versioning, halo I/O, snapshots. |
+| [engine/](engine/) | Orchestration substrate. ProducerV2 contract, DAG pipeline DSL, pluggable execution backends (serial / thread / process / dask / SLURM), tile fan-out, retries with dead-letter, dirty propagation, run lineage, content-addressable cache, disk-spill workspace. |
+| [drivers/](drivers/) | Data-source-specific fetchers (KML, thermal-pulse, DEM, weather reanalysis, etc). These are scenario-specific — keep what you need, write more as you go. |
+| [models/](models/) | `external_model_template.py` shows how to plug a new model in. `wrf_sfire_v2.py` is a worked example (WRF-SFIRE plugged in via `ModelAdapter`). |
+| [tests/](tests/) | 158 tests covering every engine guarantee end-to-end. |
 
-## Resolver Engine
+## Plugging in a new model
 
-The resolver engine is the preferred path for new work:
+```python
+from engine import (DataAdapter, DataNeed, ModelAdapter,
+                    ProducerCapabilities, VarSpec, MergePolicy, CostHint)
+
+class MyModel(ModelAdapter):
+    name = "my_model"
+    data_adapter = DataAdapter([
+        DataNeed("ndvi", kind="static", max_native_res_m=30.0),
+        DataNeed("wind", kind="time"),
+    ])
+    produces = (VarSpec("my_output", kind="static",
+                         merge_policy=MergePolicy.MONOTONE_MAX),)
+    capabilities = ProducerCapabilities(cost_hint=CostHint.CPU)
+
+    def stage_inputs(self, grid, inputs, request, stage_dir):
+        ...                                # write inputs to disk
+    def run_model(self, stage_dir, request):
+        ...                                # invoke binary; return output path
+    def parse_outputs(self, output_path, grid):
+        ...                                # return {var_name: ndarray}
+```
+
+That's the contract. The engine handles:
+
+- **Dependency resolution**: walks `requires` -> `produces` backward from
+  any target variable.
+- **Resolution-aware cache hits**: `cube.satisfies(spec)` returns True
+  only when cached data matches `max_native_res_m`.
+- **Dirty propagation**: bumped upstream invalidates downstream
+  automatically.
+- **Parallel execution**: producers on the same DAG layer fan out across
+  the configured backend; tile-aware producers fan tiles across workers.
+- **Retries**: configurable `RetryPolicy` with dead-letter tracking.
+- **Lineage**: every run records git SHA, config hash, library versions,
+  input SHA-256s, and produced variable versions.
+- **Cross-cube cache**: `ContentCache` keyed by `SHA-256(source, params)`
+  so external fetches survive cube deletion + are shared across runs.
+
+## Worked example: WRF-SFIRE
+
+[models/wrf_sfire_v2.py](models/wrf_sfire_v2.py) shows the full pattern
+for an external Fortran model:
+
+1. `DataAdapter` declares `ignition_t0`, `nfuel_cat`, `dem`, optional
+   wind/moisture.
+2. `stage_inputs` builds the WRF-SFIRE stage directory: copies
+   namelist templates, patches them with cube-derived grid/time/
+   `fire_tign_in_time`, writes `TIGN_IN` / `NFUEL_CAT` / `ZSF` on the
+   fire mesh inside `wrfinput_d01.nc`.
+3. `run_model` subprocesses `wrf.exe`.
+4. `parse_outputs` extracts `TIGN_G` and `FIRE_AREA` from the wrfout
+   and downsamples back to the cube grid.
+
+[tests/test_wrf_sfire_v2.py](tests/test_wrf_sfire_v2.py) validates the
+full data flow without requiring a built WRF binary (uses a Python
+stand-in subprocess).
+
+## Setup
 
 ```bash
-python run.py \
-  --engine resolver \
-  --satellite landsat \
-  --weather synthetic \
-  --scenario-date 2036-09-15 \
-  --days 3
+./setup.sh                       # creates .venv and installs deps
+.venv/bin/python -m pytest tests/
 ```
 
-The fire model requests its final variables from the cube. Missing upstream
-variables are produced automatically by registered producers:
+## Layout
 
-```text
-fire
-  -> LANDFIRE fuels
-  -> DEM + slope/aspect
-  -> thermal ignition and burnable mask
-  -> Landsat historical NDVI/NDWI/NBR
-  -> satellite-index trend prediction
-  -> LFMC
-  -> weather
-  -> dead fuel moisture
-  -> KBDI
-  -> fuel thresholds / hard barriers / urban resistance
-  -> fire spread
 ```
-
-The threshold layer separates surface behavior into:
-
-```text
-hard barriers: snow/ice, maintained agriculture, water, bare ground
-wildland: grass, shrub, timber, slash via Rothermel spread
-urban/WUI: high ignition/spread threshold with slower spread
+engine/         orchestration substrate (model-agnostic)
+cube/           storage + catalog + halo + snapshot
+drivers/        data-source fetchers (scenario-specific)
+models/         model plug-ins
+  external_model_template.py    drop-in template
+  wrf_sfire_v2.py               WRF-SFIRE worked example
+tests/          engine + adapter integration tests
+configs/        example configs
 ```
-
-For population exposure, provide a population-count raster:
-
-```bash
-python run.py --engine resolver --population-raster /path/to/population.tif
-```
-
-## Cube Snapshots
-
-The resolver already reuses any variable present in the active cube. For
-example, if `ndvi` exists in `data/cube/ndvi.zarr`, a later fire run will read
-that layer instead of re-running the satellite producer.
-
-Named snapshots make that reuse explicit:
-
-```bash
-python run.py --save-snapshot dallas_inputs_v1
-```
-
-Restore a snapshot into a run root:
-
-```bash
-python run.py \
-  --from-snapshot dallas_inputs_v1 \
-  --overwrite-root \
-  --recompute-fire
-```
-
-`--recompute-fire` removes only downstream fire outputs such as `arrival_s`,
-`fire`, `R_head`, and population exposure. Upstream inputs such as fuels, DEM,
-NDVI/NDWI/NBR, LFMC, weather, and threshold layers remain available for reuse.

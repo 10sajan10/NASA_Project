@@ -6,8 +6,10 @@ Decouples three concerns the existing pipeline mixes together:
   * Execution  -> backends (Serial / Thread / Process / Dask / SLURM)
   * Adapters   -> ProducerV2 contract (extract -> compute -> update)
 
-Lives alongside `fusion/`. The legacy resolver continues to work; producers
-migrate to the new contract one at a time.
+Plug in producers via the `ProducerV2` contract. Adapters at the
+boundary accept any object that quacks like the producer protocol
+(`name`, `produces`, `requires`, `run(cube, request)`), so existing
+producer-shaped code can be wrapped without rewriting.
 """
 from .contracts import (
     CostHint,

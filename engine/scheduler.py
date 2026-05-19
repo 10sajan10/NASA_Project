@@ -100,9 +100,9 @@ def _coerce_produced(out: Any) -> dict[str, int]:
     """Normalize a producer's `run` return into {variable: version}.
 
     Accepts:
-      * dict[str, int]    (ProducerV2 default)
-      * list[str]         (legacy fusion adapter)
-      * None              (driver wrote directly to the cube)
+      * dict[str, int]    (ProducerV2 default — {variable: version})
+      * list[str]         (legacy-shape adapter — names only)
+      * None              (producer wrote directly to the cube)
     """
     if out is None:
         return {}
@@ -132,9 +132,10 @@ def _producer_already_satisfied(producer, cube, request: Request) -> bool:
 
     Honors two contract shapes without coupling to either:
 
-      * legacy fusion: `is_satisfied(cube, variable, request)` - per-variable
-      * engine v2 (future): `is_satisfied(cube, request)` - producer-level
-      * cube-native: `cube.satisfies(VarSpec, request)` for every output
+      * legacy per-variable: `is_satisfied(cube, variable, request)`
+      * ProducerV2 producer-level: `is_satisfied(cube, request)`
+      * cube-native fallback: `cube.satisfies(VarSpec, request)` for
+        every declared output
 
     A producer is treated as satisfied only when ALL its declared `produces`
     are satisfied. Any error in the predicate is treated as 'not satisfied'
@@ -152,7 +153,7 @@ def _producer_already_satisfied(producer, cube, request: Request) -> bool:
     satisfied = False
     if method is not None:
         try:
-            # Per-variable signature (legacy fusion).
+            # Per-variable signature (legacy shape).
             satisfied = all(method(cube, var, request) for var in produces)
         except TypeError:
             try:
