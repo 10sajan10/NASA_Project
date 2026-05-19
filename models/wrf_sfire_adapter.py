@@ -100,13 +100,12 @@ class WRFSFireAdapter(ModelAdapter):
     data_adapter = DataAdapter([
         DataNeed("ignition_t0", kind="static",
                   units="s",
-                  description="Asteroid pulse per-cell ignition time"),
+                  description="Per-cell ignition time (s); NaN = un-ignited"),
         DataNeed("nfuel_cat", kind="static",
-                  description="Anderson 13 fuel categories"),
+                  description="Fuel category raster (1..N burnable, "
+                              "no-fuel sentinel for non-burnable cells)"),
         DataNeed("dem", kind="static", units="m",
                   description="Surface elevation"),
-        DataNeed("burnable", kind="static", required=False,
-                  description="Optional burnable mask"),
         DataNeed("wind_speed_ms", kind="time", required=False,
                   description="Optional wind speed series; "
                               "if absent the namelist defaults are used"),
@@ -304,14 +303,12 @@ class WRFSFireAdapter(ModelAdapter):
         H, W = grid.shape
         Hf, Wf = H * self.fmr, W * self.fmr
 
-        # Build the fire-mesh TIGN_IN field.
+        # Build the fire-mesh TIGN_IN field. A cell is "pre-ignited" iff
+        # ignition_t0 is finite + non-negative. Whether the cell can
+        # actually carry fire is `nfuel_cat`'s job — no-fuel categories
+        # are written there, not in a separate boolean mask.
         ign_t0 = np.asarray(inputs["ignition_t0"], dtype="float32")
-        burnable = inputs.get("burnable")
-        if burnable is None:
-            valid = np.isfinite(ign_t0) & (ign_t0 >= 0)
-        else:
-            burnable = np.asarray(burnable).astype(bool)
-            valid = (burnable & np.isfinite(ign_t0) & (ign_t0 >= 0))
+        valid = np.isfinite(ign_t0) & (ign_t0 >= 0)
         tign_atm = np.where(valid, ign_t0, _UNIGNITED_SENTINEL_S
                              ).astype("float32")
         # Cap pre-ignition times to fire_tign_in_time - epsilon so SFIRE

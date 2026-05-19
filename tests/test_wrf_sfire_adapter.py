@@ -185,10 +185,6 @@ def _cube_with_asteroid(tmp_path: Path):
                        np.full((H, W), 300.0, dtype="float32"),
                        source="dem_driver", native_res_m=30.0,
                        producer="dem", units="m")
-    cube.write_static("burnable",
-                       np.ones((H, W), dtype="float32"),
-                       source="thermal_driver", native_res_m=500.0,
-                       producer="thermal")
     return cube, ign
 
 
