@@ -19,6 +19,8 @@ from .contracts import (
     VarSpec,
 )
 from .adapters import DataDriverAdapter, ModelFunctionAdapter
+from .data_adapter import DataAdapter, DataNeed
+from .model_adapter import ModelAdapter
 from .backends import (
     Backend,
     DaskBackend,
@@ -82,6 +84,10 @@ __all__ = [
     # producer adapters
     "DataDriverAdapter",
     "ModelFunctionAdapter",
+    # pluggable data + model adapters (declare needs + run external model)
+    "DataAdapter",
+    "DataNeed",
+    "ModelAdapter",
     # backends
     "Backend",
     "DaskBackend",
