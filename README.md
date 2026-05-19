@@ -16,7 +16,7 @@ glue. You bring the model and the data; the engine wires them together.
 | [cube/](cube/) | Per-variable Zarr storage indexed by a DuckDB catalog. Resolution-aware satisfaction checks, schema versioning, halo I/O, snapshots. |
 | [engine/](engine/) | Orchestration substrate. ProducerV2 contract, DAG pipeline DSL, pluggable execution backends (serial / thread / process / dask / SLURM), tile fan-out, retries with dead-letter, dirty propagation, run lineage, content-addressable cache, disk-spill workspace. |
 | [drivers/](drivers/) | Data-source-specific fetchers (KML, thermal-pulse, DEM, weather reanalysis, etc). These are scenario-specific — keep what you need, write more as you go. |
-| [models/](models/) | `external_model_template.py` — drop-in template for plugging in a new model. The substrate ships no concrete models; you bring them. |
+| [models/](models/) | `external_model_template.py` — drop-in template for new model adapters. `wrf_sfire_adapter.py` — adapter that calls the external WRF-SFIRE model in [wrf-sfire/](wrf-sfire/). No physics ships here; adapters are wiring. |
 | [tests/](tests/) | Engine guarantees end-to-end. |
 
 ## Plugging in a new model
@@ -73,7 +73,8 @@ engine/         orchestration substrate (model-agnostic)
 cube/           storage + catalog + halo + snapshot
 drivers/        data-source fetchers (scenario-specific)
 models/         model plug-ins
-  external_model_template.py    drop-in template
+  external_model_template.py    drop-in adapter template
+  wrf_sfire_adapter.py          adapter for the external WRF-SFIRE model
 tests/          engine + adapter integration tests
 configs/        example configs
 ```
