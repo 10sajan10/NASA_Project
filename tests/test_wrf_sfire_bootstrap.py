@@ -38,6 +38,8 @@ def test_dry_run_actions_include_clone_and_compile(tmp_path):
     plan = bootstrap_wrf_sfire_stack(
         install_root=tmp_path / "stack", dry_run=True)
     actions = "\n".join(plan.actions).lower()
+    assert "netcdf_classic=1" in actions
+    assert "stdin='32\\n0\\n'" in actions
     assert "clone wrf-sfire" in actions
     assert "compile em_fire" in actions
     assert "compile em_real" in actions
@@ -55,6 +57,16 @@ def test_dry_run_skip_components(tmp_path):
     assert "skip wrf-sfire" in text
     assert "skip wps " in text
     assert "skip wps_geog" in text
+
+
+def test_hdf5_env_is_ignored_on_classic_netcdf_path(tmp_path):
+    plan = bootstrap_wrf_sfire_stack(
+        install_root=tmp_path / "stack",
+        netcdf_env={"HDF5": "/usr", "HD5": "/usr"},
+        dry_run=True)
+    text = "\n".join(plan.actions).lower()
+    assert "ignore hdf5/hd5" in text
+    assert "netcdf_classic=1" in text
 
 
 def test_dry_run_detects_existing_install(tmp_path):
