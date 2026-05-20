@@ -21,8 +21,9 @@ from .contracts import (
     VarSpec,
 )
 from .adapters import DataDriverAdapter, ModelFunctionAdapter
-from .data_adapter import DataAdapter, DataNeed
+from .data_adapter import DataAdapter, DataNeed, NoDataAvailable
 from .model_adapter import ModelAdapter
+from .resample import resample_spatial, resample_temporal
 from .backends import (
     Backend,
     DaskBackend,
@@ -89,7 +90,11 @@ __all__ = [
     # pluggable data + model adapters (declare needs + run external model)
     "DataAdapter",
     "DataNeed",
+    "NoDataAvailable",
     "ModelAdapter",
+    # resample utilities (spatial + temporal)
+    "resample_spatial",
+    "resample_temporal",
     # backends
     "Backend",
     "DaskBackend",

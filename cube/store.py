@@ -15,7 +15,7 @@ from __future__ import annotations
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import numpy as np
 import xarray as xr
@@ -388,6 +388,33 @@ class Cube:
         ds = xr.open_zarr(self._zarr_path(variable), consolidated=False)
         return [t.astype("datetime64[us]").item() for t in ds.t.values]
 
+    def read_3d_window(self, variable: str,
+                        t_start: Optional[datetime] = None,
+                        t_end: Optional[datetime] = None
+                        ) -> tuple[list[datetime], np.ndarray]:
+        """Read only timesteps falling inside ``[t_start, t_end]`` (both
+        ends inclusive). Either bound may be None to leave that side
+        open. Useful when the cube holds a long time series but a
+        consumer only needs a slice — avoids materialising the full
+        array.
+
+        Returns ``(times_in_window, array_of_shape (T_in_window, H, W))``.
+        If no timestep falls inside the window, returns
+        ``([], np.empty((0, H, W)))`` rather than raising — callers can
+        decide whether to treat that as "no data" or trigger a producer.
+        """
+        ds = xr.open_zarr(self._zarr_path(variable), consolidated=False)
+        sel_kwargs: dict[str, Any] = {}
+        # xarray .sel(t=slice(a, b)) is inclusive on both ends.
+        if t_start is not None or t_end is not None:
+            sel_kwargs["t"] = slice(
+                np.datetime64(t_start) if t_start is not None else None,
+                np.datetime64(t_end) if t_end is not None else None,
+            )
+        sub = ds[variable].sel(**sel_kwargs) if sel_kwargs else ds[variable]
+        ts = [t.astype("datetime64[us]").item() for t in sub.t.values]
+        return ts, np.asarray(sub.values)
+
     # ------------------------------------------------------------------
     # introspection
     # ------------------------------------------------------------------
@@ -455,6 +482,35 @@ class Cube:
 
         # Unknown kinds are intentionally not guessed.
         return False
+
+    def time_coverage(self, variable: str,
+                       t_start: datetime,
+                       t_end: datetime) -> dict:
+        """Report what timestamps the cube has for `variable` in
+        [t_start, t_end] (inclusive both ends).
+
+        Returns a dict with:
+          * times_in_range : sorted list of available timestamps inside
+                              the requested window
+          * window_covered : True iff at least one tile lies inside the
+                              window
+          * first / last   : full available range for the variable, or
+                              None if the variable is absent / static
+
+        This is diagnostic. `cube.satisfies(spec, request)` remains the
+        canonical scheduling check.
+        """
+        times = self.catalog.list_times(variable)
+        if not times:
+            return {"times_in_range": [], "window_covered": False,
+                    "first": None, "last": None}
+        in_range = [t for t in times if t_start <= t <= t_end]
+        return {
+            "times_in_range": in_range,
+            "window_covered": bool(in_range),
+            "first": times[0],
+            "last": times[-1],
+        }
 
     def list_variables(self) -> list[dict]:
         return self.catalog.list_variables()
