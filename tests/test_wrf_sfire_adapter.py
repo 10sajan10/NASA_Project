@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import stat
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +73,21 @@ def test_block_reduce_min_picks_smallest_in_block():
     assert np.array_equal(out, np.array([[0, 2], [8, 10]], dtype="float32"))
 
 
+def test_cmd_for_stage_resolves_project_relative_binary(
+        tmp_path, sfire_templates, monkeypatch):
+    """Usage examples can point at wrf-sfire/main/wrf.exe from the project
+    root even though subprocesses run with cwd set to a temp stage."""
+    exe = tmp_path / "wrf-sfire" / "main" / "wrf.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("#!/bin/sh\n")
+    monkeypatch.chdir(tmp_path)
+    adapter = WRFSFireAdapter(sfire_dir=sfire_templates)
+
+    resolved = adapter._cmd_for_stage(["wrf-sfire/main/wrf.exe"])
+
+    assert resolved[0] == str(exe)
+
+
 # ========================================================== fake binaries
 _FAKE_WRF_SCRIPT = '''\
 #!/usr/bin/env python3
@@ -121,6 +137,31 @@ def fake_wrf_binary(tmp_path: Path) -> Path:
     return p
 
 
+_FAKE_REAL_SCRIPT = '''\
+#!/usr/bin/env python3
+"""Stand-in for real.exe used in tests.
+
+The adapter should call this only when canonical cube wind covers the
+requested run period and WRF-native met_em files are staged. We leave
+wrfinput creation to the adapter's minimal test fallback.
+"""
+from pathlib import Path
+
+stage = Path.cwd()
+assert list(stage.glob("met_em.d01*"))
+assert not list(stage.glob("*.npz"))
+(stage / "real_was_used.txt").write_text("real path used\\n")
+'''
+
+
+@pytest.fixture
+def fake_real_binary(tmp_path: Path) -> Path:
+    p = tmp_path / "fake_real.py"
+    p.write_text(_FAKE_REAL_SCRIPT)
+    p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return p
+
+
 @pytest.fixture
 def sfire_templates(tmp_path: Path) -> Path:
     """A minimal sfire_dir holding just the templates the producer
@@ -154,7 +195,9 @@ def sfire_templates(tmp_path: Path) -> Path:
         "/\n"
     )
     (sfire_dir / "namelist.fire").write_text("&fuel_scalars\n/\n")
-    (sfire_dir / "input_sounding").write_text("# minimal sounding\n")
+    (sfire_dir / "input_sounding").write_text(
+        "# surface line\n"
+        " 100.0 300.0 0.0 1.0 2.0\n")
     return sfire_dir
 
 
@@ -191,15 +234,46 @@ def _cube_with_asteroid(tmp_path: Path):
 # ========================================================== producer
 def _build_producer(sfire_templates: Path, fake_wrf: Path,
                     fire_mesh_ratio: int = 2,
-                    sim_seconds: int = 600):
+                    sim_seconds: int = 600,
+                    real_cmd=None,
+                    met_em_dir: Path | None = None,
+                    stage_root: Path | None = None):
     return WRFSFireAdapter(
         sfire_dir=sfire_templates,
         ideal_cmd=None,                                  # test mode
+        real_cmd=real_cmd,
+        met_em_dir=met_em_dir,
         wrf_cmd=[sys.executable, str(fake_wrf)],
         sim_seconds=sim_seconds,
         history_interval_s=60,
         fire_mesh_ratio=fire_mesh_ratio,
+        stage_root=stage_root,
     )
+
+
+def _seed_wind(cube, t0: datetime, *, hours: int,
+               speed: float = 5.0, direction: float = 270.0,
+               include_direction: bool = True):
+    ts = [t0 + timedelta(hours=i) for i in range(hours)]
+    H, W = cube.grid.shape
+    speed_arr = np.full((hours, H, W), speed, dtype="float32")
+    cube.write_3d(
+        "wind_speed_ms", ts, speed_arr,
+        source="test_wind", native_res_m=27_750.0,
+        units="m/s", producer="test_wind")
+    if include_direction:
+        dir_arr = np.full((hours, H, W), direction, dtype="float32")
+        cube.write_3d(
+            "wind_dir_deg", ts, dir_arr,
+            source="test_wind", native_res_m=27_750.0,
+            units="deg", producer="test_wind")
+
+
+def _met_em_dir(tmp_path: Path) -> Path:
+    met = tmp_path / "met_em"
+    met.mkdir()
+    (met / "met_em.d01.2026-09-15_00:00:00.nc").write_text("placeholder\n")
+    return met
 
 
 # ========================================================== integration
@@ -310,6 +384,104 @@ def test_arrival_s_lands_back_in_cube(
     cube.close()
 
 
+def test_input_sounding_uses_cube_wind_vector(
+        tmp_path, sfire_templates, fake_wrf_binary):
+    """The adapter translates canonical cube wind into WRF's sounding
+    u/v columns without caring which upstream driver produced it."""
+    t0 = datetime(2026, 9, 15)
+    cube, _ = _cube_with_asteroid(tmp_path / "cube")
+    _seed_wind(cube, t0, hours=1, speed=5.0, direction=270.0)
+    stage_root = tmp_path / "stages"
+    model = _build_producer(
+        sfire_templates, fake_wrf_binary,
+        fire_mesh_ratio=2,
+        stage_root=stage_root)
+    reg = to_engine_registry([model])
+    pipe = Pipeline.from_targets(["arrival_s"], registry=reg)
+    runner = PipelineRunner(reg, backend=SerialBackend(),
+                             verbose=False)
+    res = runner.run(
+        cube, pipe,
+        t_start=t0, t_end=t0 + timedelta(minutes=10),
+        context={"keep_stage": True})
+    assert res.ok, [s.error for s in res.steps if s.status == "error"]
+
+    stage = sorted(stage_root.glob("wrf_sfire_asteroid_*"))[-1]
+    row = (stage / "input_sounding").read_text().splitlines()[1].split()
+    # Direction 270 = wind from west, so it blows east: u=+speed, v~0.
+    assert float(row[3]) == pytest.approx(5.0, abs=1e-3)
+    assert float(row[4]) == pytest.approx(0.0, abs=1e-3)
+    cube.close()
+
+
+def test_real_exe_path_used_when_cube_wind_and_met_em_are_available(
+        tmp_path, sfire_templates, fake_wrf_binary, fake_real_binary):
+    """When both wind_speed_ms and wind_dir_deg cover the requested
+    period and WRF-native met_em inputs are configured, the adapter
+    invokes real_cmd before injecting SFIRE inputs."""
+    t0 = datetime(2026, 9, 15)
+    cube, _ = _cube_with_asteroid(tmp_path / "cube")
+    _seed_wind(cube, t0, hours=3)
+    stage_root = tmp_path / "stages"
+    model = _build_producer(
+        sfire_templates, fake_wrf_binary,
+        fire_mesh_ratio=2,
+        real_cmd=[sys.executable, str(fake_real_binary)],
+        met_em_dir=_met_em_dir(tmp_path),
+        stage_root=stage_root)
+    reg = to_engine_registry([model])
+    pipe = Pipeline.from_targets(["arrival_s"], registry=reg)
+    runner = PipelineRunner(reg, backend=SerialBackend(),
+                             verbose=False)
+    res = runner.run(
+        cube, pipe,
+        t_start=t0, t_end=t0 + timedelta(hours=2),
+        context={"keep_stage": True})
+    assert res.ok, [s.error for s in res.steps if s.status == "error"]
+
+    stages = sorted(stage_root.glob("wrf_sfire_asteroid_*"))
+    assert stages
+    stage = stages[-1]
+    assert (stage / "real_was_used.txt").exists()
+    assert list(stage.glob("met_em.d01*"))
+    assert not list(stage.glob("*.npz"))
+    cube.close()
+
+
+def test_real_exe_path_not_used_when_wind_pair_or_period_is_incomplete(
+        tmp_path, sfire_templates, fake_wrf_binary, fake_real_binary):
+    """real_cmd is selected only when both canonical wind variables exist
+    and cover the requested period. Missing direction keeps the
+    ideal/minimal path."""
+    t0 = datetime(2026, 9, 15)
+    cube, _ = _cube_with_asteroid(tmp_path / "cube")
+    _seed_wind(cube, t0, hours=3, include_direction=False)
+    stage_root = tmp_path / "stages"
+    model = _build_producer(
+        sfire_templates, fake_wrf_binary,
+        fire_mesh_ratio=2,
+        real_cmd=[sys.executable, str(fake_real_binary)],
+        met_em_dir=_met_em_dir(tmp_path),
+        stage_root=stage_root)
+    reg = to_engine_registry([model])
+    pipe = Pipeline.from_targets(["arrival_s"], registry=reg)
+    runner = PipelineRunner(reg, backend=SerialBackend(),
+                             verbose=False)
+    res = runner.run(
+        cube, pipe,
+        t_start=t0, t_end=t0 + timedelta(hours=2),
+        context={"keep_stage": True})
+    assert res.ok, [s.error for s in res.steps if s.status == "error"]
+
+    stages = sorted(stage_root.glob("wrf_sfire_asteroid_*"))
+    assert stages
+    stage = stages[-1]
+    assert not (stage / "real_was_used.txt").exists()
+    assert not list(stage.glob("*.npz"))
+    assert not list(stage.glob("met_em.d01*"))
+    cube.close()
+
+
 def test_second_run_is_skipped(
         tmp_path, sfire_templates, fake_wrf_binary):
     """The WRF binary is expensive — a second run on the same cube must
@@ -324,6 +496,60 @@ def test_second_run_is_skipped(
     runner.run(cube, pipe)
     res2 = runner.run(cube, pipe)
     assert res2.by_name()["wrf_sfire_asteroid"].status == "skipped"
+    cube.close()
+
+
+def test_burnability_gate_blocks_ignition_in_no_fuel_cells(
+        tmp_path, sfire_templates, fake_wrf_binary):
+    """A cell inside the asteroid annulus that has a non-burnable
+    Anderson 13 code (14, 91, 92, 93, 98, 99) must NOT be pre-ignited
+    in TIGN_IN — urban/snow/water surfaces don't carry fire just because
+    a thermal pulse hit them. The adapter ANDs `np.isfinite(ign_t0)`
+    with `1 <= nfuel_cat <= 13`."""
+    cube, _ign = _cube_with_asteroid(tmp_path / "cube")
+    H, W = cube.grid.shape
+
+    # Make EVERY cell pre-ignited at t=0.0, then make the top-left
+    # quadrant non-burnable (code 14). If the gate works, only the
+    # bottom-right quadrant ends up with a non-sentinel TIGN_IN.
+    cube.write_static(
+        "ignition_t0",
+        np.zeros((H, W), dtype="float32"),
+        source="t", native_res_m=500.0, producer="t", units="s")
+    nfuel = np.full((H, W), 3, dtype="float32")  # burnable default
+    nfuel[: H // 2, : W // 2] = 14.0             # no-fuel quadrant
+    cube.write_static(
+        "nfuel_cat", nfuel,
+        source="t", native_res_m=30.0, producer="t")
+
+    fmr = 2
+    model = _build_producer(sfire_templates, fake_wrf_binary,
+                             fire_mesh_ratio=fmr)
+    reg = to_engine_registry([model])
+    pipe = Pipeline.from_targets(["arrival_s"], registry=reg)
+    PipelineRunner(reg, backend=SerialBackend(),
+                    verbose=False).run(
+        cube, pipe, context={"keep_stage": True})
+
+    import netCDF4 as nc
+    import tempfile
+    candidates = sorted(Path(tempfile.gettempdir()).glob(
+        "wrf_sfire_asteroid_*/wrfinput_d01.nc"),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    assert candidates, "stage dir was not preserved"
+    with nc.Dataset(candidates[0]) as ds:
+        tign_in = np.asarray(ds.variables["TIGN_IN"][:])
+
+    # Map the atm-mesh no-fuel block to its fire-mesh extent.
+    no_fuel_y = (H // 2) * fmr      # atm `:H//2` -> fire `:(H//2)*fmr`
+    no_fuel_x = (W // 2) * fmr
+    sentinel_mask = tign_in > 0.99 * _UNIGNITED_SENTINEL_S
+    # No-fuel block on the fire mesh -> all sentinel (no ignition)
+    assert sentinel_mask[:no_fuel_y, :no_fuel_x].all(), (
+        "no-fuel quadrant should be marked un-ignited via the burnability gate")
+    # Burnable block on the fire mesh -> all finite TIGN_IN
+    assert not sentinel_mask[no_fuel_y:, no_fuel_x:].any(), (
+        "burnable quadrant should keep its finite ignition time")
     cube.close()
 
 

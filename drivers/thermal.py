@@ -64,9 +64,11 @@ class ThermalDriver(Driver):
                           description=f"Power flux assuming {self.pulse_seconds}-s "
                           "square pulse")
         cube.write_static("ignition_t0", ig_t0,
-                          source=src, native_res_m=nat, units="bool",
+                          source=src, native_res_m=nat, units="s",
                           producer=self.name,
-                          description="t=0 burning annulus: Critical -> Unsurvivable")
+                          description="Per-cell asteroid pre-ignition time "
+                                      "(s); 0.0 inside the Critical->Unsurvivable "
+                                      "annulus, NaN elsewhere")
         cube.write_static("burnable", burnable,
                           source=src, native_res_m=nat, units="bool",
                           producer=self.name,
@@ -107,7 +109,15 @@ class ThermalDriver(Driver):
 
         j_crit = DAMAGE_FLUENCE_MJ_M2["Critical Burn (clothing)"]
         j_unsurv = DAMAGE_FLUENCE_MJ_M2["Unsurvivable Burn (structures)"]
-        ig_t0 = ((fluence >= j_crit) & (fluence < j_unsurv)).astype(np.uint8)
+        # The ignition annulus: between Critical (outer edge of the
+        # cellulose-ignition zone) and Unsurvivable (inner edge of the
+        # vaporised dead zone). Cells inside the annulus ignite at the
+        # pulse front (t = 0); cells outside are encoded as NaN so the
+        # downstream WRF-SFIRE adapter's `np.isfinite` check correctly
+        # treats them as un-ignited and lets SFIRE physics propagate
+        # fire into them.
+        in_annulus = (fluence >= j_crit) & (fluence < j_unsurv)
+        ig_t0 = np.where(in_annulus, 0.0, np.nan).astype(np.float32)
         burnable = (fluence < j_unsurv).astype(np.uint8)
 
         return fluence, power, ig_t0, burnable, _RingMetrics(

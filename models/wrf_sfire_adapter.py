@@ -1,9 +1,9 @@
 """Adapter that calls the external WRF-SFIRE model from the engine.
 
-The MODEL is the Fortran code in the cloned `wrf-sfire/` directory.
-This file is just the ADAPTER: Python wiring that stages cube data into
-SFIRE's expected NetCDF/namelist format, subprocesses the `wrf.exe`
-binary, and parses the wrfout back into the cube. No fire physics
+The MODEL is the external Fortran WRF-SFIRE checkout. This file is just
+the ADAPTER: Python wiring that stages cube data into SFIRE's expected
+NetCDF/namelist format, subprocesses the `real.exe` / `wrf.exe`
+binaries, and parses the wrfout back into the cube. No fire physics
 lives here.
 
 If you swap WRF-SFIRE for a different external model, write a new
@@ -20,9 +20,11 @@ Inputs consumed (declared via DataAdapter):
                     cells with NaN/<0 are taken to be un-ignited
   * nfuel_cat    - Anderson 13 fuel categories (1..13 burnable, 14 no-fuel)
   * dem          - surface elevation (m)
-  * burnable     - optional; mask of cells that can burn
-  * wind_speed_ms / wind_dir_deg - optional time series; if absent, the
-                    namelist's static wind values are used
+  * wind_speed_ms / wind_dir_deg - optional canonical cube wind time series.
+                    If both cover the requested run period, the adapter
+                    translates them into WRF-SFIRE's sounding format. The
+                    real.exe path also requires prebuilt WRF-native
+                    met_em.d01.* atmospheric inputs.
 
 Outputs produced:
   * arrival_s    - fire arrival time per cell (TIGN_G), merged MONOTONE_MIN
@@ -37,12 +39,48 @@ How SFIRE knows about the asteroid pulse:
     (TIGN_IN >> fire_tign_in_time) so SFIRE leaves them un-ignited and
     lets its physics propagate fire to them.
 
-Building the binary (one-time, ~1 hour on CHPC):
-    module load gcc netcdf-c netcdf-fortran
+External setup (one-time, outside the adapter):
+    # WRF-SFIRE supplies real.exe / wrf.exe / ideal.exe.
+    git clone https://github.com/openwfm/wrf-sfire wrf-sfire
     cd wrf-sfire
-    ./configure                  # pick gfortran serial (32)
-    ./compile em_fire 2>&1 | tee build.log
-    # produces wrf.exe + ideal.exe in main/
+    module load gcc netcdf-c netcdf-fortran
+    ./configure
+    ./compile em_fire 2>&1 | tee compile_em_fire.log
+    ./compile em_real 2>&1 | tee compile_em_real.log
+    # main/ should now contain wrf.exe, ideal.exe, and real.exe.
+
+    # WPS supplies geogrid.exe / ungrib.exe / metgrid.exe. Run it outside
+    # this adapter to produce met_em.d01.* files for the requested domain.
+    cd ..
+    git clone https://github.com/openwfm/WPS WPS
+    cd WPS
+    export WRF_DIR="$(pwd)/../wrf-sfire"
+    ./configure
+    ./compile 2>&1 | tee compile_wps.log
+
+    # WPS_GEOG is static land-use/elevation/soil data used by geogrid.exe.
+    # It is not read by this adapter directly, but WPS needs it before it
+    # can create geo_em/met_em files for a real-data run.
+    cd ..
+    wget https://demo.openwfm.org/web/wrfx/WPS_GEOG.tbz
+    tar xvfj WPS_GEOG.tbz
+
+Runtime contract:
+    * WPS_GEOG is used by WPS/geogrid, not by WRFSFireAdapter.
+    * WPS/metgrid produces met_em.d01.* files in `met_em_dir`.
+    * WRFSFireAdapter stages those WRF-native files, runs real.exe,
+      injects cube-derived fire fields, runs wrf.exe, and writes outputs
+      back to the cube.
+
+About WRFx:
+    wrfxpy / wrfxweb / wrfxctrl are OpenWFM's optional orchestration,
+    visualization, and web-submission stack. This repository already has its
+    own engine, cube, drivers, and backends, so WRFSFireAdapter does not need
+    wrfxpy, WRFx queue templates, or WRFx tokens. Use WRFx only if you want
+    its full forecasting/web workflow instead of this engine. Tokens such as
+    MesoWest or Earthdata are only needed by the data-acquisition tool that
+    contacts those services; the current ERA5/LANDFIRE/DEM drivers here do
+    not use WRFx token files.
 
 Usage:
     from models.wrf_sfire_adapter import WRFSFireAdapter
@@ -50,8 +88,10 @@ Usage:
 
     adapter = WRFSFireAdapter(
         sfire_dir="wrf-sfire/test/em_fire/hill",
-        ideal_cmd=["./ideal.exe"],
-        wrf_cmd=["./wrf.exe"],
+        ideal_cmd=["wrf-sfire/main/ideal.exe"],
+        real_cmd=["wrf-sfire/main/real.exe"],
+        met_em_dir="data/wps_runs/run_001/met_em",
+        wrf_cmd=["wrf-sfire/main/wrf.exe"],
         sim_seconds=3 * 3600,
         fire_mesh_ratio=4,
     )
@@ -70,6 +110,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -107,7 +148,7 @@ class WRFSFireAdapter(ModelAdapter):
         DataNeed("dem", kind="static", units="m",
                   description="Surface elevation"),
         DataNeed("wind_speed_ms", kind="time", required=False,
-                  description="Optional wind speed series; "
+                  description="Optional canonical wind speed series; "
                               "if absent the namelist defaults are used"),
         DataNeed("wind_dir_deg", kind="time", required=False),
     ])
@@ -132,6 +173,7 @@ class WRFSFireAdapter(ModelAdapter):
                  *,
                  sfire_dir: str | Path,
                  ideal_cmd: Optional[list[str]] = None,
+                 real_cmd: Optional[list[str]] = None,
                  wrf_cmd: list[str] | None = None,
                  sim_seconds: int = 3 * 3600,
                  history_interval_s: int = 120,
@@ -139,6 +181,7 @@ class WRFSFireAdapter(ModelAdapter):
                  namelist_template: str = "namelist.input_ignite_from_tign_in",
                  fire_namelist: str = "namelist.fire",
                  sounding: str = "input_sounding",
+                 met_em_dir: str | Path | None = None,
                  namelist_overrides: Optional[dict[str, str]] = None,
                  stage_root: str | Path | None = None,
                  keep_stage: bool = False) -> None:
@@ -147,7 +190,11 @@ class WRFSFireAdapter(ModelAdapter):
                      (namelist.input, namelist.fire, input_sounding,
                       and the wrf.exe/ideal.exe binaries when present)
         ideal_cmd : command to run ideal.exe. None skips ideal (test mode);
-                     the producer then builds wrfinput from scratch.
+                     the producer then builds wrfinput from scratch unless
+                     real_cmd is selected.
+        real_cmd  : command to run real.exe when complete cube wind inputs
+                     and prebuilt WRF-native met_em inputs are available.
+                     None disables real.exe and keeps the ideal/minimal path.
         wrf_cmd   : command to run wrf.exe (e.g. ["./wrf.exe"]).
         sim_seconds : total fire-spread simulation length in seconds.
         history_interval_s : how often SFIRE writes a wrfout history frame.
@@ -156,11 +203,15 @@ class WRFSFireAdapter(ModelAdapter):
         namelist_template : template namelist.input in sfire_dir. The
                             shipped 'namelist.input_ignite_from_tign_in'
                             is the canonical TIGN_IN-driven scenario.
+        met_em_dir : optional directory of prebuilt WPS `met_em.d01.*`
+                     files. When present, they are symlinked/copied into
+                     the stage before real.exe runs.
         namelist_overrides : extra `key=value` lines to inject into
                               namelist.input after the standard patches.
         """
         self.sfire_dir = Path(sfire_dir)
         self.ideal_cmd = ideal_cmd
+        self.real_cmd = real_cmd
         self.wrf_cmd = wrf_cmd or ["./wrf.exe"]
         self.sim_seconds = int(sim_seconds)
         self.history_interval_s = int(history_interval_s)
@@ -168,10 +219,40 @@ class WRFSFireAdapter(ModelAdapter):
         self.namelist_template = namelist_template
         self.fire_namelist = fire_namelist
         self.sounding = sounding
+        self.met_em_dir = Path(met_em_dir) if met_em_dir is not None else None
         self.namelist_overrides = dict(namelist_overrides or {})
         if stage_root is not None:
             self.stage_root = Path(stage_root)
         self.keep_stage = bool(keep_stage)
+
+    # ============================================================ BOOTSTRAP
+    @classmethod
+    def bootstrap(cls,
+                   install_root: str | Path = "wrf-sfire-stack",
+                   *,
+                   dry_run: bool = False,
+                   **kwargs):
+        """Provision WRF-SFIRE + WPS + WPS_GEOG under `install_root`.
+
+        Thin pass-through to `models.wrf_sfire_bootstrap.bootstrap_wrf_sfire_stack`.
+        Keeps callers from importing the bootstrap module directly when
+        the adapter is the obvious entry point.
+
+        Returns the `BootstrapPlan` describing what was (or, if
+        `dry_run=True`, what would be) done. After a successful real
+        bootstrap, instantiate the adapter with:
+
+            adapter = WRFSFireAdapter(
+                sfire_dir=plan.wrf_sfire_dir / "test/em_fire/hill",
+                ideal_cmd=[str(plan.wrf_sfire_dir / "main/ideal.exe")],
+                real_cmd =[str(plan.wrf_sfire_dir / "main/real.exe")],
+                wrf_cmd  =[str(plan.wrf_sfire_dir / "main/wrf.exe")],
+                met_em_dir=...,
+            )
+        """
+        from .wrf_sfire_bootstrap import bootstrap_wrf_sfire_stack
+        return bootstrap_wrf_sfire_stack(
+            install_root, dry_run=dry_run, **kwargs)
 
     # ============================================================ STAGE
     def stage_inputs(self, grid, inputs: dict[str, Any],
@@ -179,11 +260,19 @@ class WRFSFireAdapter(ModelAdapter):
         """Build a complete WRF-SFIRE stage dir:
 
           1. Copy template namelist.input / namelist.fire / input_sounding
+          1b. If cube wind is available, overwrite input_sounding's per-
+              level u/v columns with real wind at scenario start (so
+              the ideal fallback initialises with real meteorology, not
+              template wind).
           2. Patch namelist.input with grid dims, time, fire_tign_in_time
-          3. Run ideal.exe (or skip and create a minimal wrfinput)
+          3. If complete cube wind + real_cmd + prebuilt WRF-native met_em
+             inputs are available, stage met_em and run real.exe; otherwise
+             run ideal.exe (or skip and create a minimal wrfinput in test
+             mode).
           4. Inject TIGN_IN / NFUEL_CAT / ZSF into wrfinput_d01.nc
         """
         H, W = grid.shape
+        wind_state = self._cube_wind_for_required_period(inputs, request)
 
         # 1. Copy templates ------------------------------------------------
         for filename in (self.namelist_template,
@@ -198,6 +287,17 @@ class WRFSFireAdapter(ModelAdapter):
         shutil.copy(self.sfire_dir / self.fire_namelist,
                      stage / "namelist.fire")
         shutil.copy(self.sfire_dir / self.sounding, stage / "input_sounding")
+
+        # 1b. Overwrite input_sounding u/v with cube wind when present.
+        # Even when real.exe is unavailable, the ideal fallback now starts
+        # from the scenario wind instead of the template's canned wind.
+        used_real_wind = self._patch_input_sounding_with_wind(
+            stage / "input_sounding", inputs, request)
+        if used_real_wind:
+            print(f"[wrf_sfire] input_sounding patched with cube wind at "
+                  f"{request.t_start}")
+        else:
+            print("[wrf_sfire] no usable cube wind; using template sounding")
 
         # 2. Patch namelist.input -----------------------------------------
         ign_t0 = np.asarray(inputs["ignition_t0"], dtype="float32")
@@ -231,9 +331,34 @@ class WRFSFireAdapter(ModelAdapter):
             text = _patch_namelist_value(text, key, value)
         (stage / "namelist.input").write_text(text)
 
-        # 3. Run ideal.exe (or skip and create a minimal wrfinput) --------
-        if self.ideal_cmd is not None:
-            subprocess.run(self.ideal_cmd, cwd=stage, check=True)
+        # 3. Run real.exe only when WRF-native atmospheric inputs are
+        # available. Wind speed/direction are cube variables; met_em files
+        # are the WRF-required atmospheric input format.
+        real_requested = self.real_cmd is not None
+        real_ready = (
+            wind_state is not None
+            and self.real_cmd is not None
+            and self.met_em_dir is not None
+        )
+        if real_ready:
+            n_met = self._stage_met_em_files(stage)
+            if not n_met:
+                raise FileNotFoundError(
+                    f"no met_em.d01* files found in {self.met_em_dir}")
+            print(f"[wrf_sfire] staged {n_met} met_em files for real.exe")
+            print("[wrf_sfire] using real.exe path with cube wind coverage")
+            subprocess.run(self._cmd_for_stage(self.real_cmd),
+                           cwd=stage, check=True)
+        else:
+            if real_requested and wind_state is None:
+                print("[wrf_sfire] cube wind does not cover requested "
+                      "period; using ideal/minimal path")
+            elif real_requested and self.met_em_dir is None:
+                print("[wrf_sfire] cube wind is available, but no "
+                      "met_em_dir is configured; using ideal/minimal path")
+        if not real_ready and self.ideal_cmd is not None:
+            subprocess.run(self._cmd_for_stage(self.ideal_cmd),
+                           cwd=stage, check=True)
         wrfinput = stage / "wrfinput_d01.nc"
         if not wrfinput.exists():
             # Test-mode fallback: build a minimal wrfinput shell so the
@@ -246,7 +371,8 @@ class WRFSFireAdapter(ModelAdapter):
 
     # ============================================================ RUN
     def run_model(self, stage: Path, request: Request) -> Path:
-        subprocess.run(self.wrf_cmd, cwd=stage, check=True)
+        subprocess.run(self._cmd_for_stage(self.wrf_cmd),
+                       cwd=stage, check=True)
         return stage
 
     # ============================================================ PARSE
@@ -281,6 +407,172 @@ class WRFSFireAdapter(ModelAdapter):
         }
 
     # ============================================================ helpers
+    def _cmd_for_stage(self, cmd: list[str]) -> list[str]:
+        """Resolve `./binary` commands against sfire_dir for temp stages.
+
+        The adapter runs from a fresh stage directory, so relative commands
+        such as `wrf-sfire/main/wrf.exe` would otherwise be resolved relative
+        to that stage. If the command exists relative to the current project
+        directory or under sfire_dir, run that absolute path while keeping
+        cwd=stage for model I/O.
+        """
+        if not cmd:
+            return cmd
+        out = list(cmd)
+        exe = Path(out[0])
+        if not exe.is_absolute():
+            for candidate in (exe.resolve(), (self.sfire_dir / exe).resolve()):
+                if candidate.exists():
+                    out[0] = str(candidate)
+                    break
+        return out
+
+    def _cube_wind_for_required_period(self, inputs: dict[str, Any],
+                                        request: Request
+                                        ) -> Optional[dict[str, Any]]:
+        """Return cube wind inputs only when both variables cover the run.
+
+        Coverage is checked at hourly cadence because the current wind
+        drivers write hourly fields. A 10-minute run starting at 12:00 only
+        requires the 12:00 field; a three-hour run requires 12:00, 13:00,
+        and 14:00.
+        """
+        wind_speed = inputs.get("wind_speed_ms")
+        wind_dir = inputs.get("wind_dir_deg")
+        if wind_speed is None or wind_dir is None:
+            return None
+        if request.t_start is None:
+            return None
+
+        ts_s, speed_arr = wind_speed
+        ts_d, dir_arr = wind_dir
+        if list(ts_s) != list(ts_d):
+            raise RuntimeError(
+                "wind_speed_ms and wind_dir_deg time axes differ; "
+                "re-fetch wind so both share a single time axis")
+        if len(ts_s) == 0:
+            return None
+
+        t0, t1 = self._required_wind_window(request)
+        available = {self._floor_hour(t) for t in ts_s}
+        t = t0
+        while t <= t1:
+            if t not in available:
+                return None
+            t += timedelta(hours=1)
+
+        return {
+            "ts": list(ts_s),
+            "speed": np.asarray(speed_arr, dtype="float32"),
+            "direction": np.asarray(dir_arr, dtype="float32"),
+            "required_start": t0,
+            "required_end": t1,
+        }
+
+    def _required_wind_window(self, request: Request):
+        start = self._floor_hour(request.t_start)
+        if request.t_end is not None:
+            end_raw = request.t_end
+        else:
+            end_raw = request.t_start + timedelta(seconds=self.sim_seconds)
+        if end_raw <= request.t_start:
+            end_raw = request.t_start
+        # Request end is exclusive. Use the final covered hour.
+        end = self._floor_hour(end_raw - timedelta(microseconds=1))
+        if end < start:
+            end = start
+        return start, end
+
+    @staticmethod
+    def _floor_hour(t):
+        return t.replace(minute=0, second=0, microsecond=0)
+
+    def _stage_met_em_files(self, stage: Path) -> int:
+        if self.met_em_dir is None:
+            return 0
+        if not self.met_em_dir.exists():
+            raise FileNotFoundError(self.met_em_dir)
+        files = sorted(self.met_em_dir.glob("met_em.d01*"))
+        for src in files:
+            dest = stage / src.name
+            if dest.exists():
+                continue
+            try:
+                dest.symlink_to(src.resolve())
+            except OSError:
+                shutil.copy2(src, dest)
+        return len(files)
+
+    def _patch_input_sounding_with_wind(self, sounding_path: Path,
+                                         inputs: dict[str, Any],
+                                         request: Request) -> bool:
+        """If `inputs` carries cube wind, replace the u/v columns of every
+        per-level row in `input_sounding` with real wind at scenario start.
+        Returns True if at least one sounding row was patched.
+
+        The template's surface line + per-level (height, theta, qv) are
+        left intact; only the trailing u/v columns are swapped. The wind
+        is broadcast vertically (10 m surface wind applied at every
+        level). For more nuanced vertical profiles, fetch multi-level
+        winds and extend this method.
+        """
+        wind_speed = inputs.get("wind_speed_ms")
+        wind_dir = inputs.get("wind_dir_deg")
+        if wind_speed is None or wind_dir is None:
+            return False
+        if not sounding_path.exists():
+            return False
+
+        ts_s, speed_arr = wind_speed       # (timestamps, (T, H, W))
+        ts_d, dir_arr = wind_dir
+        if list(ts_s) != list(ts_d):
+            raise RuntimeError(
+                "wind_speed_ms and wind_dir_deg time axes differ; "
+                "re-fetch wind so both share a single time axis")
+        if request.t_start is None:
+            return False
+
+        # Pick the timestamp closest to scenario start.
+        t_target = request.t_start.replace(
+            minute=0, second=0, microsecond=0)
+        deltas = [abs((t - t_target).total_seconds()) for t in ts_s]
+        ti = int(np.argmin(deltas))
+
+        # Use the cube-center cell. For small AOIs the wind is ~uniform;
+        # the center is a reproducible representative.
+        H, W = speed_arr.shape[1], speed_arr.shape[2]
+        cy, cx = H // 2, W // 2
+        speed = float(speed_arr[ti, cy, cx])
+        direction = float(dir_arr[ti, cy, cx])
+
+        # Meteorological direction (wind comes FROM) -> earth-frame u/v.
+        # u positive = blows east; v positive = blows north.
+        dir_rad = float(np.deg2rad(direction))
+        u_earth = -speed * float(np.sin(dir_rad))
+        v_earth = -speed * float(np.cos(dir_rad))
+
+        # Patch per-level rows: keep height, theta, qv; rewrite u, v.
+        old = sounding_path.read_text().splitlines()
+        if not old:
+            return False
+        new_lines = [old[0]]              # surface line untouched
+        patched = False
+        for line in old[1:]:
+            tokens = line.split()
+            if len(tokens) < 5:
+                new_lines.append(line)     # malformed; leave alone
+                continue
+            height, theta, qv = tokens[0], tokens[1], tokens[2]
+            new_lines.append(
+                f" {float(height):11.2f} {float(theta):11.2f} "
+                f"{float(qv):11.2f} {u_earth:11.3f} {v_earth:11.3f}"
+            )
+            patched = True
+        if not patched:
+            return False
+        sounding_path.write_text("\n".join(new_lines) + "\n")
+        return True
+
     def _write_minimal_wrfinput(self, path: Path, grid) -> None:
         """Create a NetCDF shell with the dimensions SFIRE expects, used
         in test mode when no real ideal.exe is available."""
@@ -304,11 +596,20 @@ class WRFSFireAdapter(ModelAdapter):
         Hf, Wf = H * self.fmr, W * self.fmr
 
         # Build the fire-mesh TIGN_IN field. A cell is "pre-ignited" iff
-        # ignition_t0 is finite + non-negative. Whether the cell can
-        # actually carry fire is `nfuel_cat`'s job — no-fuel categories
-        # are written there, not in a separate boolean mask.
+        #
+        #   1. ignition_t0 is finite + non-negative      (asteroid pulse
+        #                                                  reached it), AND
+        #   2. nfuel_cat is a burnable Anderson 13 code  (1..13). LANDFIRE
+        #      non-burnable codes (91/92/93/98/99) are mapped to the
+        #      no-fuel sentinel (14) by drivers.landfire_fbfm13, and the
+        #      same gate covers any source that uses category 14 for "no
+        #      fuel". This stops us flagging urban/snow/water cells as
+        #      pre-ignited just because they sit inside the asteroid's
+        #      thermal annulus.
         ign_t0 = np.asarray(inputs["ignition_t0"], dtype="float32")
-        valid = np.isfinite(ign_t0) & (ign_t0 >= 0)
+        nfuel_atm = np.asarray(inputs["nfuel_cat"], dtype="float32")
+        burnable_cell = (nfuel_atm >= 1.0) & (nfuel_atm <= 13.0)
+        valid = (np.isfinite(ign_t0) & (ign_t0 >= 0) & burnable_cell)
         tign_atm = np.where(valid, ign_t0, _UNIGNITED_SENTINEL_S
                              ).astype("float32")
         # Cap pre-ignition times to fire_tign_in_time - epsilon so SFIRE
@@ -319,7 +620,6 @@ class WRFSFireAdapter(ModelAdapter):
             tign_atm)
         tign_fire = _block_replicate(tign_atm, (self.fmr, self.fmr))
 
-        nfuel_atm = np.asarray(inputs["nfuel_cat"], dtype="float32")
         nfuel_fire = _block_replicate(nfuel_atm, (self.fmr, self.fmr))
 
         dem_atm = np.asarray(inputs["dem"], dtype="float32")
