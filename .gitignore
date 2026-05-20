@@ -5,6 +5,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 wrf-sfire/
+WRF-SFIRE/
+WPS/
+WPS_GEOG/
 # Local environments
 .venv/
 venv/
