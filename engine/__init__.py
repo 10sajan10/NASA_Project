@@ -22,6 +22,7 @@ from .contracts import (
 )
 from .adapters import DataDriverAdapter, ModelFunctionAdapter
 from .data_adapter import DataAdapter, DataNeed, NoDataAvailable
+from .log import RunContext, configure as configure_logging, get_logger
 from .model_adapter import ModelAdapter
 from .resample import resample_spatial, resample_temporal
 from .backends import (
@@ -95,6 +96,10 @@ __all__ = [
     # resample utilities (spatial + temporal)
     "resample_spatial",
     "resample_temporal",
+    # logging facade
+    "RunContext",
+    "configure_logging",
+    "get_logger",
     # backends
     "Backend",
     "DaskBackend",

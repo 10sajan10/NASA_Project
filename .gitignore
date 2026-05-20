@@ -17,9 +17,13 @@ env/
 data/cube/
 data/raw/
 data/out/
+data/runs/
 data/*.duckdb
 data/catalog.json
 data/grid.json
+wrf-sfire-stack/
+hdf5_root/
+netcdf_root/
 data_*/
 *.zarr/
 *.tif

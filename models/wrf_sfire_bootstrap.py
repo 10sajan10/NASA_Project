@@ -33,9 +33,13 @@ Limitations (intentional, to keep this module short and predictable):
   * Configure is interactive in the upstream Makefiles. We feed answers
     via stdin; if your environment needs different compiler choices,
     pass them via `wrf_configure_input` / `wps_configure_input`.
-  * The bootstrap does not provision Intel/GNU compilers, NetCDF, HDF5,
+  * The bootstrap does not provision Intel/GNU compilers, NetCDF,
     Jasper, or MPI — those are system packages outside our control.
     The wiki lists what to install via your OS package manager.
+  * WRF-SFIRE is configured in classic NetCDF mode by default. That keeps
+    this repo on the portable path we verified on CHPC and avoids WRF's
+    fragile explicit HDF5 link flags (`-lhdf5*`), which do not match the
+    Debian/Ubuntu `hdf5_serial` library names.
   * GRIB acquisition (ungrib input) is NOT covered. Met-data ingest is
     a separate concern; this module only builds the binaries.
 """
@@ -58,12 +62,12 @@ WPS_GEOG_URL = "https://demo.openwfm.org/web/wrfx/WPS_GEOG.tbz"
 
 
 # Defaults match the openwfm wiki's recommendations:
-#   * WRF-SFIRE configure: 34 (GNU gfortran/gcc dmpar) + 1 (simple
-#     nesting). The wiki recommends Intel (15), but GNU is more
-#     portable. Override via `wrf_configure_input` if you have Intel.
+#   * WRF-SFIRE configure: 32 (GNU gfortran/gcc serial) + 0 (no nesting).
+#     This is the portable local/dev default verified for the adapter.
+#     Override via `wrf_configure_input` for Intel or MPI builds.
 #   * WPS configure: 1 (GNU gfortran/gcc serial). Wiki recommends 17
 #     (Intel serial); override for that.
-_DEFAULT_WRF_CONFIGURE_INPUT = "34\n1\n"
+_DEFAULT_WRF_CONFIGURE_INPUT = "32\n0\n"
 _DEFAULT_WPS_CONFIGURE_INPUT = "1\n"
 
 
@@ -117,9 +121,10 @@ def bootstrap_wrf_sfire_stack(
         Newline-separated answers fed to the interactive
         `./configure` scripts. Defaults pick GNU compilers.
     netcdf_env :
-        Optional environment variables for the build (NETCDF, HDF5,
-        JASPERLIB, JASPERINC, etc.). Merged into `os.environ` before
-        each compile invocation.
+        Optional environment variables for the build (NETCDF, JASPERLIB,
+        JASPERINC, etc.). Merged into `os.environ` before each compile
+        invocation. HDF5/HD5 are intentionally ignored on the default
+        path because WRF-SFIRE is built with `NETCDF_classic=1`.
     dry_run :
         If True, return the plan without executing the heavy clone /
         configure / compile / download steps. The plan still creates
@@ -138,6 +143,7 @@ def bootstrap_wrf_sfire_stack(
     env = dict(os.environ)
     if netcdf_env:
         env.update(netcdf_env)
+    _force_classic_netcdf(env, plan)
 
     if not skip_wrf:
         _bootstrap_wrf_sfire(plan, env, wrf_configure_input, dry_run)
@@ -155,6 +161,24 @@ def bootstrap_wrf_sfire_stack(
         plan.add("skip WPS_GEOG (already present or skipped)")
 
     return plan
+
+
+# --------------------------------------------------------------------- env
+def _force_classic_netcdf(env: dict[str, str], plan: BootstrapPlan) -> None:
+    """Keep the default build on the proven NetCDF-classic path.
+
+    WRF can build with NetCDF4/HDF5, but the upstream configure script
+    emits generic `-lhdf5*` flags. On this CHPC/Ubuntu-style environment
+    the available libraries are named `libhdf5_serial*`, so explicit HDF5
+    linking fails even though NetCDF itself can use HDF5 internally.
+    """
+    env["NETCDF_classic"] = "1"
+    removed = [name for name in ("HDF5", "HD5") if env.pop(name, None)]
+    if removed:
+        plan.add("ignore HDF5/HD5 for WRF-SFIRE bootstrap "
+                  "(using NETCDF_classic=1)")
+    else:
+        plan.add("set NETCDF_classic=1 for WRF-SFIRE bootstrap")
 
 
 # --------------------------------------------------------------------- WRF
@@ -176,6 +200,28 @@ def _bootstrap_wrf_sfire(plan: BootstrapPlan, env: dict[str, str],
         plan.add(f"WRF-SFIRE binaries already built (skip compile)")
         return
 
+    # WRF's `./configure` requires NETCDF to be a directory with include/
+    # + lib/ holding the right headers / .mod / .so files. On
+    # Ubuntu/Debian the system layout is split across /usr/include and
+    # /usr/lib/<triplet>, so build a symlink stub when needed.
+    _ensure_lib_stub(
+        env, plan, env_var="NETCDF",
+        header_check="netcdf.inc",
+        candidate_includes=[Path("/usr/include")],
+        candidate_libs=[Path("/usr/lib/x86_64-linux-gnu"),
+                         Path("/usr/lib64"),
+                         Path("/usr/lib")],
+        dry_run=dry_run)
+
+    # If a previous compile failed mid-link, configure.wrf carries the old
+    # paths and the .o files are stale. Re-run configure (overwrites
+    # configure.wrf) and clean before recompiling. Detect this state by
+    # configure.wrf existing but the target binaries missing.
+    if (target / "configure.wrf").exists() and not have_all:
+        plan.add("./clean -a (stale partial build detected)")
+        if not dry_run:
+            _run(["./clean", "-a"], cwd=target, env=env)
+
     # Need to configure + compile.
     plan.add(f"configure WRF-SFIRE (stdin={configure_input!r})")
     plan.add("compile em_fire (~15 min)")
@@ -189,6 +235,66 @@ def _bootstrap_wrf_sfire(plan: BootstrapPlan, env: dict[str, str],
          log_name="compile_em_fire.log")
     _run(["./compile", "em_real"], cwd=target, env=env, capture_log=True,
          log_name="compile_em_real.log")
+
+
+def _ensure_lib_stub(env: dict[str, str], plan: BootstrapPlan,
+                      *,
+                      env_var: str,
+                      header_check: str,
+                      candidate_includes: list[Path],
+                      candidate_libs: list[Path],
+                      lib_pattern: str = "lib*.so*",
+                      dry_run: bool) -> None:
+    """If `env[env_var]` points at a missing / improperly-laid-out
+    directory, auto-build a symlink stub:
+
+        $<env_var>/include -> first candidate_include that contains
+                               `header_check`
+        $<env_var>/lib     -> first candidate_lib that contains a file
+                               matching `lib_pattern`
+
+    This sidesteps the Ubuntu/Debian split layout (for example, NetCDF in
+    /usr/include + /usr/lib/<triplet>). Skipped when the env var isn't
+    set, the target already looks usable, or dry_run=True is in effect.
+    """
+    val = env.get(env_var)
+    if not val:
+        return
+    root = Path(val).expanduser()
+    if (root / "include" / header_check).exists():
+        return  # already usable
+
+    sys_inc = next((c for c in candidate_includes
+                     if (c / header_check).exists()), None)
+    if sys_inc is None:
+        plan.add(f"WARNING: {header_check} not found in {candidate_includes} "
+                  f"for {env_var}; install the dev package or set "
+                  f"{env_var} to a usable root")
+        return
+
+    sys_lib = next(
+        (c for c in candidate_libs
+         if c.exists() and any(c.glob(lib_pattern))),
+        None)
+    if sys_lib is None:
+        plan.add(f"WARNING: no {lib_pattern} found in {candidate_libs} "
+                  f"for {env_var}")
+        return
+
+    plan.add(f"prepare {env_var} stub at {root} "
+              f"(include -> {sys_inc}, lib -> {sys_lib})")
+    if dry_run:
+        return
+
+    root.mkdir(parents=True, exist_ok=True)
+    for name, src in (("include", sys_inc), ("lib", sys_lib)):
+        link = root / name
+        if link.is_symlink() or link.exists():
+            try:
+                link.unlink()
+            except (IsADirectoryError, OSError):
+                continue
+        link.symlink_to(src)
 
 
 # --------------------------------------------------------------------- WPS

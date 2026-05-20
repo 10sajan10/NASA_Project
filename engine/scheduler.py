@@ -32,10 +32,14 @@ from typing import Any, Optional
 from .backends import Backend, SerialBackend
 from .contracts import Request
 from .cube_ref import CubeRef, is_cross_process_backend
+from .log import get_logger
 from .pipeline import Pipeline, Trigger
 from .registry import ProducerRegistry, producer_produces, producer_requires
 from .retry import RetryPolicy, attempt_with_retry
 from .tiled import _run_tile, is_tile_aware
+
+
+_log = get_logger(__name__)
 
 
 # --------------------------------------------------------------- results
@@ -47,6 +51,15 @@ class TileMetric:
     attempts: int
     status: str                                  # "ok" | "error"
     error: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "elapsed_s": self.elapsed_s,
+            "attempts": self.attempts,
+            "status": self.status,
+            "error": self.error,
+        }
 
 
 @dataclass
@@ -81,6 +94,20 @@ class StepResult:
                           if t.status == "error"),
         }
 
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "elapsed_s": self.elapsed_s,
+            "produced": dict(self.produced),
+            "error": self.error,
+            "attempts": self.attempts,
+            "dead_letter": self.dead_letter,
+            "tile_count": self.tile_count,
+            "tile_metrics": [t.to_dict() for t in self.tile_metrics],
+            "tile_latency_summary": self.tile_latency_summary,
+        }
+
 
 @dataclass
 class RunResult:
@@ -93,6 +120,28 @@ class RunResult:
 
     def by_name(self) -> dict[str, StepResult]:
         return {s.name: s for s in self.steps}
+
+    def to_dict(self) -> dict:
+        """Serialisable snapshot of the run — drop into JSON for offline
+        analysis ("which step failed yesterday at 03:14 UTC?")."""
+        return {
+            "ok": self.ok,
+            "n_steps": len(self.steps),
+            "n_errors": sum(1 for s in self.steps if s.status == "error"),
+            "n_skipped": sum(1 for s in self.steps if s.status == "skipped"),
+            "total_elapsed_s": sum(s.elapsed_s for s in self.steps),
+            "triggered": list(self.triggered),
+            "steps": [s.to_dict() for s in self.steps],
+        }
+
+    def save_json(self, path) -> None:
+        """Write `to_dict()` as JSON. Caller chooses the path; the runner
+        passes ``logs/{run_id}.json`` when given a ``run_id``."""
+        import json
+        from pathlib import Path as _P
+        p = _P(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(self.to_dict(), indent=2, default=str))
 
 
 # ------------------------------------------------------------ workers
@@ -208,7 +257,8 @@ class PipelineRunner:
                  fail_fast: bool = False,
                  skip_when_satisfied: bool = True,
                  retry_policy: Optional[RetryPolicy] = None,
-                 max_inflight_tiles: Optional[int] = None) -> None:
+                 max_inflight_tiles: Optional[int] = None,
+                 result_dir: Optional[Any] = None) -> None:
         self.registry = registry
         self.backend = backend or SerialBackend()
         self.verbose = verbose
@@ -222,6 +272,10 @@ class PipelineRunner:
         # thousands of tiles to avoid building up large in-flight result
         # buffers in the parent process.
         self.max_inflight_tiles = max_inflight_tiles
+        # Where (if anywhere) to persist RunResult JSON dumps. Default
+        # None = don't persist. Set to a Path to drop one file per
+        # .run() invocation under that directory.
+        self.result_dir = result_dir
 
     # ------------------------------------------------------------------
     def run(self,
@@ -230,11 +284,21 @@ class PipelineRunner:
             *,
             t_start=None, t_end=None,
             force: bool = False,
-            context: Optional[dict] = None) -> RunResult:
-        """Execute the pipeline. Returns a `RunResult` summarizing each step."""
+            context: Optional[dict] = None,
+            result_path: Optional[Any] = None) -> RunResult:
+        """Execute the pipeline. Returns a `RunResult` summarizing each step.
+
+        If `result_path` is given (or `self.result_dir` is set), the
+        RunResult is dumped as JSON after the run finishes — including
+        when steps fail. Pass `result_path=False` to suppress the dump
+        on a per-call basis.
+        """
         request = Request(t_start=t_start, t_end=t_end, force=force,
                           context=dict(context or {}))
         result = RunResult()
+        # Resolve the JSON dump target up front so the try/finally at the
+        # bottom of this method can dump even on exceptional exits.
+        dump_target = self._resolve_result_path(result_path)
 
         # working set: each pending node -> its unmet dependencies
         node_after: dict[str, set[str]] = {
@@ -247,8 +311,8 @@ class PipelineRunner:
             triggers_by_source.setdefault(t.source, []).append(t)
 
         if self.verbose:
-            print(pipeline.explain())
-            print(f"[runner] backend={self.backend.name}")
+            _log.info(pipeline.explain())
+            _log.info(f"[runner] backend={self.backend.name}")
 
         while node_after:
             # nodes whose deps are all completed (deps that failed: the node
@@ -267,7 +331,7 @@ class PipelineRunner:
 
             for n in unreachable:
                 if self.verbose:
-                    print(f"[runner] {n} unreachable "
+                    _log.info(f"[runner] {n} unreachable "
                           f"(failed deps: {sorted(node_after[n] & failed)})")
                 node_after.pop(n, None)
                 result.steps.append(StepResult(
@@ -301,11 +365,45 @@ class PipelineRunner:
                     failed.add(sr.name)
                     if self.fail_fast:
                         if self.verbose:
-                            print(f"[runner] fail_fast: stopping after "
+                            _log.info(f"[runner] fail_fast: stopping after "
                                   f"{sr.name} error")
+                        self._dump_result(result, dump_target)
                         return result
 
+        self._dump_result(result, dump_target)
         return result
+
+    # ------------------------------------------------------------------
+    def _resolve_result_path(self, result_path) -> Optional[Any]:
+        """Pick where (if anywhere) to dump the RunResult JSON.
+
+        Precedence: per-call `result_path` overrides the runner's
+        `result_dir`. ``result_path=False`` explicitly disables the
+        dump. ``result_dir`` (a directory) -> a timestamped filename
+        inside it.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        from pathlib import Path as _P
+        if result_path is False:
+            return None
+        if result_path is not None:
+            return _P(result_path)
+        if self.result_dir is not None:
+            stamp = _dt.now(_tz.utc).strftime("%Y%m%d_%H%M%S")
+            return _P(self.result_dir) / f"runresult_{stamp}.json"
+        return None
+
+    @staticmethod
+    def _dump_result(result: RunResult, path) -> None:
+        if path is None:
+            return
+        try:
+            result.save_json(path)
+            _log.debug("RunResult JSON written to %s", path)
+        except Exception as exc:
+            # Never let a logging-layer failure crash the run itself.
+            _log.warning("failed to write RunResult JSON to %s: %s",
+                         path, exc)
 
     # ------------------------------------------------------------------
     def _fire_triggers(self,
@@ -320,14 +418,14 @@ class PipelineRunner:
                 fired = bool(trig.when(cube))
             except Exception as e:
                 if self.verbose:
-                    print(f"[trigger] {trig.name}: predicate error: {e}; "
+                    _log.info(f"[trigger] {trig.name}: predicate error: {e}; "
                           "treating as not fired")
                 fired = False
             if not fired:
                 continue
             if trig.target in completed:
                 if self.verbose:
-                    print(f"[trigger] {trig.name}: target {trig.target!r} "
+                    _log.info(f"[trigger] {trig.name}: target {trig.target!r} "
                           "already completed; skipping")
                 continue
             # Insert (or merge into) the working set with a dependency on the
@@ -335,7 +433,7 @@ class PipelineRunner:
             node_after.setdefault(trig.target, set()).add(source)
             result.triggered.append(trig.target)
             if self.verbose:
-                print(f"[trigger] {trig.name} fired -> "
+                _log.info(f"[trigger] {trig.name} fired -> "
                       f"scheduled {trig.target!r}")
 
     # ------------------------------------------------------------------
@@ -358,7 +456,7 @@ class PipelineRunner:
             if self.skip_when_satisfied and _producer_already_satisfied(
                     producer, cube, request):
                 if self.verbose:
-                    print(f"[step] {name}  skipped (already satisfied)")
+                    _log.info(f"[step] {name}  skipped (already satisfied)")
                 results.append(StepResult(
                     name=name, status="skipped", elapsed_s=0.0))
                 continue
@@ -381,7 +479,7 @@ class PipelineRunner:
         for name in to_submit:
             producer = self.registry.get(name)
             if self.verbose:
-                print(f"[step] {name}  submit ({self.backend.name})")
+                _log.info(f"[step] {name}  submit ({self.backend.name})")
             t0 = time.monotonic()
             futs.append((name, self.backend.submit(
                 attempt_with_retry, _run_one, producer, worker_cube,
@@ -402,7 +500,7 @@ class PipelineRunner:
                     error=f"{type(e).__name__}: {e}",
                     attempts=1, dead_letter=True))
                 if self.verbose:
-                    print(f"[step] {name}  ERROR (backend) after "
+                    _log.info(f"[step] {name}  ERROR (backend) after "
                           f"{elapsed:.2f}s: {e}")
                 continue
             elapsed = time.monotonic() - t0
@@ -413,7 +511,7 @@ class PipelineRunner:
                     elapsed_s=elapsed, produced=produced,
                     attempts=attempts))
                 if self.verbose:
-                    print(f"[step] {name}  ok in {elapsed:.2f}s{tag} -> "
+                    _log.info(f"[step] {name}  ok in {elapsed:.2f}s{tag} -> "
                           f"{produced}")
             else:
                 dead_letter = attempts >= max_attempts
@@ -425,7 +523,7 @@ class PipelineRunner:
                     dead_letter=dead_letter))
                 if self.verbose:
                     dtag = " (dead-letter)" if dead_letter else ""
-                    print(f"[step] {name}  ERROR after {elapsed:.2f}s "
+                    _log.info(f"[step] {name}  ERROR after {elapsed:.2f}s "
                           f"({attempts} attempts){dtag}: {exc}")
         return results
 
@@ -434,7 +532,7 @@ class PipelineRunner:
         if self.skip_when_satisfied and _producer_already_satisfied(
                 producer, cube, request):
             if self.verbose:
-                print(f"[step] {name}  skipped (already satisfied)")
+                _log.info(f"[step] {name}  skipped (already satisfied)")
             return StepResult(name=name, status="skipped", elapsed_s=0.0)
 
         # Route tile-aware producers through the tile fan-out path. Tiles
@@ -445,7 +543,7 @@ class PipelineRunner:
             return self._run_tiled_step(name, producer, cube, request)
 
         if self.verbose:
-            print(f"[step] {name}  start")
+            _log.info(f"[step] {name}  start")
         t0 = time.monotonic()
         produced, exc, attempts = attempt_with_retry(
             _run_one, producer, cube, request,
@@ -454,14 +552,14 @@ class PipelineRunner:
         if exc is None:
             tag = f" (after {attempts} attempts)" if attempts > 1 else ""
             if self.verbose:
-                print(f"[step] {name}  ok in {elapsed:.2f}s{tag} -> {produced}")
+                _log.info(f"[step] {name}  ok in {elapsed:.2f}s{tag} -> {produced}")
             return StepResult(name=name, status="ok",
                               elapsed_s=elapsed, produced=produced,
                               attempts=attempts)
         dead_letter = attempts >= self.retry_policy.max_attempts
         if self.verbose:
             tag = f" (dead-letter after {attempts} attempts)" if dead_letter else ""
-            print(f"[step] {name}  ERROR after {elapsed:.2f}s{tag}: {exc}")
+            _log.info(f"[step] {name}  ERROR after {elapsed:.2f}s{tag}: {exc}")
         return StepResult(name=name, status="error",
                           elapsed_s=elapsed,
                           error=f"{type(exc).__name__}: {exc}",
@@ -478,7 +576,7 @@ class PipelineRunner:
         that calls `process_tile`, then `finalize` runs in the parent.
         """
         if self.verbose:
-            print(f"[step] {name}  start (tile fan-out, "
+            _log.info(f"[step] {name}  start (tile fan-out, "
                   f"backend={self.backend.name})")
         t0 = time.monotonic()
         try:
@@ -502,7 +600,7 @@ class PipelineRunner:
                 msg = f"[step] {name}  {n_tiles} active tiles"
                 if skipped_inactive:
                     msg += f" ({skipped_inactive} inactive skipped)"
-                print(msg)
+                _log.info(msg)
 
             worker_cube = (CubeRef.from_cube(cube)
                            if is_cross_process_backend(self.backend)
@@ -596,7 +694,7 @@ class PipelineRunner:
                 dead_letter = max_tile_attempts >= self.retry_policy.max_attempts
                 if self.verbose:
                     dtag = " (some dead-letter)" if dead_letter else ""
-                    print(f"[step] {name}  ERROR after {elapsed:.2f}s "
+                    _log.info(f"[step] {name}  ERROR after {elapsed:.2f}s "
                           f"({len(tile_errors)} tile failures){dtag}")
                 return StepResult(name=name, status="error",
                                   elapsed_s=elapsed, error=err,
@@ -610,11 +708,11 @@ class PipelineRunner:
             if self.verbose:
                 rt = (f" (max {max_tile_attempts} tile attempts)"
                       if max_tile_attempts > 1 else "")
-                print(f"[step] {name}  ok in {elapsed:.2f}s "
+                _log.info(f"[step] {name}  ok in {elapsed:.2f}s "
                       f"({n_tiles} tiles){rt} -> {produced}")
                 if tile_metrics:
                     summary_times = sorted(t.elapsed_s for t in tile_metrics)
-                    print(f"[step] {name}  tile latency: "
+                    _log.info(f"[step] {name}  tile latency: "
                           f"min={summary_times[0]*1000:.0f}ms "
                           f"median={summary_times[len(summary_times)//2]*1000:.0f}ms "
                           f"max={summary_times[-1]*1000:.0f}ms")
@@ -628,7 +726,7 @@ class PipelineRunner:
         except BaseException as e:
             elapsed = time.monotonic() - t0
             if self.verbose:
-                print(f"[step] {name}  ERROR after {elapsed:.2f}s: {e}")
+                _log.info(f"[step] {name}  ERROR after {elapsed:.2f}s: {e}")
             return StepResult(name=name, status="error",
                               elapsed_s=elapsed,
                               error=f"{type(e).__name__}: {e}")

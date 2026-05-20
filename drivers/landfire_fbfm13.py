@@ -33,13 +33,20 @@ import requests
 
 from cube.store import Cube
 from drivers.base import Driver
+from engine.log import get_logger
 
+
+
+_log = get_logger(__name__)
 
 # Latest LANDFIRE Anderson 13 surface fire behavior fuel model service.
-# If LANDFIRE rotates the service path, override via the constructor.
+# USGS migrated services in 2025-2026: the old landfire.cr.usgs.gov host
+# now 404s. The current REST root is at lfps.usgs.gov; LF2024 lives under
+# /Landfire_LF2024/LF2024_FBFM13_{CONUS,AK,HI}. If LANDFIRE rotates the
+# path again, override via the constructor's `service_url` kwarg.
 LANDFIRE_LF240_FBFM13 = (
-    "https://landfire.cr.usgs.gov/arcgis/rest/services/"
-    "Landfire_LF240/US_240FBFM13/ImageServer/exportImage"
+    "https://lfps.usgs.gov/arcgis/rest/services/"
+    "Landfire_LF2024/LF2024_FBFM13_CONUS/ImageServer/exportImage"
 )
 
 # LANDFIRE's ImageServer rejects very large pixel requests; tile if needed.
@@ -143,7 +150,7 @@ class LandfireFBFM13Driver(Driver):
         # If the single request keeps failing, split the tile and recurse.
         can_split = width > self.min_tile_px or height > self.min_tile_px
         if can_split and (width > 1 or height > 1):
-            print(f"[landfire_fbfm13] tile request failed; splitting "
+            _log.info(f"[landfire_fbfm13] tile request failed; splitting "
                   f"{width}x{height} tile into smaller requests "
                   f"({last_exc})")
             arr = self._request_split_tile(
@@ -207,7 +214,7 @@ class LandfireFBFM13Driver(Driver):
                 xmax = grid.x0 + i1 * grid.pixel_m
                 ymax = grid.y1 - j0 * grid.pixel_m
                 ymin = grid.y1 - j1 * grid.pixel_m
-                print(f"[landfire_fbfm13] tile {tile_no}/{n_tiles}: "
+                _log.info(f"[landfire_fbfm13] tile {tile_no}/{n_tiles}: "
                       f"rows {j0}:{j1}, cols {i0}:{i1}, size={tw}x{th}")
                 tile = self._request_tile(
                     xmin, ymin, xmax, ymax, tw, th, sr)
