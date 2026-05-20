@@ -176,12 +176,24 @@ def sfire_templates(tmp_path: Path) -> Path:
         " run_hours   = 0,\n"
         " run_minutes = 1,\n"
         " run_seconds = 0,\n"
-        " end_hour    = 1,\n"
-        " end_minute  = 0,\n"
-        " end_second  = 0,\n"
+        " start_year   = 0001,\n"
+        " start_month  = 01,\n"
+        " start_day    = 01,\n"
+        " start_hour   = 00,\n"
+        " start_minute = 00,\n"
+        " start_second = 00,\n"
+        " end_year     = 0001,\n"
+        " end_month    = 01,\n"
+        " end_day      = 01,\n"
+        " end_hour     = 1,\n"
+        " end_minute   = 0,\n"
+        " end_second   = 0,\n"
         " history_interval_s = 60,\n"
         "/\n"
         "&domains\n"
+        " time_step = 0,\n"
+        " time_step_fract_num = 25,\n"
+        " time_step_fract_den = 100,\n"
         " e_we = 43,\n"
         " e_sn = 43,\n"
         " dx = 50,\n"
@@ -190,6 +202,8 @@ def sfire_templates(tmp_path: Path) -> Path:
         " sr_y = 10,\n"
         "/\n"
         "&fire\n"
+        " fire_fuel_read = 0,\n"
+        " fire_fuel_cat  = 3,\n"
         " fire_tign_in_time = 1.0,\n"
         " fire_num_ignitions = 0,\n"
         "/\n"
@@ -307,6 +321,75 @@ def test_namelist_gets_fire_tign_in_time_from_max_ignition(
     assert "e_sn = 12" in nml
     assert "dx = 500.0" in nml
     assert "sr_x = 2" in nml       # fire_mesh_ratio default in our test
+    # fire_fuel_read = -1 so SFIRE reads NFUEL_CAT from wrfinput
+    # (default = 0 uses uniform fire_fuel_cat and would ignore LANDFIRE).
+    assert "fire_fuel_read = -1" in nml
+    # time_step scaled from dx (500 m -> 6 * 0.5 = 3 s, rounded). The
+    # template's 0.25-s value would be over-resolved 12x for this grid.
+    assert "time_step = 3" in nml
+    assert "time_step_fract_num = 0" in nml
+    cube.close()
+
+
+def test_namelist_carries_start_end_datetime_from_request(
+        tmp_path, sfire_templates, fake_wrf_binary):
+    """When request.t_start is given, the namelist start_*/end_* triplets
+    must match. real.exe rejects met_em files whose timestamps don't
+    line up with start_year/month/day/hour."""
+    cube, _ = _cube_with_asteroid(tmp_path / "cube")
+    model = _build_producer(sfire_templates, fake_wrf_binary,
+                             sim_seconds=3 * 3600)  # 3 h run
+    reg = to_engine_registry([model])
+    pipe = Pipeline.from_targets(["arrival_s"], registry=reg)
+    runner = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+
+    t0 = datetime(2025, 1, 1, 0, 0, 0)
+    runner.run(cube, pipe,
+                t_start=t0, t_end=t0 + timedelta(hours=3),
+                context={"keep_stage": True})
+
+    import tempfile
+    candidates = sorted(Path(tempfile.gettempdir()).glob(
+        "wrf_sfire_asteroid_*/namelist.input"),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    assert candidates
+    nml = candidates[0].read_text()
+
+    # Start aligned to request.t_start = 2025-01-01 00:00:00 UTC.
+    # Use regex tolerant of whitespace between key and `=`.
+    import re
+    def _has(key, val):
+        return re.search(rf"\b{key}\s*=\s*{val}\b", nml) is not None
+    assert _has("start_year", "2025")
+    assert _has("start_month", "01")
+    assert _has("start_day", "01")
+    assert _has("start_hour", "00")
+    # 3-hour run -> end is 03:00 same day.
+    assert _has("end_year", "2025")
+    assert _has("end_hour", "03")
+    cube.close()
+
+
+def test_namelist_skips_start_end_when_request_has_no_time(
+        tmp_path, sfire_templates, fake_wrf_binary):
+    """The asteroid-test backstop: when t_start is None, leave start_*
+    alone (template's 0001 placeholders stay) instead of writing garbage."""
+    cube, _ = _cube_with_asteroid(tmp_path / "cube")
+    model = _build_producer(sfire_templates, fake_wrf_binary)
+    reg = to_engine_registry([model])
+    pipe = Pipeline.from_targets(["arrival_s"], registry=reg)
+    runner = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+    runner.run(cube, pipe, context={"keep_stage": True})
+
+    import tempfile
+    candidates = sorted(Path(tempfile.gettempdir()).glob(
+        "wrf_sfire_asteroid_*/namelist.input"),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    assert candidates
+    nml = candidates[0].read_text()
+    # Template's placeholder year preserved.
+    import re
+    assert re.search(r"\bstart_year\s*=\s*0001\b", nml) is not None
     cube.close()
 
 
@@ -448,14 +531,15 @@ def test_real_exe_path_used_when_cube_wind_and_met_em_are_available(
     cube.close()
 
 
-def test_real_exe_path_not_used_when_wind_pair_or_period_is_incomplete(
+def test_real_exe_path_runs_without_cube_wind(
         tmp_path, sfire_templates, fake_wrf_binary, fake_real_binary):
-    """real_cmd is selected only when both canonical wind variables exist
-    and cover the requested period. Missing direction keeps the
-    ideal/minimal path."""
+    """real.exe owns the atmospheric state via met_em files; cube wind
+    is for the ideal-fallback input_sounding only. So the real path
+    must fire whenever (real_cmd + met_em_dir) are configured — even
+    when no canonical cube wind exists."""
     t0 = datetime(2026, 9, 15)
     cube, _ = _cube_with_asteroid(tmp_path / "cube")
-    _seed_wind(cube, t0, hours=3, include_direction=False)
+    # Intentionally no _seed_wind call.
     stage_root = tmp_path / "stages"
     model = _build_producer(
         sfire_templates, fake_wrf_binary,
@@ -476,8 +560,40 @@ def test_real_exe_path_not_used_when_wind_pair_or_period_is_incomplete(
     stages = sorted(stage_root.glob("wrf_sfire_asteroid_*"))
     assert stages
     stage = stages[-1]
+    # real.exe DID run (cube wind absence no longer gates it).
+    assert (stage / "real_was_used.txt").exists()
+    assert list(stage.glob("met_em.d01*"))
+    cube.close()
+
+
+def test_ideal_exe_path_when_no_met_em_dir(
+        tmp_path, sfire_templates, fake_wrf_binary, fake_real_binary):
+    """real_cmd alone (without met_em_dir) is insufficient — fall back
+    to the ideal path. Cube wind is irrelevant either way."""
+    t0 = datetime(2026, 9, 15)
+    cube, _ = _cube_with_asteroid(tmp_path / "cube")
+    _seed_wind(cube, t0, hours=3)  # cube wind present but no met_em_dir
+    stage_root = tmp_path / "stages"
+    model = _build_producer(
+        sfire_templates, fake_wrf_binary,
+        fire_mesh_ratio=2,
+        real_cmd=[sys.executable, str(fake_real_binary)],
+        met_em_dir=None,
+        stage_root=stage_root)
+    reg = to_engine_registry([model])
+    pipe = Pipeline.from_targets(["arrival_s"], registry=reg)
+    runner = PipelineRunner(reg, backend=SerialBackend(),
+                             verbose=False)
+    res = runner.run(
+        cube, pipe,
+        t_start=t0, t_end=t0 + timedelta(hours=2),
+        context={"keep_stage": True})
+    assert res.ok, [s.error for s in res.steps if s.status == "error"]
+
+    stages = sorted(stage_root.glob("wrf_sfire_asteroid_*"))
+    assert stages
+    stage = stages[-1]
     assert not (stage / "real_was_used.txt").exists()
-    assert not list(stage.glob("*.npz"))
     assert not list(stage.glob("met_em.d01*"))
     cube.close()
 
@@ -496,6 +612,66 @@ def test_second_run_is_skipped(
     runner.run(cube, pipe)
     res2 = runner.run(cube, pipe)
     assert res2.by_name()["wrf_sfire_asteroid"].status == "skipped"
+    cube.close()
+
+
+def test_fire_dem_driver_samples_zsf_at_fire_mesh_resolution(
+        tmp_path, sfire_templates, fake_wrf_binary):
+    """When `fire_dem_driver` is set, ZSF is sampled at the fire mesh's
+    native resolution rather than nearest-neighbour upsampled from the
+    900 m cube DEM. The test fake just returns a unique value per cell,
+    so we can prove the array isn't a 2x2 block-replicate."""
+    cube, _ = _cube_with_asteroid(tmp_path / "cube")
+    H, W = cube.grid.shape
+    fmr = 2
+    Hf, Wf = H * fmr, W * fmr
+
+    class _FineFireDEM:
+        name = "fire_dem_fake"
+        calls = []
+
+        def fetch_to_array(self_, xmin, ymin, xmax, ymax,
+                            width, height, sr):
+            self_.calls.append((width, height, sr))
+            # Linearly increasing values so each cell is unique and
+            # block-replicate of any coarser array can't produce this
+            # pattern.
+            return np.arange(height * width,
+                              dtype="float32").reshape(height, width)
+
+    fake_fine = _FineFireDEM()
+
+    model = WRFSFireAdapter(
+        sfire_dir=sfire_templates,
+        ideal_cmd=None,
+        wrf_cmd=[sys.executable, str(fake_wrf_binary)],
+        sim_seconds=600,
+        history_interval_s=60,
+        fire_mesh_ratio=fmr,
+        fire_dem_driver=fake_fine,
+    )
+    reg = to_engine_registry([model])
+    pipe = Pipeline.from_targets(["arrival_s"], registry=reg)
+    runner = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+    runner.run(cube, pipe, context={"keep_stage": True})
+
+    # fetch_to_array got called once with the fire-mesh dims.
+    assert fake_fine.calls, "fire_dem_driver.fetch_to_array was never called"
+    width, height, sr = fake_fine.calls[-1]
+    assert (width, height) == (Wf, Hf)
+    assert sr == int(cube.grid.crs_epsg)
+
+    import netCDF4 as nc
+    import tempfile
+    cands = sorted(Path(tempfile.gettempdir()).glob(
+        "wrf_sfire_asteroid_*/wrfinput_d01.nc"),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    assert cands
+    with nc.Dataset(cands[0]) as ds:
+        zsf = np.asarray(ds.variables["ZSF"][:])
+    # Distinct values everywhere — not the block-replicate of 11 atm
+    # cells, which would have only 11x11 = 121 unique values.
+    assert len(np.unique(zsf)) > 121
     cube.close()
 
 

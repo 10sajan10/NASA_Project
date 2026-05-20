@@ -19,6 +19,10 @@ import requests
 
 from cube.store import Cube
 from drivers.base import Driver
+from engine.log import get_logger
+
+
+_log = get_logger(__name__)
 
 USGS_3DEP = (
     "https://elevation.nationalmap.gov/arcgis/rest/services/"
@@ -123,7 +127,7 @@ class DEMDriver(Driver):
 
         can_split = width > self.min_tile_px or height > self.min_tile_px
         if can_split and (width > 1 or height > 1):
-            print("[dem] tile request failed; splitting "
+            _log.info("[dem] tile request failed; splitting "
                   f"{width}x{height} tile into smaller requests "
                   f"({last_exc})")
             arr = self._request_split_tile(
@@ -160,40 +164,66 @@ class DEMDriver(Driver):
                     sub_xmin, sub_ymin, sub_xmax, sub_ymax, sw, sh, sr)
         return out
 
-    def fetch(self, cube: Cube,
-              t_start: Optional[datetime] = None,
-              t_end: Optional[datetime] = None) -> list[str]:
-        grid = cube.grid
-        H, W = grid.height, grid.width
-        sr = int(grid.crs_epsg)
+    def fetch_to_array(self,
+                        xmin: float, ymin: float,
+                        xmax: float, ymax: float,
+                        width: int, height: int,
+                        sr: int) -> np.ndarray:
+        """Fetch a DEM tile for an arbitrary bbox + size + CRS.
 
-        dem = np.full((H, W), np.nan, dtype=np.float32)
+        Returns a ``(height, width)`` float32 ndarray sampled on a
+        uniform grid spanning the bbox. The tile-split / retry / cache
+        machinery is shared with the cube-bound `fetch()` path; this
+        method is the building block for consumers that need DEM at a
+        resolution different from the cube grid — for example the
+        WRF-SFIRE adapter sampling the **fire mesh** ``(H*fmr, W*fmr)``
+        for ZSF, while the cube still holds atmosphere-mesh DEM.
 
-        # Tile requests so public DEM service failures do not kill large runs.
-        n_rows = math.ceil(H / self.max_tile_px)
-        n_cols = math.ceil(W / self.max_tile_px)
+        Does NOT write anything to a cube.
+        """
+        dem = np.full((height, width), np.nan, dtype=np.float32)
+        pixel_x = (xmax - xmin) / width
+        pixel_y = (ymax - ymin) / height
+        n_rows = math.ceil(height / self.max_tile_px)
+        n_cols = math.ceil(width / self.max_tile_px)
         n_tiles = n_rows * n_cols
         tile_no = 0
-        for j0 in range(0, H, self.max_tile_px):
-            j1 = min(j0 + self.max_tile_px, H)
-            for i0 in range(0, W, self.max_tile_px):
-                i1 = min(i0 + self.max_tile_px, W)
+        for j0 in range(0, height, self.max_tile_px):
+            j1 = min(j0 + self.max_tile_px, height)
+            for i0 in range(0, width, self.max_tile_px):
+                i1 = min(i0 + self.max_tile_px, width)
                 tile_no += 1
-                tw = i1 - i0; th = j1 - j0
-                xmin = grid.x0 + i0 * grid.pixel_m
-                xmax = grid.x0 + i1 * grid.pixel_m
-                ymax = grid.y1 - j0 * grid.pixel_m
-                ymin = grid.y1 - j1 * grid.pixel_m
-                print(f"[dem] tile {tile_no}/{n_tiles}: "
+                tw = i1 - i0
+                th = j1 - j0
+                sub_xmin = xmin + i0 * pixel_x
+                sub_xmax = xmin + i1 * pixel_x
+                sub_ymax = ymax - j0 * pixel_y
+                sub_ymin = ymax - j1 * pixel_y
+                _log.info(f"[dem] tile {tile_no}/{n_tiles}: "
                       f"rows {j0}:{j1}, cols {i0}:{i1}, size={tw}x{th}")
-                tile = self._request_tile(xmin, ymin, xmax, ymax, tw, th, sr)
+                tile = self._request_tile(sub_xmin, sub_ymin,
+                                           sub_xmax, sub_ymax,
+                                           tw, th, sr)
                 dem[j0:j1, i0:i1] = self._fit_tile(tile, tw, th)
 
         # USGS 3DEP returns NoData around -3.4e+38 (max -F32). Clean it up.
         bad = ~np.isfinite(dem) | (dem < -1e6) | (dem > 1e6)
         if bad.any():
             dem[bad] = np.nanmean(dem[~bad]) if (~bad).any() else 0.0
+        return dem
 
+    def fetch(self, cube: Cube,
+              t_start: Optional[datetime] = None,
+              t_end: Optional[datetime] = None) -> list[str]:
+        grid = cube.grid
+        H, W = grid.height, grid.width
+        sr = int(grid.crs_epsg)
+        xmin = grid.x0
+        xmax = grid.x0 + W * grid.pixel_m
+        ymax = grid.y1
+        ymin = grid.y1 - H * grid.pixel_m
+
+        dem = self.fetch_to_array(xmin, ymin, xmax, ymax, W, H, sr)
         slope, aspect = _slope_aspect_deg(dem, grid.pixel_m)
 
         src = "USGS_3DEP_ImageServer"
