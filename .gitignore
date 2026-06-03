@@ -48,3 +48,6 @@ cube_snapshots/
 # OS/editor noise
 .DS_Store
 *.swp
+
+# Documentation / presentation artifacts (kept local)
+docs/

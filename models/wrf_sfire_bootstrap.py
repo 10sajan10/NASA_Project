@@ -103,6 +103,8 @@ def bootstrap_wrf_sfire_stack(
     wrf_configure_input: str = _DEFAULT_WRF_CONFIGURE_INPUT,
     wps_configure_input: str = _DEFAULT_WPS_CONFIGURE_INPUT,
     netcdf_env: Optional[dict[str, str]] = None,
+    hpc_profile=None,
+    enable_chem: bool = False,
     dry_run: bool = False,
 ) -> BootstrapPlan:
     """Provision WRF-SFIRE + WPS + WPS_GEOG under `install_root`.
@@ -140,10 +142,41 @@ def bootstrap_wrf_sfire_stack(
         wps_geog_dir=root / "WPS_GEOG",
     )
 
+    # Opt-in HPC profile: switch the interactive configure answers to the
+    # profile's MPI (dmpar) build and load its modules before compiling.
+    # The serial defaults stay in force when no profile is passed, so the
+    # local/dev path (and its tests) is unchanged. The profile carries
+    # "<option>\n<nesting>\n" — e.g. "34\n1\n" = GNU gfortran dmpar +
+    # basic nesting, which yields an MPI- and nest-capable wrf.exe.
+    if hpc_profile is not None:
+        if wrf_configure_input is _DEFAULT_WRF_CONFIGURE_INPUT:
+            wrf_configure_input = hpc_profile.wrf_configure_input
+        if wps_configure_input is _DEFAULT_WPS_CONFIGURE_INPUT:
+            wps_configure_input = hpc_profile.wps_configure_input
+        plan.add(f"HPC profile {hpc_profile.name}: load modules "
+                 f"{hpc_profile.modules}; MPI configure "
+                 f"{wrf_configure_input!r}")
+        if not dry_run:
+            from hpc.profiles import load_modules
+            load_modules(hpc_profile)
+
     env = dict(os.environ)
     if netcdf_env:
         env.update(netcdf_env)
+    if hpc_profile is not None:
+        env.update(hpc_profile.extra_env)
     _force_classic_netcdf(env, plan)
+
+    # WRF-Chem build for smoke / aerosol tracers. WRF's configure reads
+    # WRF_CHEM from the environment; with WRF_CHEM=1 the em_real compile
+    # also builds the chemistry solver, and the resulting wrf.exe honours
+    # the &chem namelist (chem_opt, biomass_burn_opt, plumerisefire). On a
+    # non-chem binary the &chem section is silently ignored, so enabling
+    # this is the prerequisite for smoke=true scenarios.
+    if enable_chem:
+        env["WRF_CHEM"] = "1"
+        env.setdefault("WRF_KPP", "0")     # skip the KPP preprocessor path
+        plan.add("enable WRF-Chem build (WRF_CHEM=1) for smoke tracers")
 
     if not skip_wrf:
         _bootstrap_wrf_sfire(plan, env, wrf_configure_input, dry_run)
