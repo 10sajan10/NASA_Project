@@ -78,6 +78,36 @@ class WRFSFireAdapter(ModelAdapter):
                 description="Cell-wise burned fraction from FIRE_AREA"),
     )
 
+    # Extra fire diagnostics surfaced into the cube when the adapter is
+    # constructed with extra_outputs=True. Each maps a fire-mesh wrfout
+    # variable to a cube variable via a block-reduction op. Kept opt-in
+    # so the default contract (arrival_s, fire_area) and its tests are
+    # untouched, and so a fake/idealised wrf.exe that only writes TIGN_G
+    # + FIRE_AREA still satisfies the producer.
+    #   (cube_var, wrfout_var, reduce_op, units, merge_policy, description)
+    _EXTRA_OUTPUT_SPECS = (
+        ("ros_max", "ROS", "max", "m/s", MergePolicy.MONOTONE_MAX,
+         "Peak rate of spread per cell from WRF-SFIRE ROS"),
+        ("fire_intensity", "FGRNHFX", "max", "W/m^2", MergePolicy.MONOTONE_MAX,
+         "Peak ground-fire heat flux (Byram intensity proxy) from FGRNHFX"),
+        ("fuel_consumed", "FUEL_FRAC", "consumed", "0..1",
+         MergePolicy.MONOTONE_MAX,
+         "Fraction of fuel consumed (1 - final FUEL_FRAC)"),
+    )
+
+    # Smoke / aerosol diagnostics, surfaced when smoke_outputs=True. These
+    # live on the ATMOSPHERE grid (= cube grid) at the lowest model level,
+    # so they are read as (Time, bottom_top, sn, we)[-1, 0] with no fire-
+    # mesh block-reduction. They exist only on a WRF-Chem-enabled binary
+    # (bootstrap enable_chem=True). Missing -> NaN field.
+    #   (cube_var, wrfout_var, units, merge_policy, description)
+    _SMOKE_OUTPUT_SPECS = (
+        ("pm25_surface", "PM2_5_DRY", "ug/m^3", MergePolicy.MONOTONE_MAX,
+         "Surface PM2.5 dry mass concentration from WRF-Chem"),
+        ("smoke_tracer", "tr17_1", "ug/kg", MergePolicy.MONOTONE_MAX,
+         "Passive fire-emitted smoke tracer (lowest model level)"),
+    )
+
     capabilities = ProducerCapabilities(
         tile_parallel=False,        # coupled spatial integrator
         cost_hint=CostHint.CPU,
@@ -100,6 +130,10 @@ class WRFSFireAdapter(ModelAdapter):
                  met_em_dir: str | Path | None = None,
                  namelist_overrides: Optional[dict[str, str]] = None,
                  fire_dem_driver=None,
+                 extra_outputs: bool = False,
+                 smoke_outputs: bool = False,
+                 namelist_builder=None,
+                 fire_domain_id: int = 1,
                  stage_root: str | Path | None = None,
                  keep_stage: bool = False) -> None:
         """
@@ -152,6 +186,43 @@ class WRFSFireAdapter(ModelAdapter):
         self.stage_root = Path(stage_root) if stage_root is not None else None
         self.keep_stage = bool(keep_stage)
 
+        # Optional config-driven namelist generation. When set (a
+        # models.wrf_config.NamelistBuilder, or anything exposing
+        # ``scenario`` + ``render()``), the staged namelist.input is
+        # generated from the scenario — nested domains, &chem, etc. —
+        # instead of copy-template + scalar patch. None keeps the
+        # template+patch path the existing tests exercise.
+        self.namelist_builder = namelist_builder
+
+        # Which WRF domain SFIRE runs on (1 = single domain / d01). For
+        # nested runs the fire mesh lives on the innermost nest, so
+        # TIGN_IN injection and wrfout parsing target that domain's files
+        # (wrfinput_d0N / wrfout_d0N). met_em inputs are always d01.
+        self.fire_domain_id = int(fire_domain_id)
+        self._fire_dom = f"d{self.fire_domain_id:02d}"
+
+        # Opt-in extra diagnostics. Setting `self.produces` as an instance
+        # attribute shadows the class tuple, so the registry and
+        # _validate_outputs see the extended contract only for instances
+        # that asked for it.
+        self.extra_outputs = bool(extra_outputs)
+        self.smoke_outputs = bool(smoke_outputs)
+        added: tuple = ()
+        if self.extra_outputs:
+            added += tuple(
+                VarSpec(cube_var, kind="static", dtype="float32",
+                        units=units, merge_policy=policy, description=desc)
+                for (cube_var, _wrf_var, _op, units, policy, desc)
+                in self._EXTRA_OUTPUT_SPECS)
+        if self.smoke_outputs:
+            added += tuple(
+                VarSpec(cube_var, kind="static", dtype="float32",
+                        units=units, merge_policy=policy, description=desc)
+                for (cube_var, _wrf_var, units, policy, desc)
+                in self._SMOKE_OUTPUT_SPECS)
+        if added:
+            self.produces = type(self).produces + added
+
     # ============================================================ BOOTSTRAP
     @classmethod
     def bootstrap(cls,
@@ -195,12 +266,17 @@ class WRFSFireAdapter(ModelAdapter):
             f"input_sounding patched with cube wind at {request.t_start}"
             if used_wind else "using template sounding")
 
-        fire_tign_in_time = self._patch_namelist(
-            stage / "namelist.input", grid, inputs, request)
+        if self.namelist_builder is not None:
+            fire_tign_in_time = self._render_namelist(
+                stage / "namelist.input", inputs)
+        else:
+            fire_tign_in_time = self._patch_namelist(
+                stage / "namelist.input", grid, inputs, request)
 
         self._make_wrfinput(stage, grid)
         self._inject_sfire_inputs(
-            stage / "wrfinput_d01.nc", grid, inputs, fire_tign_in_time)
+            stage / f"wrfinput_{self._fire_dom}.nc", grid, inputs,
+            fire_tign_in_time)
 
     # ============================================================ RUN
     def run_model(self, stage: Path, request: Request) -> Path:
@@ -211,10 +287,10 @@ class WRFSFireAdapter(ModelAdapter):
     # ============================================================ PARSE
     def parse_outputs(self, output_path: Path,
                       grid) -> dict[str, Any]:
-        wrfouts = sorted(output_path.glob("wrfout_d01_*"))
+        wrfouts = sorted(output_path.glob(f"wrfout_{self._fire_dom}_*"))
         if not wrfouts:
             raise FileNotFoundError(
-                f"no wrfout_d01_* found in {output_path}")
+                f"no wrfout_{self._fire_dom}_* found in {output_path}")
         latest = wrfouts[-1]
 
         import netCDF4 as nc
@@ -234,10 +310,83 @@ class WRFSFireAdapter(ModelAdapter):
         # them as arrival-time 1e9.
         arrival_s = np.where(arrival_s > 0.99 * _UNIGNITED_SENTINEL_S,
                               np.nan, arrival_s).astype("float32")
-        return {
+        out: dict[str, Any] = {
             "arrival_s": arrival_s,
             "fire_area": fire_area.astype("float32"),
         }
+        if self.extra_outputs:
+            out.update(self._parse_extra_outputs(latest, grid))
+        if self.smoke_outputs:
+            out.update(self._parse_smoke_outputs(latest, grid))
+        return out
+
+    def _parse_smoke_outputs(self, wrfout: Path, grid) -> dict[str, Any]:
+        """Read WRF-Chem surface smoke / aerosol fields onto the cube grid.
+
+        These are atmosphere-grid variables; we take the lowest model
+        level of the last time frame. Shapes are (Time, bottom_top, sn,
+        we) — or (Time, sn, we) for already-2D fields. Missing variables
+        (non-chem binary) yield NaN so the declared contract holds."""
+        import netCDF4 as nc
+        H, W = grid.shape
+        result: dict[str, Any] = {}
+        with nc.Dataset(wrfout) as ds:
+            for cube_var, wrf_var, _u, _p, _d in self._SMOKE_OUTPUT_SPECS:
+                if wrf_var not in ds.variables:
+                    result[cube_var] = np.full((H, W), np.nan, dtype="float32")
+                    continue
+                arr = np.asarray(ds.variables[wrf_var][:])
+                # Reduce to a 2-D surface field: last time, lowest level.
+                while arr.ndim > 2:
+                    arr = arr[-1] if arr.shape[0] > 1 else arr[0]
+                result[cube_var] = arr[:H, :W].astype("float32")
+        return result
+
+    def _parse_extra_outputs(self, wrfout: Path, grid) -> dict[str, Any]:
+        """Read the opt-in diagnostic fire-mesh variables and block-reduce
+        them onto the cube grid. Missing variables (e.g. when a minimal /
+        idealised wrf.exe did not write them) yield an all-NaN field so
+        the declared contract is still satisfied."""
+        import netCDF4 as nc
+        H, W = grid.shape
+        result: dict[str, Any] = {}
+        with nc.Dataset(wrfout) as ds:
+            for cube_var, wrf_var, op, _u, _p, _d in self._EXTRA_OUTPUT_SPECS:
+                if wrf_var not in ds.variables:
+                    result[cube_var] = np.full((H, W), np.nan, dtype="float32")
+                    continue
+                fire = self._read_last_frame(ds, wrf_var)
+                if op == "consumed":
+                    # 1 - final fuel fraction, averaged onto the cube grid.
+                    remaining = _block_reduce(
+                        fire, (self.fmr, self.fmr), op="mean")[:H, :W]
+                    arr = (1.0 - remaining)
+                else:
+                    arr = _block_reduce(
+                        fire, (self.fmr, self.fmr), op=op)[:H, :W]
+                result[cube_var] = arr.astype("float32")
+        return result
+
+    def _render_namelist(self, path: Path, inputs: dict[str, Any]) -> float:
+        """Generate namelist.input from the configured NamelistBuilder.
+
+        The builder already encodes the grid (possibly nested), time
+        window, physics, and &chem from the scenario. The one value it
+        cannot know ahead of time is ``fire_tign_in_time`` — it depends
+        on the actual ignition field — so we compute it from
+        ``ignition_t0`` and set it on the scenario before rendering.
+        Returns the value so TIGN_IN injection can clamp to it.
+        """
+        ign = np.asarray(inputs["ignition_t0"], dtype="float32")
+        finite = ign[np.isfinite(ign) & (ign >= 0)]
+        max_ign = float(finite.max()) if finite.size else 0.0
+        fire_tign_in_time = max_ign + 1.0
+
+        scenario = getattr(self.namelist_builder, "scenario", None)
+        if scenario is not None:
+            scenario.fire_tign_in_time = fire_tign_in_time
+        path.write_text(self.namelist_builder.render())
+        return fire_tign_in_time
 
     # ============================================================ helpers
     def _copy_templates(self, stage: Path) -> None:
@@ -343,7 +492,7 @@ class WRFSFireAdapter(ModelAdapter):
         the later TIGN_IN/NFUEL_CAT/ZSF surgery has something to write
         into.
         """
-        wrfinput = stage / "wrfinput_d01.nc"
+        wrfinput = stage / f"wrfinput_{self._fire_dom}.nc"
 
         if self.real_cmd is not None and self.met_em_dir is not None:
             n_met = self._stage_met_em_files(stage)
