@@ -307,30 +307,15 @@ def _build_cube(out: Path, config):
 
 
 def _build_met_em(args, config, profile, wrf_scenario=None):
-    """Run the WPS chain and return the met_em directory.
+    """The in-process WPS path (WPSMeteoDriver) has been removed.
 
-    When a nested WRF scenario is supplied, met_em is built on the
-    PARENT (d01) grid; nests interpolate from it inside real.exe.
+    Build met_em out-of-band with ``scripts/run_wps_chain.sh`` (geogrid |
+    ungrib | metgrid) and point the run at it with ``--met-em-dir``.
     """
-    from drivers.wps_meteo import WPSMeteoDriver
-    from hpc.profiles import load_modules
-
-    load_modules(profile)
-    domain_km = args.domain_km
-    dx_m = args.dx_m
-    if wrf_scenario is not None:
-        domain_km = wrf_scenario.extent_km
-        dx_m = wrf_scenario.domains[0].dx_m
-    driver = WPSMeteoDriver(
-        wps_dir=args.install_root / "WPS",
-        geog_dir=args.install_root / "WPS_GEOG",
-        vtable=args.templates_dir / "Vtable.ERA5",
-        work_dir=args.out / "wps")
-    end = config.start + timedelta(seconds=config.sim_seconds)
-    return driver.run(
-        start_date=config.start, end_date=end,
-        center_lat=config.center_lat, center_lon=config.center_lon,
-        domain_km=domain_km, dx_m=dx_m)
+    raise NotImplementedError(
+        "--build-met-em is no longer supported (wps_meteo.py removed). "
+        "Run WPS separately with scripts/run_wps_chain.sh, then pass "
+        "--met-em-dir <WPS dir with met_em.d0*> to use real.exe.")
 
 
 def _apply_loaded_scenario(args, loaded) -> None:

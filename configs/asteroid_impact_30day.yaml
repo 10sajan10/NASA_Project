@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# ASTEROID-IMPACT cascade — Model 1 (WRF-SFIRE + WRF-Chem smoke), 30 days.
+#
+# Geometry (decided with the user):
+#   * 900 km outer atmosphere + chem domain (captures regional smoke transport)
+#   * nested 8100 -> 2700 -> 900 m; finest 900 m atmosphere domain ~225 km wide
+#   * 90 m fire mesh on the finest domain (fire_mesh_ratio 10), centered on the
+#     impact point — fire only resolved where fuel actually burns near impact.
+#
+# Smoke/tracers: chem_opt=300 (GOCART simple) + biomass_burn_opt=1 (now safe
+# after the add_fire_emissions per-species guard) + tracer_opt=1 (passive
+# smoke tracer). See phys/module_fr_sfire_atm.F patch.
+#
+# Duration: 30 days, run as chained 3-day SLURM restart jobs (partition cap).
+#
+# Run (data + WPS + real, then submit the SLURM chain):
+#   .venv/bin/python scripts/run_cascade.py --config configs/asteroid_impact_30day.yaml
+# ---------------------------------------------------------------------------
+
+scenario:
+  kml: Dallas.kml
+  city: "Dallas TX USA"
+  band: Mean
+  center: [-96.80889, 32.77998]   # impact / ignition center
+  pulse_seconds: 10.0
+
+domain:
+  extent_km: 900                  # d01 parent span (atmosphere + chem)
+  map_proj: lambert
+  resolutions_m: [8100, 2700, 900]  # integer-ratio nest landing on 900 m
+  nest_fraction: 0.5              # d02 ~= 450 km, d03 ~= 225 km (fire domain)
+  fire_mesh_ratio: 10             # 900 m / 10 = 90 m fire cells on inner nest
+  e_vert: 45
+  p_top_pa: 5000
+  num_metgrid_levels: 33
+  num_metgrid_soil_levels: 4
+
+time:
+  start: 2019-09-04T12:00
+  duration_days: 30
+  history_interval_min: 60        # hourly output (storage-aware; not 10 min)
+  interval_seconds: 21600         # 6-hourly ERA5 boundary forcing
+  restart_interval_min: 1440      # daily restart -> 3-day SLURM chunk + resume
+
+fire:
+  ifire: 1
+  fire_atm_feedback: 1.0
+  fire_tign_in_time: 1.0
+
+chem:
+  smoke: true                     # -> chem_opt=300, tracer_opt=1, biomass_burn_opt=1
+
+execution:
+  hpc_profile: chpc_utah
+  np: 0                           # 0 -> SLURM script uses 80% of allocated cores
+  backend: mpi
+  use_real: true                  # real.exe + met_em (nested)
+  build_met_em: true              # run WPS first (ERA5 900 km box, 30 days)
+  submit_slurm: true              # generate + submit the chained restart jobs
+
+outputs:
+  targets: [arrival_s, fire_area, ros_max, fire_intensity, fuel_consumed, pm25_surface, smoke_tracer]
+  pixel_m: 900

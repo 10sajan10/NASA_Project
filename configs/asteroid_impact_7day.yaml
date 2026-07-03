@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# ASTEROID-IMPACT cascade — Model 1 (WRF-SFIRE + WRF-Chem smoke), 7 days.
+# Same geometry/chem as asteroid_impact_30day.yaml, duration cut to 7 days
+# and run DIRECTLY on the node (no SLURM), using 90% of cores.
+#
+#   .venv/bin/python scripts/run_cascade.py --config configs/asteroid_impact_7day.yaml \
+#       --real --met-em-dir <abs>/wrf-sfire-stack/WPS --install-root <abs>/wrf-sfire-stack --np 100
+# ---------------------------------------------------------------------------
+
+scenario:
+  kml: Dallas.kml
+  city: "Dallas TX USA"
+  band: Mean
+  center: [-96.80889, 32.77998]   # impact / ignition center
+  pulse_seconds: 10.0
+
+domain:
+  extent_km: 900
+  map_proj: lambert
+  resolutions_m: [8100, 2700, 900]
+  nest_fraction: 0.5
+  fire_mesh_ratio: 10
+  e_vert: 45
+  p_top_pa: 5000
+  num_metgrid_levels: 33
+  num_metgrid_soil_levels: 4
+
+time:
+  start: 2019-09-04T12:00
+  duration_days: 7
+  history_interval_min: 60        # hourly output
+  interval_seconds: 21600         # 6-hourly ERA5 boundary forcing
+  restart_interval_min: 1440      # daily restart checkpoints
+
+fire:
+  ifire: 1
+  fire_atm_feedback: 1.0
+  fire_tign_in_time: 1.0
+
+chem:
+  smoke: true                     # -> chem_opt=300, tracer_opt=1, biomass_burn_opt=1
+
+execution:
+  hpc_profile: chpc_utah
+  np: 100                         # 90% of 112 cores
+  backend: serial                 # DAG runs serially in-process; WRF launches mpirun itself
+  use_real: true
+  build_met_em: false             # WPS run separately by the orchestration script
+  submit_slurm: false             # run locally on the node
+
+outputs:
+  targets: [arrival_s, fire_area, ros_max, fire_intensity, fuel_consumed, pm25_surface, smoke_tracer]
+  pixel_m: 900

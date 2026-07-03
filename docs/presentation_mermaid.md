@@ -1,249 +1,232 @@
-# Predicting the Cascading Effects of an Asteroid Impact
-### A pluggable, infrastructure-independent multi-model system
-*4 slides · Mermaid diagrams + speaking notes · audience: NASA*
+# WRF-SFIRE Cascade Pipeline
+### Motivation, abstraction, and overall system architecture
+*4 slides - Mermaid diagrams + speaking notes*
 
-> Diagrams render in VS Code (Markdown Preview) and on GitHub. Screenshot
-> each diagram into PowerPoint/Keynote, or present this file directly.
-> ASCII fallback version: `docs/presentation.md`.
+> Code-grounded deck based on `scripts/run_cascade.py`, `engine/`,
+> `cube/`, `drivers/`, and `models/wrf_sfire_adapter.py`.
 
 ---
 ---
 
-## SLIDE 1 — Why: one impact, a cascade of consequences
+## SLIDE 1 - Motivation: target-driven cascade execution
 
 ```mermaid
-flowchart TD
-    IMPACT(["☄  ASTEROID IMPACT"])
-    IMPACT --> THERMAL["Thermal pulse"]
-    IMPACT --> BLAST["Blast / seismic"]
-    IMPACT --> EJECTA["Ejecta / dust"]
+flowchart LR
+    USER["User request<br/>produce arrival_s<br/>and fire_area"] --> PROBLEM["Without orchestration<br/>manual workflow"]
 
-    THERMAL --> FIRE["WILDFIRE"]
-    FIRE -->|smoke emitted| SMOKE["SMOKE / AEROSOLS"]
-    SMOKE -->|transport| AIR["AIR QUALITY"]
-    FIRE -->|burn scars| FLOOD["FLOODING"]
-    AIR --> HEALTH["HEALTH / EXPOSURE"]
+    PROBLEM --> A["Find datasets<br/>KML heating, fuel,<br/>DEM, wind"]
+    PROBLEM --> B["Convert formats<br/>rasters, NetCDF,<br/>WRF inputs"]
+    PROBLEM --> C["Run model<br/>real.exe or ideal.exe<br/>then wrf.exe"]
+    PROBLEM --> D["Track outputs<br/>lineage, resolution,<br/>staleness"]
 
-    classDef impact fill:#3b0a0a,stroke:#ff6b6b,color:#fff,stroke-width:2px;
-    classDef model fill:#0b2545,stroke:#4da6ff,color:#fff,stroke-width:2px;
-    classDef effect fill:#13262f,stroke:#6fb,color:#fff;
-    class IMPACT impact;
-    class FIRE,SMOKE,FLOOD model;
-    class THERMAL,BLAST,EJECTA,AIR,HEALTH effect;
+    USER --> SYSTEM["Current system<br/>ask for target variables"]
+    SYSTEM --> GRAPH["Build dependency graph"]
+    GRAPH --> RUN["Run only missing producers"]
+    RUN --> CUBE["Write results to cube"]
+    CUBE --> OUT["arrival_s<br/>fire_area"]
+
+    classDef user fill:#3b2a0a,stroke:#ffd166,color:#fff,stroke-width:2px;
+    classDef pain fill:#3b0a0a,stroke:#ff6b6b,color:#fff,stroke-width:2px;
+    classDef step fill:#13262f,stroke:#6fb,color:#fff;
+    classDef system fill:#0b2545,stroke:#4da6ff,color:#fff,stroke-width:2px;
+    class USER,OUT user;
+    class PROBLEM pain;
+    class A,B,C,D,GRAPH,RUN,CUBE step;
+    class SYSTEM system;
 ```
 
-**Every arrow = one model's output is the next model's input.**
+**Point of the project:** a scientist should request the variable they
+want, not hand-wire data access, model staging, execution, and reuse.
 
-- One impact triggers **interacting** processes: fire → smoke → air
-  quality; burn scars → flooding.
-- The science lives in **separate, mature models** (WRF-SFIRE, chemical
-  transport, hydrology) — different teams, languages, machines.
-- No single tool spans the cascade; hand-stitching is fragile and
-  unreproducible.
+- WRF-SFIRE is already an external HPC model with strict input/output
+  expectations.
+- Its inputs come from independent data producers.
+- The pipeline turns a target variable into an executable dependency
+  graph and records the result in a shared cube.
 
-> **What we built:** a system where any model **plugs in**, shares one
-> **data catalog**, and the engine **automatically runs whatever upstream
-> models it depends on** — so the cascade runs end-to-end, reproducibly.
-
-### 🎤 Speaking notes
-"An airburst doesn't cause one effect — it sets off a chain. The thermal
-pulse ignites fires, fires loft smoke, smoke degrades air quality, burn
-scars later drive flooding. Each link is a serious model maintained by a
-different community. Today, coupling them is heroic and not repeatable.
-Our goal: make the **cascade itself** a reproducible object — plug models
-in, let the system wire them together. I'll show the abstraction, then
-walk it through with a fire model and a smoke model."
+### Speaking Notes
+"The motivation is that cascade simulation should not be a hand-built
+script for every experiment. For WRF-SFIRE, we need impact ignition,
+fuel, terrain, and weather. Then we have to stage WRF files, run the
+binary, parse outputs, and remember what was produced. The current
+system changes the unit of work: instead of saying 'run these scripts',
+the user says 'produce these target variables'. The engine figures out
+which data and models are needed."
 
 ---
 ---
 
-## SLIDE 2 — The abstraction: everything is a *producer*
+## SLIDE 2 - Abstraction: variables, producers, and the cube
 
 ```mermaid
 flowchart TB
-    subgraph CONTRACT["ONE CONTRACT FOR EVERYTHING"]
-        direction LR
-        DRV["DATA DRIVER<br/>requires: (none)<br/>produces: wind"]
-        MOD["MODEL<br/>requires: fuel, wind, ignition<br/>produces: fire_arrival"]
+    TARGET["Target variable<br/>example: fire_area"] --> PLANNER["Planner<br/>Pipeline.from_targets"]
+    PLANNER --> REG["ProducerRegistry<br/>variable name -> producer"]
+
+    REG --> P1["ProducerV2 contract"]
+    P1 --> REQ["requires<br/>input variables"]
+    P1 --> PROD["produces<br/>output variables"]
+    P1 --> RUN["run(cube, request)"]
+
+    subgraph IMPLEMENTATIONS["Producer implementations"]
+        DDA["DataDriverAdapter<br/>wraps Driver.fetch()"]
+        MA["ModelAdapter<br/>stage_inputs<br/>run_model<br/>parse_outputs"]
     end
 
-    ASK(["Ask for a target variable"]) --> RES{"In DATA CATALOG?<br/>fresh & fine enough?"}
-    RES -->|yes| USE["Use it"]
-    RES -->|no| FIND["Find the producer of it"]
-    FIND --> RUN["Run it (driver OR model —<br/>identical handling)"]
-    RUN --> RES
+    P1 --> DDA
+    P1 --> MA
 
-    CONTRACT -. "engine can't tell them apart" .-> RES
+    DDA --> CUBE["Cube<br/>shared state"]
+    MA <--> CUBE
 
-    USE --> CAT[("DATA CATALOG<br/>single source of truth<br/>native resolution + lineage")]
-    RUN --> CAT
-    RUN --> INFRA["INFRASTRUCTURE LAYER<br/>auto-detect HPC · same code,<br/>laptop → supercomputer"]
+    CUBE --> STORE["Zarr arrays<br/>actual variable data"]
+    CUBE --> CAT["DuckDB catalog<br/>kind, producer,<br/>native_res_m, version,<br/>fetched_at"]
+    CUBE --> SAT["satisfies()<br/>time coverage + resolution"]
+    CUBE --> STALE["is_output_stale()<br/>dirty propagation"]
 
-    classDef contract fill:#0b2545,stroke:#4da6ff,color:#fff,stroke-width:2px;
+    classDef target fill:#3b2a0a,stroke:#ffd166,color:#fff,stroke-width:2px;
     classDef engine fill:#13262f,stroke:#6fb,color:#fff;
+    classDef contract fill:#0b2545,stroke:#4da6ff,color:#fff,stroke-width:2px;
     classDef store fill:#2a1a3a,stroke:#c79bff,color:#fff,stroke-width:2px;
-    class DRV,MOD contract;
-    class ASK,RES,FIND,RUN,USE engine;
-    class CAT,INFRA store;
+    class TARGET target;
+    class PLANNER,REG,REQ,PROD,RUN,SAT,STALE engine;
+    class P1,DDA,MA contract;
+    class CUBE,STORE,CAT store;
 ```
 
-**Three abstractions — nothing model-specific:**
-1. **Producer** — uniform contract (`produces` / `requires` / `run`).
-   Data sources and models are *the same kind of thing*.
-2. **Data catalog** — one place all producers read/write; the system's
-   memory + reproducibility anchor.
-3. **Resolver** — given a goal, finds and runs whatever satisfies it,
-   recursively. Zero domain knowledge.
+**Key abstraction:** the engine never depends on model names. It depends
+on canonical variable names.
 
-### 🎤 Speaking notes
-"Here's the whole idea on one slide. We force *everything* — every data
-source and every model — through one tiny contract: what you produce,
-what you require, how to run. The engine reads only that; it has no
-domain knowledge. Ask for a result, and the resolver checks the shared
-catalog: if the data is there, fresh, and fine enough, reuse it;
-otherwise find the producer and run it — and that producer might be a
-data download *or* another model. Same handling. That symmetry is the
-trick that lets a model transparently trigger another model. And since
-models never name a machine, the same run executes on a laptop or a
-supercomputer."
+- A data source and a model both materialize variables.
+- A producer declares `requires`, `produces`, and `run`.
+- `DataNeed` and `VarSpec` carry variable metadata such as kind, units,
+  native resolution requirements, and merge policy.
+- The cube is the shared memory of the cascade.
+
+### Speaking Notes
+"This is the core abstraction. Everything is a producer of variables.
+A data driver produces variables by fetching external data. A model
+produces variables by computing from other variables. The engine treats
+both the same way. It asks the registry: who can produce `fire_area`?
+Then it walks backward through requirements until all upstream variables
+are satisfied in the cube. The cube is not just storage; it is also the
+place where reuse decisions happen."
 
 ---
 ---
 
-## SLIDE 3 — Walkthrough: WRF-SFIRE (model 1) → smoke_model (model 2)
-
-```mermaid
-flowchart LR
-    KML["Thermal pulse<br/>(from KML)"] -->|ignition| WRF
-    FUEL["Fuel map"] -->|fuel| WRF
-    WIND["ERA5 wind"] -->|wind| WRF
-    DEM["Terrain DEM"] -->|terrain| WRF
-
-    WRF["WRF-SFIRE<br/>★ MODEL 1<br/>fire spread + atmosphere"]
-    WRF -->|fire_arrival| SMOKE
-    WRF -->|burned_area| SMOKE
-    WIND -. "wind reused<br/>(already in catalog)" .-> SMOKE
-
-    SMOKE["smoke_model<br/>★ MODEL 2 (hypothetical)<br/>plume + chemistry"]
-    SMOKE -->|smoke_concentration| GOAL(["GOAL the user asked for"])
-
-    classDef data fill:#13262f,stroke:#6fb,color:#fff;
-    classDef m1 fill:#0b2545,stroke:#4da6ff,color:#fff,stroke-width:2px;
-    classDef m2 fill:#2a1a3a,stroke:#c79bff,color:#fff,stroke-width:2px;
-    classDef goal fill:#3b2a0a,stroke:#ffd166,color:#fff,stroke-width:2px;
-    class KML,FUEL,WIND,DEM data;
-    class WRF m1;
-    class SMOKE m2;
-    class GOAL goal;
-```
-
-**Execution order the engine derives (topological):**
-
-```mermaid
-flowchart LR
-    S1["1 · data drivers<br/>thermal · fuel · wind · dem<br/>(parallel)"] --> S2["2 · WRF-SFIRE<br/>(consumes step 1)"]
-    S2 --> S3["3 · smoke_model<br/>(consumes WRF-SFIRE + reused wind)"]
-    classDef s fill:#13262f,stroke:#6fb,color:#fff;
-    class S1,S2,S3 s;
-```
-
-**Plug in model 2 — the entire integration:**
-```text
-1. declare its contract:   requires = {fire_arrival, wind}
-                           produces = {smoke_concentration}
-2. register it:            catalog.add_model("smoke", …)   ← one line
-→ the engine wires the cascade. No engine code changes.
-```
-
-### 🎤 Speaking notes
-"Concretely: the user asks for *smoke concentration* — nothing else. The
-engine reads smoke_model's contract, sees it needs fire arrival time,
-finds WRF-SFIRE produces it, sees WRF-SFIRE needs ignition, fuel, wind,
-terrain — pulls those from data drivers. It runs everything in
-dependency order. Note the wind: WRF-SFIRE already used it, so when
-smoke_model also needs it, the catalog hands back the cached copy — no
-recompute. To add the smoke model, a scientist writes a three-line
-contract and registers it with one line. They never touch the engine,
-the catalog, or the fire model. That's how the third, fourth, tenth
-model goes in too."
-
----
----
-
-## SLIDE 4 — The hard part: *"is it already in the system?"*
+## SLIDE 3 - Overall system architecture from the code
 
 ```mermaid
 flowchart TB
-    REQ(["Request a variable"]) --> Q1{"Covers THIS<br/>time window?"}
-    Q1 -->|no| RC
-    Q1 -->|yes| Q2{"FINE-ENOUGH<br/>resolution?"}
-    Q2 -->|no| RC
-    Q2 -->|yes| Q3{"Inputs CURRENT<br/>(not stale)?"}
-    Q3 -->|no| RC
-    Q3 -->|yes| Q4{"Provenance /<br/>config matches?"}
-    Q4 -->|no| RC
-    Q4 -->|yes| REUSE["✔ REUSE<br/>(skip the expensive run)"]
-    RC["✗ RECOMPUTE<br/>+ cascade invalidation downstream"]
+    CLI["scripts/run_cascade.py<br/>CLI target request"] --> SC["ScenarioConfig<br/>area, grid, time,<br/>WRF mode"]
+    SC --> BC["BuildContext<br/>HPC profile,<br/>install paths,<br/>requested targets"]
 
-    classDef q fill:#13262f,stroke:#6fb,color:#fff;
-    classDef good fill:#0b2e1a,stroke:#5cdb95,color:#fff,stroke-width:2px;
-    classDef bad fill:#3b0a0a,stroke:#ff6b6b,color:#fff,stroke-width:2px;
-    class REQ,Q1,Q2,Q3,Q4 q;
-    class REUSE good;
-    class RC bad;
+    BC --> CATALOG["CascadeCatalog<br/>models/catalog.py"]
+    CATALOG --> FACTORIES["Producer factories<br/>build drivers and models"]
+    FACTORIES --> REG["ProducerRegistry<br/>name index + variable index"]
+
+    REG --> PLAN["Pipeline.from_targets()<br/>derive DAG from<br/>requires/produces"]
+    PLAN --> RUNNER["PipelineRunner<br/>topological scheduling<br/>skip_when_satisfied<br/>retry/result logging"]
+    RUNNER --> BACKEND["Backend layer<br/>serial, thread,<br/>process, dask, slurm"]
+
+    BACKEND --> DD["Data producers<br/>thermal, landfire,<br/>dem, era5_wind"]
+    BACKEND --> MM["Model producers<br/>wrf_sfire_asteroid<br/>future model adapters"]
+
+    DD --> CUBE["Cube"]
+    MM <--> CUBE
+
+    CUBE --> ZARR["Zarr variable stores"]
+    CUBE --> DUCK["DuckDB catalog"]
+    DUCK --> META["lineage metadata<br/>producer, source,<br/>native_res_m,<br/>version, fetched_at"]
+
+    CUBE --> RESULT["Requested outputs<br/>available for analysis<br/>or downstream models"]
+
+    classDef entry fill:#3b2a0a,stroke:#ffd166,color:#fff,stroke-width:2px;
+    classDef engine fill:#13262f,stroke:#6fb,color:#fff;
+    classDef prod fill:#0b2545,stroke:#4da6ff,color:#fff,stroke-width:2px;
+    classDef store fill:#2a1a3a,stroke:#c79bff,color:#fff,stroke-width:2px;
+    class CLI,RESULT entry;
+    class SC,BC,CATALOG,FACTORIES,REG,PLAN,RUNNER,BACKEND,META engine;
+    class DD,MM prod;
+    class CUBE,ZARR,DUCK store;
 ```
 
-> Wrong one way → silently use **stale / too-coarse** data (bad science).
-> Wrong the other → **recompute a 50,000-core run** needlessly.
+**Implemented architecture:**
+- `run_cascade.py` creates the scenario, registry, pipeline, cube, and
+  runner.
+- `default_catalog()` registers the built-in data producers and
+  WRF-SFIRE.
+- `Pipeline.from_targets()` creates a target-driven DAG.
+- `PipelineRunner` executes the DAG through a backend.
+- The cube records both arrays and catalog metadata for reuse and
+  provenance.
 
-**Why this is the real research problem**
-- The abstraction is easy to state, hard to make **trustworthy**.
-- "Satisfaction" is **multi-dimensional**: time × resolution × freshness
-  × provenance — not "does the key exist?"
-- One changed input must invalidate **exactly** the affected downstream
-  products — no more, no less.
+### Speaking Notes
+"This is the overall architecture as it exists in the code. The command
+line target flows into scenario configuration and build context. The
+catalog instantiates producers. The registry maps every variable to the
+producer that can create it. The planner turns targets into a DAG, and
+the runner executes that DAG through a backend. Data producers and model
+producers both read and write the same cube, so downstream models can
+consume upstream outputs without any direct coupling."
 
-**Design stance — abstractions over implementations**
-- Producers declare *requirements* ("≤ 100 m"), not procedures.
-- The catalog records *native resolution + lineage* per variable.
-- One resolver decides reuse-vs-recompute from that metadata — policy in
-  **one place**, not smeared across every model.
+---
+---
 
-**Roadmap**
+## SLIDE 4 - Current implementation: WRF-SFIRE as model 1
+
 ```mermaid
-flowchart LR
-    subgraph DONE["✔ Working today"]
-        A["uniform producer contract"]
-        B["recursive cascade resolution"]
-        C["data catalog + lineage"]
-        D["infrastructure independence"]
-        E["WRF-SFIRE = model 1, validated"]
+`flowchart TB
+    subgraph INPUTS["Variables required by WRFSFireAdapter"]
+        I1["ignition_t0<br/>from ThermalDriver"]
+        I2["nfuel_cat<br/>from LandfireFBFM13Driver"]
+        I3["dem<br/>from DEMDriver"]
+        I4["wind_speed_ms<br/>wind_dir_deg<br/>optional ERA5WindDriver"]
     end
-    subgraph NEXT["◻ Next"]
-        F["richer satisfaction calculus"]
-        G["partial / tiled reuse across nests"]
-        H["more models: smoke, flood, exposure"]
-        I["cross-model uncertainty propagation"]
-    end
-    DONE ==> NEXT
-    classDef done fill:#0b2e1a,stroke:#5cdb95,color:#fff;
-    classDef next fill:#3b2a0a,stroke:#ffd166,color:#fff;
-    class A,B,C,D,E done;
-    class F,G,H,I next;
+
+    I1 --> FETCH["DataDriverAdapter<br/>writes inputs into cube"]
+    I2 --> FETCH
+    I3 --> FETCH
+    I4 -. "optional" .-> FETCH
+    FETCH --> CUBE1["Cube input state"]
+
+    CUBE1 --> WRF["WRFSFireAdapter<br/>ModelAdapter subclass"]
+
+    WRF --> STAGE["stage_inputs()<br/>templates, namelists,<br/>wrfinput, TIGN_IN,<br/>NFUEL_CAT, ZSF"]
+    STAGE --> EXEC["run_model()<br/>real.exe or ideal.exe<br/>wrf.exe via HPC profile"]
+    EXEC --> PARSE["parse_outputs()<br/>read wrfout<br/>block-reduce fire mesh"]
+
+    PARSE --> CUBE2["Cube output state"]
+    CUBE2 --> O1["arrival_s"]
+    CUBE2 --> O2["fire_area"]
+    CUBE2 --> O3["optional diagnostics<br/>ros_max, fire_intensity,<br/>fuel_consumed"]
+    CUBE2 --> O4["optional WRF-Chem outputs<br/>pm25_surface,<br/>smoke_tracer"]
+
+    CUBE2 --> NEXT["Next model adapter<br/>declares DataNeed(arrival_s)<br/>and is pulled into the DAG"]
+
+    classDef input fill:#13262f,stroke:#6fb,color:#fff;
+    classDef adapter fill:#0b2545,stroke:#4da6ff,color:#fff,stroke-width:2px;
+    classDef store fill:#2a1a3a,stroke:#c79bff,color:#fff,stroke-width:2px;
+    classDef output fill:#3b2a0a,stroke:#ffd166,color:#fff,stroke-width:2px;
+    class I1,I2,I3,I4 input;
+    class FETCH,WRF,STAGE,EXEC,PARSE,NEXT adapter;
+    class CUBE1,CUBE2 store;
+    class O1,O2,O3,O4 output;`
 ```
 
-### 🎤 Speaking notes
-"Finally, the honest part. The abstraction is simple to describe; making
-it *trustworthy* is the research. The crux: before launching an
-expensive model, decide whether what we need is *already in the system*.
-That's not 'does the key exist' — it's: do we have it for this time
-window, at fine-enough resolution, from current inputs, with matching
-provenance? Err one way, you run on stale or coarse data — bad science.
-Err the other, you burn a fifty-thousand-core run you didn't need. Our
-stance keeps this an *abstraction*: producers declare requirements, the
-catalog records resolution and lineage, one resolver makes the decision —
-so the policy lives in a single place. We have the contract, the
-recursive cascade, the catalog, and infrastructure independence working,
-with WRF-SFIRE as the validated first model. Next: a richer satisfaction
-calculus, partial reuse across nested grids, and more models in the
-chain. Thank you — happy to go deeper on any layer."
+**Why this validates the design:**
+- WRF-SFIRE is a real external model wrapped without changing the engine.
+- The adapter translates cube variables into WRF-specific files, then
+  translates WRF output back into cube variables.
+- The same registry and DAG mechanism can place another model after
+  WRF-SFIRE if it requires `arrival_s` or `fire_area`.
+
+### Speaking Notes
+"WRF-SFIRE is the implemented proof point. It is a `ModelAdapter`, so
+the engine sees the same contract as every other producer. Internally,
+the adapter does the messy model-specific work: staging namelists and
+NetCDF inputs, invoking WRF through the detected HPC profile, and parsing
+`wrfout` back into cube variables. The important architectural point is
+that this complexity is contained inside the adapter. The pipeline only
+sees variables, dependencies, and outputs."

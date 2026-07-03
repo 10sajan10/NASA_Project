@@ -258,6 +258,7 @@ class WRFSFireAdapter(ModelAdapter):
           5. Inject TIGN_IN / NFUEL_CAT / ZSF into ``wrfinput_d01.nc``.
         """
         self._copy_templates(stage)
+        self._link_run_tables(stage)
 
         used_wind = self._patch_input_sounding_with_wind(
             stage / "input_sounding", inputs, request)
@@ -275,7 +276,7 @@ class WRFSFireAdapter(ModelAdapter):
 
         self._make_wrfinput(stage, grid)
         self._inject_sfire_inputs(
-            stage / f"wrfinput_{self._fire_dom}.nc", grid, inputs,
+            self._wrfinput_path(stage), grid, inputs,
             fire_tign_in_time)
 
     # ============================================================ RUN
@@ -403,6 +404,46 @@ class WRFSFireAdapter(ModelAdapter):
                     f"WRF-SFIRE template missing: {src}")
             shutil.copy(src, stage / dst_name)
 
+    def _link_run_tables(self, stage: Path) -> None:
+        """Symlink the WRF run-time data tables into the stage.
+
+        wrf.exe expects RRTM*/CAM*/`*.TBL`/`*.formatted` and the SFIRE
+        `*.asc` files next to it (e.g. CLWRF FATALs without
+        ``CAMtr_volume_mixing_ratio``). They live in the build's
+        ``test/em_real`` dir (next to the wrf.exe being launched). Only
+        templates were copied before; link everything else here.
+        """
+        exe = next((Path(t) for t in reversed(self.wrf_cmd)
+                    if str(t).endswith(".exe")), None)
+        if exe is None:
+            return
+        exe = (exe if exe.is_absolute() else (self.sfire_dir / exe)).resolve()
+        for tbl_dir in (exe.parent.parent / "test" / "em_real",
+                        exe.parent.parent / "run"):
+            if not tbl_dir.is_dir():
+                continue
+            for src in tbl_dir.iterdir():
+                name = src.name
+                if name.endswith(".exe"):
+                    continue
+                # Skip the namelists we generate/copy ourselves, and run
+                # I/O — but DO link data tables like namelist.fire_emissions
+                # (SFIRE FATALs without it). namelist.fire is copied earlier
+                # so it's protected by the dest.exists() guard below.
+                if name in ("namelist.input", "namelist.wps"):
+                    continue
+                if name.startswith(("met_em.", "wrfinput", "wrfbdy",
+                                    "wrfout", "wrfrst", "rsl.")):
+                    continue
+                dest = stage / name
+                if dest.exists() or dest.is_symlink():
+                    continue
+                try:
+                    dest.symlink_to(src.resolve())
+                except OSError:
+                    pass
+            break
+
     def _patch_namelist(self, path: Path, grid, inputs: dict[str, Any],
                          request: Request) -> float:
         """Write the cube-aware namelist.input and return
@@ -507,10 +548,25 @@ class WRFSFireAdapter(ModelAdapter):
             subprocess.run(self._cmd_for_stage(self.ideal_cmd),
                            cwd=stage, check=True)
 
-        if not wrfinput.exists():
-            # Test-mode fallback: build a minimal wrfinput shell so
-            # _inject_sfire_inputs has something to write into.
+        # real.exe / ideal.exe write ``wrfinput_d0N`` (no extension). Only
+        # fall back to a minimal ``.nc`` shell when neither that file nor a
+        # prior shell exists (pure test mode with no model binary).
+        real_wrfinput = stage / f"wrfinput_{self._fire_dom}"
+        if not wrfinput.exists() and not real_wrfinput.exists():
             self._write_minimal_wrfinput(wrfinput, grid)
+
+    def _wrfinput_path(self, stage: Path) -> Path:
+        """Path to the fire-domain wrfinput that WRF actually reads.
+
+        real.exe / ideal.exe emit ``wrfinput_d0N`` (no extension); the
+        test-mode fallback writes ``wrfinput_d0N.nc``. Prefer the real
+        file so TIGN_IN / NFUEL_CAT / ZSF injection lands where WRF reads
+        it (otherwise the fire never ignites — TIGN_IN stays all-zero).
+        """
+        real = stage / f"wrfinput_{self._fire_dom}"
+        if real.exists():
+            return real
+        return stage / f"wrfinput_{self._fire_dom}.nc"
 
     def _cmd_for_stage(self, cmd: list[str]) -> list[str]:
         """Resolve `./binary` commands against sfire_dir for temp stages.
@@ -537,7 +593,9 @@ class WRFSFireAdapter(ModelAdapter):
             return 0
         if not self.met_em_dir.exists():
             raise FileNotFoundError(self.met_em_dir)
-        files = sorted(self.met_em_dir.glob("met_em.d01*"))
+        # Nested real.exe needs met_em for every domain (d01, d02, d03…),
+        # not just the parent — otherwise real.exe FATALs opening met_em.d02.
+        files = sorted(self.met_em_dir.glob("met_em.d0*"))
         for src in files:
             dest = stage / src.name
             if dest.exists():
@@ -675,9 +733,19 @@ class WRFSFireAdapter(ModelAdapter):
              "Terrain height on fire mesh"),
         )
         with nc.Dataset(wrfinput, "a") as ds:
-            self._ensure_fire_dims(ds, Hf, Wf)
+            # The cube AOI (extent_km wide) is generally LARGER than the
+            # fire domain it feeds (e.g. a 900 km cube driving a 227 km d03),
+            # so the cube-derived fire arrays (Hf x Wf) must be fit to the
+            # target file's real fire-mesh dims. Cube and fire domain share
+            # the impact centre and the 900 m atmosphere pitch, so a centred
+            # crop selects exactly the fire domain's footprint.
+            Hf_t = (ds.dimensions["south_north_subgrid"].size
+                    if "south_north_subgrid" in ds.dimensions else Hf)
+            Wf_t = (ds.dimensions["west_east_subgrid"].size
+                    if "west_east_subgrid" in ds.dimensions else Wf)
+            self._ensure_fire_dims(ds, Hf_t, Wf_t)
             for name, arr, units, desc in fields:
-                self._upsert_fire_var(ds, name, arr,
+                self._upsert_fire_var(ds, name, _center_fit(arr, Hf_t, Wf_t),
                                        units=units, description=desc)
 
     def _build_zsf_fire(self, grid, dem_atm: np.ndarray) -> np.ndarray:
@@ -717,7 +785,17 @@ class WRFSFireAdapter(ModelAdapter):
                           description: str = "") -> None:
         dims = ("south_north_subgrid", "west_east_subgrid")
         if name in ds.variables:
-            ds.variables[name][:] = array
+            var = ds.variables[name]
+            # real.exe writes these as (Time, sn_sub, we_sub) in a netCDF-4
+            # file where Time is UNLIMITED. Assigning a 2D array via
+            # ``var[:] = array`` there makes netCDF4 mis-handle the
+            # unlimited dim and write an unbounded region (file balloons to
+            # 100s of GB). Address the time index explicitly with a
+            # matching-rank slice instead.
+            if var.ndim == 3:
+                var[0, :, :] = array
+            else:
+                var[:] = array
         else:
             var = ds.createVariable(name, "f4", dims)
             var[:] = array
@@ -765,6 +843,27 @@ def _block_replicate(arr: np.ndarray, factor: tuple[int, int]) -> np.ndarray:
     """Upsample by integer factor via nearest-neighbour replication."""
     fy, fx = factor
     return np.repeat(np.repeat(arr, fy, axis=0), fx, axis=1)
+
+
+def _center_fit(arr: np.ndarray, Ht: int, Wt: int) -> np.ndarray:
+    """Centre-crop (or edge-pad) ``arr`` to exactly ``(Ht, Wt)``.
+
+    Used to fit a cube-resolution fire array onto a fire domain that is
+    co-centred but smaller (crop) — or, defensively, larger (edge-pad).
+    """
+    H, W = arr.shape
+    if H > Ht:
+        s = (H - Ht) // 2
+        arr = arr[s:s + Ht, :]
+    if W > Wt:
+        s = (W - Wt) // 2
+        arr = arr[:, s:s + Wt]
+    H, W = arr.shape
+    if H < Ht or W < Wt:
+        ph0, pw0 = max((Ht - H) // 2, 0), max((Wt - W) // 2, 0)
+        ph1, pw1 = max(Ht - H - ph0, 0), max(Wt - W - pw0, 0)
+        arr = np.pad(arr, ((ph0, ph1), (pw0, pw1)), mode="edge")
+    return arr
 
 
 def _block_reduce(arr: np.ndarray, factor: tuple[int, int],

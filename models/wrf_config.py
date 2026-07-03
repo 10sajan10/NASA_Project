@@ -115,9 +115,16 @@ class WRFScenario:
         # values require a WRF-Chem-enabled binary (bootstrap with
         # enable_chem=True); on a non-chem build WRF ignores &chem.
         if self.smoke and self.chem_opt == 0:
-            self.chem_opt = 17        # GOCART simple aerosol w/ fire emis
-            self.emiss_opt = 5        # biomass-burning emissions
-            self.tracer_opt = 0
+            # GOCART-simple aerosol (so2/p25/bc/oc...) — its species match the
+            # patched add_fire_emissions (per-species param_first_scalar guard),
+            # and namelist.fire_emissions.GOCART has compatible_chem_opt=300.
+            self.chem_opt = 300
+            self.emiss_opt = 0        # no anthropogenic emission files; fire
+                                      # emissions come via biomass_burn_opt
+            # passive smoke tracer (p_smoke), emitted by the fire and advected
+            # like an aerosol — the dedicated SFIRE smoke field.
+            if self.tracer_opt == 0:
+                self.tracer_opt = 1
 
     # ------------------------------------------------------------------
     @property
@@ -149,7 +156,9 @@ class WRFScenario:
         if self.time_step_s is not None:
             return int(self.time_step_s)
         dx_km = self.domains[0].dx_m / 1000.0
-        return max(1, int(round(6.0 * dx_km)))
+        # WRF caps dt/dx at ~6 s/km; the map factor pushes the effective
+        # ratio slightly above 6*dx, so use 5 s/km for a safe margin.
+        return max(1, int(5.0 * dx_km))
 
     # ------------------------------------------------------------------
     @classmethod
@@ -266,24 +275,26 @@ class NamelistBuilder:
         total_s = int(s.duration_days * 86400)
         run_days = total_s // 86400
         run_hours = (total_s % 86400) // 3600
+        run_minutes = (total_s % 3600) // 60
+        run_seconds = total_s % 60
         return f"""\
  &time_control
  run_days                = {run_days},
  run_hours               = {run_hours},
- run_minutes             = 0,
- run_seconds             = 0,
+ run_minutes             = {run_minutes},
+ run_seconds             = {run_seconds},
  start_year              = {self._per_dom(f"{s.start.year:04d}")}
  start_month             = {self._per_dom(f"{s.start.month:02d}")}
  start_day               = {self._per_dom(f"{s.start.day:02d}")}
  start_hour              = {self._per_dom(f"{s.start.hour:02d}")}
- start_minute            = {self._per_dom("00")}
- start_second            = {self._per_dom("00")}
+ start_minute            = {self._per_dom(f"{s.start.minute:02d}")}
+ start_second            = {self._per_dom(f"{s.start.second:02d}")}
  end_year                = {self._per_dom(f"{s.end.year:04d}")}
  end_month               = {self._per_dom(f"{s.end.month:02d}")}
  end_day                 = {self._per_dom(f"{s.end.day:02d}")}
  end_hour                = {self._per_dom(f"{s.end.hour:02d}")}
- end_minute              = {self._per_dom("00")}
- end_second              = {self._per_dom("00")}
+ end_minute              = {self._per_dom(f"{s.end.minute:02d}")}
+ end_second              = {self._per_dom(f"{s.end.second:02d}")}
  interval_seconds        = {s.interval_seconds},
  input_from_file         = {self._per_dom(".true.")}
  history_interval        = {self._per_dom(s.history_interval_min)}
@@ -363,18 +374,21 @@ class NamelistBuilder:
  &chem
  kemit                   = 1,
  chem_opt                = {self._per_dom(s.chem_opt)}
+ vprm_opt                = {self._per_dom("'VPRM_table_US'")}
+ chem_conv_tr            = {self._per_dom(0)}
+ chemdt                  = {self._per_dom(0)}
  bioemdt                 = {self._per_dom(0)}
  photdt                  = {self._per_dom(0)}
- chemdt                  = {self._per_dom(0)}
  emiss_opt               = {self._per_dom(s.emiss_opt)}
  emiss_opt_vol           = {self._per_dom(0)}
+ bio_emiss_opt           = {self._per_dom(0)}
  chem_in_opt             = {self._per_dom(0)}
  phot_opt                = {self._per_dom(0)}
  gas_drydep_opt          = {self._per_dom(0)}
  aer_drydep_opt          = {self._per_dom(1)}
  biomass_burn_opt        = {self._per_dom(1)}
  plumerisefire_frq       = {self._per_dom(30)}
- tracer_opt              = {self._per_dom(s.tracer_opt)}
+ aer_ra_feedback         = {self._per_dom(0)}
  have_bcs_chem           = {self._per_dom(".false.")}
  /
 """
@@ -399,6 +413,8 @@ class NamelistBuilder:
  moist_adv_opt           = {self._per_dom(1)}
  scalar_adv_opt          = {self._per_dom(1)}
  gwd_opt                 = {self._per_dom(1)}
+ tracer_opt              = {self._per_dom(s.tracer_opt)}
+ tracer_adv_opt          = {self._per_dom(1 if s.tracer_opt else 0)}
  /
 """
 
@@ -504,6 +520,8 @@ class WPSNamelistBuilder:
  end_date   = {row([f"'{s.end.strftime(fmt)}'"] * s.max_dom)}
  interval_seconds = {s.interval_seconds},
  io_form_geogrid = 2,
+ subgrid_ratio_x = {row(x.sr for x in d)}
+ subgrid_ratio_y = {row(x.sr for x in d)}
  /
 
  &geogrid

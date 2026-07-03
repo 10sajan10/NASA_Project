@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# BURN-CONFIRMATION TEST for the asteroid-impact run. Identical geometry/chem
+# to asteroid_impact_30day.yaml, but only ~30 min of simulation so we can
+# confirm fire actually ignites (FIRE_AREA>0) and smoke/PM25 is emitted above
+# background BEFORE committing the full 30-day run. Run locally, no SLURM.
+#
+#   .venv/bin/python scripts/run_cascade.py --config configs/asteroid_burntest.yaml \
+#       --real --met-em-dir wrf-sfire-stack/WPS --install-root wrf-sfire-stack
+# ---------------------------------------------------------------------------
+
+scenario:
+  kml: Dallas.kml
+  city: "Dallas TX USA"
+  band: Mean
+  center: [-96.80889, 32.77998]   # impact / ignition center
+  pulse_seconds: 10.0
+
+domain:
+  extent_km: 900
+  map_proj: lambert
+  resolutions_m: [8100, 2700, 900]
+  nest_fraction: 0.5
+  fire_mesh_ratio: 10
+  e_vert: 45
+  p_top_pa: 5000
+  num_metgrid_levels: 33
+  num_metgrid_soil_levels: 4
+
+time:
+  start: 2019-09-04T12:00
+  duration_days: 0.25              # 6 h — minimum real-data run (one ERA5 interval); confirms burn early via 10-min frames
+  history_interval_min: 10         # frequent output so we can see the burn
+  interval_seconds: 21600
+  restart_interval_min: 1440       # no restart within the 30-min test
+
+fire:
+  ifire: 1
+  fire_atm_feedback: 1.0
+  fire_tign_in_time: 1.0
+
+chem:
+  smoke: true
+
+execution:
+  hpc_profile: chpc_utah
+  np: 0
+  backend: serial                  # DAG runs serially in-process; WRF node launches mpirun itself
+  use_real: true
+  build_met_em: false              # met_em already built (wrf-sfire-stack/WPS)
+  submit_slurm: false              # run locally on the node
+
+outputs:
+  targets: [fire_area, pm25_surface, smoke_tracer]
+  pixel_m: 900

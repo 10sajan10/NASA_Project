@@ -289,7 +289,7 @@ def diagram_layers():
         *DATA, fs=10, bold=True)
 
     box(ax, 10, 24, 80, 9,
-        "INFRASTRUCTURE INDEPENDENCE  (a supporting concern, not the focus)\n"
+        "INFRASTRUCTURE INDEPENDENCE  (another concern)\n"
         "same run on a laptop or a supercomputer",
         *NEUTRAL, fs=10)
 

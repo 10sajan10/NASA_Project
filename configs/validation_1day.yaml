@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# 1-day VALIDATION scenario — proves the full nested + chem pipeline end to end
+# before launching the full 14-day run.
+#
+# Same geometry as the production scenario (1200 km parent, nested to 900 m,
+# 90 m fire mesh on the inner domain, smoke/chem ON) but only 1 simulated day
+# so geogrid->ungrib->metgrid->real->wrf(+chem) and the cube round-trip can be
+# verified quickly.
+#
+# Run:
+#   .venv/bin/python scripts/run_cascade.py --config configs/validation_1day.yaml
+# ---------------------------------------------------------------------------
+
+scenario:
+  kml: Dallas.kml
+  city: "Dallas TX USA"
+  band: Mean
+  center: [-96.80889, 32.77998]
+  pulse_seconds: 10.0
+
+domain:
+  extent_km: 1200                 # d01 parent span
+  map_proj: lambert
+  # explicit integer-ratio nest stack that lands exactly on 900 m:
+  #   8100 ->(/3) 2700 ->(/3) 900
+  resolutions_m: [8100, 2700, 900]
+  nest_fraction: 0.4              # each nest covers 40% of its parent (centered)
+  fire_mesh_ratio: 10             # 900 m / 10 = 90 m fire cells on inner nest
+  e_vert: 45
+  p_top_pa: 5000
+  num_metgrid_levels: 33
+  num_metgrid_soil_levels: 4
+
+time:
+  start: 2019-09-04T12:00
+  duration_days: 1                # VALIDATION: 1 day (production will be 14)
+  history_interval_min: 60
+  interval_seconds: 21600
+  restart_interval_min: 1440
+
+fire:
+  ifire: 1
+  fire_atm_feedback: 1.0
+  fire_tign_in_time: 1.0
+
+chem:
+  smoke: true                     # chem_opt=17 (GOCART + biomass-burn emissions)
+
+execution:
+  hpc_profile: auto               # -> chpc_utah
+  np: 56
+  backend: serial
+  use_real: true                  # real.exe + met_em (nested)
+  build_met_em: true              # run WPS first (ERA5 1200 km box, 1 day)
+  submit_slurm: false
+
+outputs:
+  # Cube analysis grid resolution. The fire diagnostics come from the inner
+  # nest; ros_max/fire_intensity/fuel_consumed enable the extra parse path,
+  # pm25_surface/smoke_tracer enable the chem parse path.
+  targets: [arrival_s, fire_area, ros_max, fire_intensity, fuel_consumed, pm25_surface]
+  pixel_m: 900
