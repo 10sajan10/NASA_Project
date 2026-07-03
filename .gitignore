@@ -45,9 +45,19 @@ logs/
 # Named cube snapshots can be large generated artifacts
 cube_snapshots/
 
+# Run artifacts and event-bus runtime state
+runs/
+events/
+.asteroid7d_logpath
+Architect
+
 # OS/editor noise
 .DS_Store
 *.swp
 
 # Documentation / presentation artifacts (kept local)
+docs/
 
+# self-contained provisioning build outputs
+wrfdeps/
+WRF-SFIRE/

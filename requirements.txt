@@ -95,3 +95,5 @@ wrapt==2.1.2
 xarray==2026.4.0
 yarl==1.23.0
 zarr==3.2.1
+anthropic>=0.115
+mcp>=1.0

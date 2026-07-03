@@ -1,0 +1,419 @@
+{
+  "datasets": [
+    {
+      "id": "dem",
+      "title": "Digital elevation model (SRTM/3DEP)",
+      "description": "",
+      "variables": [
+        "dem",
+        "slope_deg",
+        "aspect_deg"
+      ],
+      "driver": "dem",
+      "coverage": {
+        "bbox": [
+          -180.0,
+          -60.0,
+          180.0,
+          60.0
+        ],
+        "t_start": null,
+        "t_end": null
+      },
+      "native_res_m": 30.0,
+      "cadence_s": 0.0,
+      "provenance": {
+        "source_org": "USGS",
+        "url": "",
+        "doi": "",
+        "license": "public",
+        "retrieval": "api"
+      },
+      "quality": {
+        "trust_tier": "reference",
+        "uncertainty": "",
+        "validation": ""
+      },
+      "cost": {
+        "setup_s": 60.0,
+        "cell_step_s": 0.0,
+        "parallel_alpha": 1.0,
+        "max_cores": 0
+      },
+      "tags": []
+    },
+    {
+      "id": "era5_wind",
+      "title": "ERA5 reanalysis 10 m wind",
+      "description": "",
+      "variables": [
+        "wind_speed_ms",
+        "wind_dir_deg"
+      ],
+      "driver": "era5_wind",
+      "coverage": {
+        "bbox": [
+          -180.0,
+          -90.0,
+          180.0,
+          90.0
+        ],
+        "t_start": "1940-01-01T00:00:00",
+        "t_end": null
+      },
+      "native_res_m": 31000.0,
+      "cadence_s": 3600.0,
+      "provenance": {
+        "source_org": "ECMWF/Copernicus",
+        "url": "https://cds.climate.copernicus.eu",
+        "doi": "",
+        "license": "CC-BY-4.0",
+        "retrieval": "api"
+      },
+      "quality": {
+        "trust_tier": "reference",
+        "uncertainty": "",
+        "validation": ""
+      },
+      "cost": {
+        "setup_s": 300.0,
+        "cell_step_s": 0.0,
+        "parallel_alpha": 1.0,
+        "max_cores": 0
+      },
+      "tags": []
+    },
+    {
+      "id": "exposure",
+      "title": "Synthetic population + asset exposure",
+      "description": "Monocentric-city placeholder for population density and built-asset value; replace with WorldPop/HAZUS drivers for real estimates",
+      "variables": [
+        "population_density",
+        "asset_value_usd"
+      ],
+      "driver": "exposure",
+      "coverage": {
+        "bbox": [
+          -180.0,
+          -90.0,
+          180.0,
+          90.0
+        ],
+        "t_start": null,
+        "t_end": null
+      },
+      "native_res_m": 0.0,
+      "cadence_s": 0.0,
+      "provenance": {
+        "source_org": "synthetic",
+        "url": "",
+        "doi": "",
+        "license": "public",
+        "retrieval": "computed"
+      },
+      "quality": {
+        "trust_tier": "experimental",
+        "uncertainty": "parametric placeholder",
+        "validation": ""
+      },
+      "cost": {
+        "setup_s": 1.0,
+        "cell_step_s": 0.0,
+        "parallel_alpha": 1.0,
+        "max_cores": 0
+      },
+      "tags": []
+    },
+    {
+      "id": "landfire",
+      "title": "LANDFIRE FBFM13 fuel model",
+      "description": "",
+      "variables": [
+        "fbfm13",
+        "nfuel_cat"
+      ],
+      "driver": "landfire",
+      "coverage": {
+        "bbox": [
+          -125.0,
+          24.0,
+          -66.0,
+          50.0
+        ],
+        "t_start": null,
+        "t_end": null
+      },
+      "native_res_m": 30.0,
+      "cadence_s": 0.0,
+      "provenance": {
+        "source_org": "USGS LANDFIRE",
+        "url": "https://landfire.gov",
+        "doi": "",
+        "license": "public",
+        "retrieval": "api"
+      },
+      "quality": {
+        "trust_tier": "reference",
+        "uncertainty": "",
+        "validation": ""
+      },
+      "cost": {
+        "setup_s": 60.0,
+        "cell_step_s": 0.0,
+        "parallel_alpha": 1.0,
+        "max_cores": 0
+      },
+      "tags": []
+    },
+    {
+      "id": "thermal",
+      "title": "PDC asteroid thermal-damage footprint",
+      "description": "Airburst thermal fluence/power + ignition map parsed from a PDC exercise KML",
+      "variables": [
+        "thermal_fluence",
+        "thermal_power",
+        "ignition_t0",
+        "burnable"
+      ],
+      "driver": "thermal",
+      "coverage": {
+        "bbox": [
+          -180.0,
+          -90.0,
+          180.0,
+          90.0
+        ],
+        "t_start": null,
+        "t_end": null
+      },
+      "native_res_m": 0.0,
+      "cadence_s": 0.0,
+      "provenance": {
+        "source_org": "NASA/JPL PDC exercise",
+        "url": "",
+        "doi": "",
+        "license": "public",
+        "retrieval": "file"
+      },
+      "quality": {
+        "trust_tier": "validated",
+        "uncertainty": "",
+        "validation": "PDC 2019 exercise product"
+      },
+      "cost": {
+        "setup_s": 5.0,
+        "cell_step_s": 0.0,
+        "parallel_alpha": 1.0,
+        "max_cores": 0
+      },
+      "tags": []
+    }
+  ],
+  "models": [
+    {
+      "name": "blast_damage",
+      "title": "Blast -> building damage",
+      "description": "Logistic overpressure vulnerability curve (HAZUS-flavoured, p50=35 kPa)",
+      "domain": "exposure",
+      "produces": [
+        "building_damage_frac"
+      ],
+      "requires": [
+        "blast_overpressure_pa"
+      ],
+      "coverage": {
+        "bbox": [
+          -180.0,
+          -90.0,
+          180.0,
+          90.0
+        ],
+        "t_start": null,
+        "t_end": null
+      },
+      "valid_res_m": [
+        0.0,
+        0.0
+      ],
+      "valid_regimes": {},
+      "fidelity_tier": "reduced-order",
+      "cost": {
+        "setup_s": 1.0,
+        "cell_step_s": 0.0,
+        "parallel_alpha": 1.0,
+        "max_cores": 0
+      },
+      "provenance": {
+        "source_org": "",
+        "url": "",
+        "doi": "",
+        "license": "",
+        "retrieval": ""
+      },
+      "quality": {
+        "trust_tier": "experimental",
+        "uncertainty": "generic fragility curve, not structure-specific",
+        "validation": ""
+      },
+      "tags": []
+    },
+    {
+      "name": "econ_loss",
+      "title": "HAZUS-style economic loss",
+      "description": "Direct loss = damage x asset value; flat indirect multiplier; population exposure inside the damage footprint",
+      "domain": "economy",
+      "produces": [
+        "economic_loss_usd",
+        "population_exposure"
+      ],
+      "requires": [
+        "building_damage_frac",
+        "asset_value_usd",
+        "population_density"
+      ],
+      "coverage": {
+        "bbox": [
+          -180.0,
+          -90.0,
+          180.0,
+          90.0
+        ],
+        "t_start": null,
+        "t_end": null
+      },
+      "valid_res_m": [
+        0.0,
+        0.0
+      ],
+      "valid_regimes": {},
+      "fidelity_tier": "reduced-order",
+      "cost": {
+        "setup_s": 1.0,
+        "cell_step_s": 0.0,
+        "parallel_alpha": 1.0,
+        "max_cores": 0
+      },
+      "provenance": {
+        "source_org": "",
+        "url": "",
+        "doi": "",
+        "license": "",
+        "retrieval": ""
+      },
+      "quality": {
+        "trust_tier": "experimental",
+        "uncertainty": "flat indirect multiplier; no sectoral IO table yet",
+        "validation": ""
+      },
+      "tags": []
+    },
+    {
+      "name": "impact_scaling",
+      "title": "Collins-style impact scaling laws",
+      "description": "Blast-overpressure footprint from event energy (Earth Impact Effects Program relations)",
+      "domain": "impact-physics",
+      "produces": [
+        "impact_energy_j",
+        "blast_overpressure_pa"
+      ],
+      "requires": [],
+      "coverage": {
+        "bbox": [
+          -180.0,
+          -90.0,
+          180.0,
+          90.0
+        ],
+        "t_start": null,
+        "t_end": null
+      },
+      "valid_res_m": [
+        0.0,
+        0.0
+      ],
+      "valid_regimes": {
+        "energy_mt": [
+          0.01,
+          100.0
+        ]
+      },
+      "fidelity_tier": "scaling-law",
+      "cost": {
+        "setup_s": 1.0,
+        "cell_step_s": 0.0,
+        "parallel_alpha": 1.0,
+        "max_cores": 0
+      },
+      "provenance": {
+        "source_org": "Collins, Melosh & Marcus 2005",
+        "url": "",
+        "doi": "10.1111/j.1945-5100.2005.tb00157.x",
+        "license": "",
+        "retrieval": ""
+      },
+      "quality": {
+        "trust_tier": "validated",
+        "uncertainty": "",
+        "validation": "published scaling relations"
+      },
+      "tags": []
+    },
+    {
+      "name": "wrf_sfire",
+      "title": "WRF-SFIRE coupled fire-atmosphere",
+      "description": "Full-physics coupled atmosphere + fire spread (+chem smoke when enabled)",
+      "domain": "fire",
+      "produces": [
+        "arrival_s",
+        "fire_area",
+        "ros_max",
+        "fire_intensity",
+        "fuel_consumed",
+        "pm25_surface",
+        "smoke_tracer"
+      ],
+      "requires": [
+        "ignition_t0",
+        "nfuel_cat",
+        "dem",
+        "wind_speed_ms",
+        "wind_dir_deg"
+      ],
+      "coverage": {
+        "bbox": [
+          -180.0,
+          -90.0,
+          180.0,
+          90.0
+        ],
+        "t_start": null,
+        "t_end": null
+      },
+      "valid_res_m": [
+        100.0,
+        12000.0
+      ],
+      "valid_regimes": {},
+      "fidelity_tier": "full-physics",
+      "cost": {
+        "setup_s": 600.0,
+        "cell_step_s": 2e-06,
+        "parallel_alpha": 0.9,
+        "max_cores": 0
+      },
+      "provenance": {
+        "source_org": "openwfm.org",
+        "url": "https://github.com/openwfm/WRF-SFIRE",
+        "doi": "",
+        "license": "public",
+        "retrieval": ""
+      },
+      "quality": {
+        "trust_tier": "validated",
+        "uncertainty": "",
+        "validation": "published model; site-specific validation pending"
+      },
+      "tags": []
+    }
+  ]
+}

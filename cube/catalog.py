@@ -1,4 +1,17 @@
-"""DuckDB catalog: tracks variables and tiles in the cube."""
+"""DuckDB catalog: tracks variables and tiles in the cube.
+
+Schema v2 adds the metadata an autonomous planner needs to reason about
+what is already in the cube:
+
+  * variables gain semantics: `standard_name` (controlled vocabulary,
+    see agentic.ontology), `domain`, and free-form `tags`.
+  * tiles gain provenance: `source_url`, `license`, `checksum`, and the
+    `run_id` of the engine run that wrote them, so every slab of data is
+    traceable back to its origin and the lineage record that produced it.
+
+Opening a v1 catalog migrates it in place (additive columns only), so
+existing cubes keep working unchanged.
+"""
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,14 +21,19 @@ from typing import Optional
 import duckdb
 
 
+SCHEMA_VERSION = 2
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS variables (
-    name        TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL,        -- 'static' | 'time'
-    units       TEXT,
-    dtype       TEXT,
-    description TEXT,
-    producer    TEXT
+    name          TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,      -- 'static' | 'time'
+    units         TEXT,
+    dtype         TEXT,
+    description   TEXT,
+    producer      TEXT,
+    standard_name TEXT DEFAULT '',    -- controlled-vocabulary name
+    domain        TEXT DEFAULT '',    -- impact-physics | atmosphere | fire | economy ...
+    tags          TEXT DEFAULT '[]'   -- JSON array of free-form tags
 );
 
 CREATE TABLE IF NOT EXISTS tiles (
@@ -24,7 +42,11 @@ CREATE TABLE IF NOT EXISTS tiles (
     source       TEXT,
     native_res_m DOUBLE,
     version      INTEGER DEFAULT 0,
-    fetched_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    fetched_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    source_url   TEXT DEFAULT '',     -- where the bytes came from
+    license      TEXT DEFAULT '',
+    checksum     TEXT DEFAULT '',     -- SHA-256 of the source payload
+    run_id       TEXT DEFAULT ''      -- engine run lineage id
 );
 CREATE INDEX IF NOT EXISTS tiles_var_t ON tiles (variable, t, version);
 
@@ -39,7 +61,29 @@ CREATE TABLE IF NOT EXISTS scenarios (
     scenario_date  TIMESTAMP,
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS catalog_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
+
+# Additive v1 -> v2 migration. `ADD COLUMN IF NOT EXISTS` makes this a
+# no-op on fresh databases and on already-migrated ones.
+MIGRATION_SQL = """
+ALTER TABLE variables ADD COLUMN IF NOT EXISTS standard_name TEXT DEFAULT '';
+ALTER TABLE variables ADD COLUMN IF NOT EXISTS domain        TEXT DEFAULT '';
+ALTER TABLE variables ADD COLUMN IF NOT EXISTS tags          TEXT DEFAULT '[]';
+ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS source_url    TEXT DEFAULT '';
+ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS license       TEXT DEFAULT '';
+ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS checksum      TEXT DEFAULT '';
+ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS run_id        TEXT DEFAULT '';
+"""
+
+_VARIABLE_COLS = ["name", "kind", "units", "dtype", "description",
+                  "producer", "standard_name", "domain", "tags"]
+_TILE_COLS = ["variable", "t", "source", "native_res_m", "version",
+              "fetched_at", "source_url", "license", "checksum", "run_id"]
 
 
 @dataclass
@@ -49,6 +93,11 @@ class TileRecord:
     source: str
     native_res_m: float
     version: int = 0
+    # provenance (all optional; empty string = unknown)
+    source_url: str = ""
+    license: str = ""
+    checksum: str = ""
+    run_id: str = ""
 
 
 class Catalog:
@@ -56,13 +105,28 @@ class Catalog:
         self.path = str(path)
         self.con = duckdb.connect(self.path)
         self.con.execute(SCHEMA_SQL)
+        self.con.execute(MIGRATION_SQL)
+        self.con.execute(
+            "INSERT OR REPLACE INTO catalog_meta VALUES ('schema_version', ?)",
+            [str(SCHEMA_VERSION)])
+
+    def schema_version(self) -> int:
+        row = self.con.execute(
+            "SELECT value FROM catalog_meta WHERE key='schema_version'"
+        ).fetchone()
+        return int(row[0]) if row else 1
 
     def register_variable(self, name: str, kind: str, units: str = "",
                           dtype: str = "f4", description: str = "",
-                          producer: str = "") -> None:
+                          producer: str = "", standard_name: str = "",
+                          domain: str = "", tags: str = "[]") -> None:
         self.con.execute(
-            "INSERT OR REPLACE INTO variables VALUES (?, ?, ?, ?, ?, ?)",
-            [name, kind, units, dtype, description, producer])
+            "INSERT OR REPLACE INTO variables "
+            "(name, kind, units, dtype, description, producer, "
+            " standard_name, domain, tags) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [name, kind, units, dtype, description, producer,
+             standard_name, domain, tags])
 
     def add_tile(self, rec: TileRecord) -> None:
         # explicit dedupe (DuckDB PRIMARY KEY columns must be NOT NULL,
@@ -77,9 +141,11 @@ class Catalog:
                 [rec.variable, rec.t, rec.version])
         self.con.execute(
             "INSERT INTO tiles "
-            "(variable, t, source, native_res_m, version, fetched_at) "
-            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            [rec.variable, rec.t, rec.source, rec.native_res_m, rec.version])
+            "(variable, t, source, native_res_m, version, fetched_at, "
+            " source_url, license, checksum, run_id) "
+            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)",
+            [rec.variable, rec.t, rec.source, rec.native_res_m, rec.version,
+             rec.source_url, rec.license, rec.checksum, rec.run_id])
 
     def has(self, variable: str, t: Optional[datetime] = None) -> bool:
         if t is None:
@@ -100,19 +166,17 @@ class Catalog:
 
     def list_variables(self) -> list[dict]:
         rs = self.con.execute(
-            "SELECT name, kind, units, dtype, description, producer "
+            f"SELECT {', '.join(_VARIABLE_COLS)} "
             "FROM variables ORDER BY name").fetchall()
-        keys = ["name", "kind", "units", "dtype", "description", "producer"]
-        return [dict(zip(keys, r)) for r in rs]
+        return [dict(zip(_VARIABLE_COLS, r)) for r in rs]
 
     def get_variable(self, name: str) -> Optional[dict]:
         row = self.con.execute(
-            "SELECT name, kind, units, dtype, description, producer "
+            f"SELECT {', '.join(_VARIABLE_COLS)} "
             "FROM variables WHERE name=?", [name]).fetchone()
         if row is None:
             return None
-        keys = ["name", "kind", "units", "dtype", "description", "producer"]
-        return dict(zip(keys, row))
+        return dict(zip(_VARIABLE_COLS, row))
 
     def native_resolution_m(self, variable: str) -> Optional[float]:
         row = self.con.execute(
@@ -123,16 +187,14 @@ class Catalog:
         return float(row[0])
 
     def list_tiles(self, variable: Optional[str] = None) -> list[dict]:
-        sql = ("SELECT variable, t, source, native_res_m, version, fetched_at "
-               "FROM tiles ")
+        sql = f"SELECT {', '.join(_TILE_COLS)} FROM tiles "
         params: list = []
         if variable is not None:
             sql += "WHERE variable=? "
             params.append(variable)
         sql += "ORDER BY variable, t"
         rs = self.con.execute(sql, params).fetchall()
-        keys = ["variable", "t", "source", "native_res_m", "version", "fetched_at"]
-        return [dict(zip(keys, r)) for r in rs]
+        return [dict(zip(_TILE_COLS, r)) for r in rs]
 
     def is_output_stale(self, output_var: str,
                          required_vars: list[str]) -> bool:
@@ -178,6 +240,7 @@ class Catalog:
         """Mirror catalog state to a human-readable JSON file."""
         import json
         data = {
+            "schema_version": self.schema_version(),
             "scenarios": [
                 dict(zip(["name", "grid_epsg", "grid_pixel_m", "grid_width",
                           "grid_height", "grid_x0", "grid_y1",

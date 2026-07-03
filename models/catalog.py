@@ -75,6 +75,9 @@ class ScenarioConfig:
     sim_seconds: int = 24 * 3600    # WRF-SFIRE run length
     wind_days: int = 10             # ERA5 wind window cached in cube
 
+    # --- event magnitude ---
+    energy_mt: float = 5.0          # impact/airburst yield (megatons TNT)
+
     # --- WRF-SFIRE run mode ---
     use_real: bool = False          # real.exe (met_em) vs ideal.exe
     pulse_seconds: float = 10.0     # asteroid thermal pulse duration
@@ -158,14 +161,21 @@ class CascadeCatalog:
     def __init__(self) -> None:
         self._drivers: list[tuple[str, DriverFactory]] = []
         self._models: list[tuple[str, ModelFactory]] = []
+        self._cards: dict[str, object] = {}   # name -> DatasetCard | ModelCard
 
     # ---- registration ----
-    def add_driver(self, name: str, factory: DriverFactory) -> "CascadeCatalog":
+    def add_driver(self, name: str, factory: DriverFactory,
+                   card: object = None) -> "CascadeCatalog":
         self._drivers.append((name, factory))
+        if card is not None:
+            self._cards[name] = card
         return self
 
-    def add_model(self, name: str, factory: ModelFactory) -> "CascadeCatalog":
+    def add_model(self, name: str, factory: ModelFactory,
+                  card: object = None) -> "CascadeCatalog":
         self._models.append((name, factory))
+        if card is not None:
+            self._cards[name] = card
         return self
 
     # ---- introspection ----
@@ -175,21 +185,46 @@ class CascadeCatalog:
     def model_names(self) -> list[str]:
         return [n for n, _ in self._models]
 
+    def card_for(self, name: str):
+        return self._cards.get(name)
+
+    def seed_metacatalog(self, metacat) -> None:
+        """Publish every registered card into an agentic MetaCatalog so
+        the planner can search/filter producers without importing or
+        instantiating any of them."""
+        from agentic.metacatalog import DatasetCard, ModelCard
+        for name, card in self._cards.items():
+            if isinstance(card, DatasetCard):
+                metacat.add_dataset(card)
+            elif isinstance(card, ModelCard):
+                metacat.add_model(card)
+
     # ---- build ----
-    def build_registry(self, ctx: BuildContext) -> ProducerRegistry:
-        """Instantiate every factory and return an engine registry.
+    def build_registry(self, ctx: BuildContext,
+                       only: Optional[set[str]] = None) -> ProducerRegistry:
+        """Instantiate factories and return an engine registry.
 
         Data drivers are wrapped in ``DataDriverAdapter`` so the
         ``fetch``-style protocol becomes a ProducerV2. Models are
         already ProducerV2 (via ``ModelAdapter``) and register directly.
+
+        ``only`` restricts the build to the named producers — this is
+        how a RunPlan's bindings become a registry: pass
+        ``only=set(plan.producer_names())`` and competing producers for
+        the same variable never collide, because exactly one was chosen
+        at plan time.
         """
         reg = ProducerRegistry()
         for name, factory in self._drivers:
+            if only is not None and name not in only:
+                continue
             drv = factory(ctx)
             reg.register(DataDriverAdapter(driver=drv))
             _log.info("[catalog] driver registered: %s -> %s",
                       name, list(getattr(drv, "produces", [])))
         for name, factory in self._models:
+            if only is not None and name not in only:
+                continue
             model = factory(ctx)
             reg.register(model)
             _log.info("[catalog] model registered: %s -> %s",
@@ -278,7 +313,187 @@ def build_wrf_sfire(ctx: BuildContext):
         namelist_builder=namelist_builder,
         fire_domain_id=fire_domain_id,
         stage_root=ctx.work_dir / "wrf_stage",
+        keep_stage=True,   # TEMP debug: preserve stage to inspect real.exe rsl logs
     )
+
+
+def _builtin_cards() -> dict:
+    """Machine-readable metadata for the built-in producers.
+
+    These cards are what the agentic planner searches and filters —
+    coverage, provenance, trust, regimes, cost — without importing or
+    running any producer code. Cost coefficients are cold-start guesses;
+    refit them from run lineage as real runs accumulate.
+    """
+    from agentic.metacatalog import (Coverage, CostModel, DatasetCard,
+                                     ModelCard, Provenance, Quality)
+
+    conus = (-125.0, 24.0, -66.0, 50.0)
+    return {
+        "thermal": DatasetCard(
+            id="thermal", title="PDC asteroid thermal-damage footprint",
+            description="Airburst thermal fluence/power + ignition map "
+                        "parsed from a PDC exercise KML",
+            variables=("thermal_fluence", "thermal_power",
+                       "ignition_t0", "burnable"),
+            driver="thermal",
+            provenance=Provenance(source_org="NASA/JPL PDC exercise",
+                                  retrieval="file", license="public"),
+            quality=Quality(trust_tier="validated",
+                            validation="PDC 2019 exercise product"),
+            cost=CostModel(setup_s=5.0)),
+        "landfire": DatasetCard(
+            id="landfire", title="LANDFIRE FBFM13 fuel model",
+            variables=("fbfm13", "nfuel_cat"), driver="landfire",
+            coverage=Coverage(bbox=conus),
+            native_res_m=30.0,
+            provenance=Provenance(source_org="USGS LANDFIRE",
+                                  url="https://landfire.gov",
+                                  retrieval="api", license="public"),
+            quality=Quality(trust_tier="reference"),
+            cost=CostModel(setup_s=60.0)),
+        "dem": DatasetCard(
+            id="dem", title="Digital elevation model (SRTM/3DEP)",
+            variables=("dem", "slope_deg", "aspect_deg"), driver="dem",
+            coverage=Coverage(bbox=(-180.0, -60.0, 180.0, 60.0)),
+            native_res_m=30.0,
+            provenance=Provenance(source_org="USGS", retrieval="api",
+                                  license="public"),
+            quality=Quality(trust_tier="reference"),
+            cost=CostModel(setup_s=60.0)),
+        "era5_wind": DatasetCard(
+            id="era5_wind", title="ERA5 reanalysis 10 m wind",
+            variables=("wind_speed_ms", "wind_dir_deg"), driver="era5_wind",
+            coverage=Coverage(t_start="1940-01-01T00:00:00"),
+            native_res_m=31_000.0, cadence_s=3600.0,
+            provenance=Provenance(source_org="ECMWF/Copernicus",
+                                  url="https://cds.climate.copernicus.eu",
+                                  retrieval="api",
+                                  license="CC-BY-4.0"),
+            quality=Quality(trust_tier="reference"),
+            cost=CostModel(setup_s=300.0)),
+        "exposure": DatasetCard(
+            id="exposure", title="Synthetic population + asset exposure",
+            description="Monocentric-city placeholder for population "
+                        "density and built-asset value; replace with "
+                        "WorldPop/HAZUS drivers for real estimates",
+            variables=("population_density", "asset_value_usd"),
+            driver="exposure",
+            provenance=Provenance(source_org="synthetic",
+                                  retrieval="computed", license="public"),
+            quality=Quality(trust_tier="experimental",
+                            uncertainty="parametric placeholder"),
+            cost=CostModel(setup_s=1.0)),
+        "impact_scaling": ModelCard(
+            name="impact_scaling",
+            title="Collins-style impact scaling laws",
+            description="Blast-overpressure footprint from event energy "
+                        "(Earth Impact Effects Program relations)",
+            domain="impact-physics",
+            produces=("impact_energy_j", "blast_overpressure_pa"),
+            requires=(),
+            valid_regimes={"energy_mt": (0.01, 100.0)},
+            fidelity_tier="scaling-law",
+            cost=CostModel(setup_s=1.0),
+            provenance=Provenance(source_org="Collins, Melosh & Marcus "
+                                             "2005",
+                                  doi="10.1111/j.1945-5100.2005."
+                                      "tb00157.x"),
+            quality=Quality(trust_tier="validated",
+                            validation="published scaling relations")),
+        "blast_damage": ModelCard(
+            name="blast_damage", title="Blast -> building damage",
+            description="Logistic overpressure vulnerability curve "
+                        "(HAZUS-flavoured, p50=35 kPa)",
+            domain="exposure",
+            produces=("building_damage_frac",),
+            requires=("blast_overpressure_pa",),
+            fidelity_tier="reduced-order",
+            cost=CostModel(setup_s=1.0),
+            quality=Quality(trust_tier="experimental",
+                            uncertainty="generic fragility curve, "
+                                        "not structure-specific")),
+        "econ_loss": ModelCard(
+            name="econ_loss", title="HAZUS-style economic loss",
+            description="Direct loss = damage x asset value; flat "
+                        "indirect multiplier; population exposure "
+                        "inside the damage footprint",
+            domain="economy",
+            produces=("economic_loss_usd", "population_exposure"),
+            requires=("building_damage_frac", "asset_value_usd",
+                      "population_density"),
+            fidelity_tier="reduced-order",
+            cost=CostModel(setup_s=1.0),
+            quality=Quality(trust_tier="experimental",
+                            uncertainty="flat indirect multiplier; no "
+                                        "sectoral IO table yet")),
+        "wrf_sfire": ModelCard(
+            name="wrf_sfire", title="WRF-SFIRE coupled fire-atmosphere",
+            description="Full-physics coupled atmosphere + fire spread "
+                        "(+chem smoke when enabled)",
+            domain="fire",
+            produces=("arrival_s", "fire_area", "ros_max",
+                      "fire_intensity", "fuel_consumed",
+                      "pm25_surface", "smoke_tracer"),
+            requires=("ignition_t0", "nfuel_cat", "dem",
+                      "wind_speed_ms", "wind_dir_deg"),
+            valid_res_m=(100.0, 12_000.0),   # atmosphere mesh
+            fidelity_tier="full-physics",
+            cost=CostModel(setup_s=600.0, cell_step_s=2e-6,
+                           parallel_alpha=0.9),
+            provenance=Provenance(source_org="openwfm.org",
+                                  url="https://github.com/openwfm/WRF-SFIRE",
+                                  license="public"),
+            quality=Quality(trust_tier="validated",
+                            validation="published model; site-specific "
+                                       "validation pending")),
+    }
+
+
+def build_exposure_driver(ctx: BuildContext):
+    from drivers.exposure import SyntheticExposureDriver
+    return SyntheticExposureDriver()
+
+
+def build_impact_scaling(ctx: BuildContext):
+    """Collins-style scaling laws — cascade model 0 (scaling-law tier)."""
+    from engine import ModelFunctionAdapter, VarSpec
+    from models.impact_scaling import run_impact_scaling
+
+    energy_mt = getattr(ctx.config, "energy_mt", 5.0)
+    return ModelFunctionAdapter(
+        name="impact_scaling",
+        produces=[VarSpec("impact_energy_j", kind="static", units="J"),
+                  VarSpec("blast_overpressure_pa", kind="static",
+                          units="Pa")],
+        requires=[],
+        func=lambda cube, req: run_impact_scaling(cube, req,
+                                                  energy_mt=energy_mt))
+
+
+def build_blast_damage(ctx: BuildContext):
+    from engine import MergePolicy, ModelFunctionAdapter, VarSpec
+    from models.consequence import run_blast_damage
+    return ModelFunctionAdapter(
+        name="blast_damage",
+        produces=[VarSpec("building_damage_frac", kind="static",
+                          units="0..1",
+                          merge_policy=MergePolicy.MONOTONE_MAX)],
+        requires=["blast_overpressure_pa"],
+        func=run_blast_damage)
+
+
+def build_econ_loss(ctx: BuildContext):
+    from engine import ModelFunctionAdapter, VarSpec
+    from models.consequence import run_econ_loss
+    return ModelFunctionAdapter(
+        name="econ_loss",
+        produces=[VarSpec("economic_loss_usd", kind="static", units="USD"),
+                  VarSpec("population_exposure", kind="static",
+                          units="people")],
+        requires=["building_damage_frac", "asset_value_usd",
+                  "population_density"],
+        func=run_econ_loss)
 
 
 def default_catalog() -> CascadeCatalog:
@@ -292,13 +507,25 @@ def default_catalog() -> CascadeCatalog:
     A model that consumes WRF-SFIRE output declares e.g.
     ``DataNeed("arrival_s")`` in its ``data_adapter``; the engine then
     runs WRF-SFIRE before it, automatically.
+
+    Every producer registers with a card so the agentic planner can
+    select it by coverage/regime/cost (``seed_metacatalog``).
     """
+    cards = _builtin_cards()
     cat = CascadeCatalog()
-    cat.add_driver("thermal",   build_thermal_driver)
-    cat.add_driver("landfire",  build_landfire_driver)
-    cat.add_driver("dem",       build_dem_driver)
-    cat.add_driver("era5_wind", build_era5_wind_driver)
-    cat.add_model("wrf_sfire",  build_wrf_sfire)        # <-- model 1
+    cat.add_driver("thermal",   build_thermal_driver,   card=cards["thermal"])
+    cat.add_driver("landfire",  build_landfire_driver,  card=cards["landfire"])
+    cat.add_driver("dem",       build_dem_driver,       card=cards["dem"])
+    cat.add_driver("era5_wind", build_era5_wind_driver, card=cards["era5_wind"])
+    cat.add_driver("exposure",  build_exposure_driver,  card=cards["exposure"])
+    cat.add_model("wrf_sfire",  build_wrf_sfire,        card=cards["wrf_sfire"])  # <-- model 1
+    # consequence chain: impact physics -> damage -> economy
+    cat.add_model("impact_scaling", build_impact_scaling,
+                  card=cards["impact_scaling"])
+    cat.add_model("blast_damage",   build_blast_damage,
+                  card=cards["blast_damage"])
+    cat.add_model("econ_loss",      build_econ_loss,
+                  card=cards["econ_loss"])
     return cat
 
 
