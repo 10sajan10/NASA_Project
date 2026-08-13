@@ -1,0 +1,156 @@
+{
+  "schema": "wind-evidence-pack-v1",
+  "created_at": "2026-08-13",
+  "source_inventory": {
+    "path": "stage0/wind_evidence_inventory_v0.json",
+    "sha256": "d82ac9631c68aa08f56210d5c8244158a5b4e8913e2fc6ecf7fcd5bf65def159"
+  },
+  "status": "UNAVAILABLE",
+  "decision_policy": {
+    "quality_sensitive_request": "CHOICE_REQUIRED",
+    "cost_selection": "ONLY_AFTER_HARD_COMPATIBILITY_CONSTRAINTS_PASS"
+  },
+  "scope": {
+    "status": "UNFROZEN",
+    "reason": "No reviewed AOI, time window, vertical scope, or validation regime is bound to held-out observations."
+  },
+  "reference_observations": {
+    "status": "UNAVAILABLE",
+    "manifest_id": null,
+    "reason_code": "NO_REVIEWED_IMMUTABLE_HELD_OUT_REFERENCE",
+    "requirements": [
+      "immutable retrieval and license manifest",
+      "reviewed quality-control and missingness policy",
+      "held-out sites and times",
+      "spatial and temporal dependence-aware splits",
+      "height and exposure representativeness"
+    ]
+  },
+  "candidate_facts": [
+    {
+      "candidate_id": "era5_arco_10m",
+      "facts": {
+        "cadence": "PT1H",
+        "native_horizontal_scale": {
+          "basis": "ANGULAR",
+          "x": "0.25",
+          "y": "0.25",
+          "unit": "degree"
+        },
+        "origin": "REANALYSIS",
+        "vertical": {
+          "kind": "HEIGHT_AGL",
+          "level": "10",
+          "unit": "m"
+        }
+      },
+      "limitations": [
+        "No exact remote AssetManifest is bound in Stage 2.",
+        "A finer output grid does not improve native or effective information scale.",
+        "No site-specific held-out quality evidence is recorded."
+      ]
+    },
+    {
+      "candidate_id": "atmospheric_wrf_downscaler",
+      "facts": {
+        "implementation_status": "CONTRACT_ONLY_NO_STANDALONE_GOLDEN_RUN"
+      },
+      "limitations": [
+        "Output descriptor and standalone scientific conformance remain unverified.",
+        "Grid spacing is not evidence of effective resolution.",
+        "No comparison against held-out observations exists."
+      ]
+    },
+    {
+      "candidate_id": "pinned_high_resolution_wind_artifact",
+      "facts": {
+        "implementation_status": "MISSING"
+      },
+      "limitations": [
+        "No artifact, source, license, immutable manifest, or validation pack exists.",
+        "The candidate must not be called high-resolution without empirical support."
+      ]
+    },
+    {
+      "candidate_id": "operational_forecast_connector_such_as_hrrr",
+      "facts": {
+        "implementation_status": "NOT_IMPLEMENTED_OR_VERIFIED"
+      },
+      "limitations": [
+        "This is a candidate class, not a selected or implemented provider.",
+        "No connector contract, archive coverage, immutable asset binding, or held-out evidence exists."
+      ]
+    }
+  ],
+  "empirical_claims": [
+    {
+      "metric_definition_id": "wind.vector_rmse.v1",
+      "status": "UNKNOWN",
+      "estimate": null,
+      "conservative_bound": null,
+      "reference_manifest_id": null,
+      "protocol_id": null,
+      "reason_code": "NO_HELD_OUT_EVIDENCE"
+    },
+    {
+      "metric_definition_id": "wind.speed_bias_rmse.v1",
+      "status": "UNKNOWN",
+      "estimate": null,
+      "conservative_bound": null,
+      "reference_manifest_id": null,
+      "protocol_id": null,
+      "reason_code": "NO_HELD_OUT_EVIDENCE"
+    },
+    {
+      "metric_definition_id": "wind.circular_direction_error.v1",
+      "status": "UNKNOWN",
+      "estimate": null,
+      "conservative_bound": null,
+      "reference_manifest_id": null,
+      "protocol_id": null,
+      "reason_code": "NO_HELD_OUT_EVIDENCE"
+    },
+    {
+      "metric_definition_id": "wind.temporal_correlation.v1",
+      "status": "UNKNOWN",
+      "estimate": null,
+      "conservative_bound": null,
+      "reference_manifest_id": null,
+      "protocol_id": null,
+      "reason_code": "NO_HELD_OUT_EVIDENCE"
+    },
+    {
+      "metric_definition_id": "wind.event_conditioned_error.v1",
+      "status": "UNKNOWN",
+      "estimate": null,
+      "conservative_bound": null,
+      "reference_manifest_id": null,
+      "protocol_id": null,
+      "reason_code": "NO_HELD_OUT_EVIDENCE"
+    },
+    {
+      "metric_definition_id": "wind.effective_resolution.v1",
+      "status": "UNKNOWN",
+      "estimate": null,
+      "conservative_bound": null,
+      "reference_manifest_id": null,
+      "protocol_id": null,
+      "reason_code": "NO_HELD_OUT_EVIDENCE"
+    },
+    {
+      "metric_definition_id": "wind.uncertainty_calibration.v1",
+      "status": "UNKNOWN",
+      "estimate": null,
+      "conservative_bound": null,
+      "reference_manifest_id": null,
+      "protocol_id": null,
+      "reason_code": "NO_HELD_OUT_EVIDENCE"
+    }
+  ],
+  "legacy_metadata_policy": {
+    "path": "configs/registry.json",
+    "field": "quality.trust_tier",
+    "status": "QUARANTINED",
+    "reason": "A catalog trust label is not a held-out empirical quality claim."
+  }
+}

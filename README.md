@@ -13,6 +13,9 @@ glue. You bring the model and the data; the engine wires them together.
 > invariants. [Stage 0A](stage0a/) selected the runtime substrate. [Stage 1](stage1/)
 > now provides the durable single-node controller, supervised subprocesses,
 > fenced validation/commit, and restart tests for an already-bound graph.
+> [Stage 2](stage2/) now adds strict scientific artifact/requirement/evidence
+> contracts, a multi-producer capability catalog, immutable derivation plans,
+> an exhaustive small-graph oracle, and a verified compiler into Stage 1.
 > WRF-SFIRE was not run; MPI/SLURM remain conditional future provider
 > capabilities and are not available on this private development node.
 
@@ -22,6 +25,9 @@ glue. You bring the model and the data; the engine wires them together.
 |---|---|
 | [cube/](cube/) | Per-variable Zarr storage indexed by a DuckDB catalog. Resolution-aware satisfaction checks, schema versioning, halo I/O, snapshots. |
 | [engine/](engine/) | Orchestration substrate. ProducerV2 contract, DAG pipeline DSL, pluggable execution backends (serial / thread / process / dask / SLURM), tile fan-out, retries with dead-letter, dirty propagation, run lineage, content-addressable cache, disk-spill workspace. |
+| [contracts/](contracts/) | Stage-2 scientific artifact descriptors, consumer requirements, evidence/applicability records, and pure direct-compatibility proofs. |
+| [capabilities/](capabilities/) | Immutable multi-producer and multi-output capability catalog with closed binders and static deployment feasibility. |
+| [plans/](plans/) + [composition/](composition/) | Candidate/bound derivation identities, exhaustive correctness oracle, structured blocker trees, and verified Stage-1 compiler. |
 | [drivers/](drivers/) | Data-source-specific fetchers (KML, thermal-pulse, DEM, weather reanalysis, etc). These are scenario-specific — keep what you need, write more as you go. |
 | [models/](models/) | `external_model_template.py` — drop-in template for new model adapters. `wrf_sfire_adapter.py` — adapter that calls the external WRF-SFIRE model in [wrf-sfire/](wrf-sfire/). No physics ships here; adapters are wiring. |
 | [agentic/](agentic/) | Agent-queryable metadata + deterministic planning. Variable ontology, DuckDB metacatalog of dataset/model cards (coverage, provenance, regimes, cost models), `EventSpec -> RunPlan` planner, and a JSON tool surface for an LLM planner agent. |
@@ -172,4 +178,8 @@ models/         model plug-ins
   wrf_sfire_adapter.py          adapter for the external WRF-SFIRE model
 tests/          engine + adapter integration tests
 configs/        example configs
+contracts/      strict scientific descriptor/requirement/evidence layer
+capabilities/   immutable producer capabilities and deployment compatibility
+plans/          scientific and executable derivation identities
+composition/    exhaustive oracle and Stage-1 compiler
 ```

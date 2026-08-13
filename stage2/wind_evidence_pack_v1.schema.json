@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sci-ndp.example/schemas/wind-evidence-pack-v1.schema.json",
+  "title": "WindEvidencePack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "created_at",
+    "source_inventory",
+    "status",
+    "decision_policy",
+    "scope",
+    "reference_observations",
+    "candidate_facts",
+    "empirical_claims",
+    "legacy_metadata_policy"
+  ],
+  "properties": {
+    "schema": {"const": "wind-evidence-pack-v1"},
+    "created_at": {"type": "string", "format": "date"},
+    "source_inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"const": "stage0/wind_evidence_inventory_v0.json"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "status": {"enum": ["AVAILABLE", "UNAVAILABLE"]},
+    "decision_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quality_sensitive_request", "cost_selection"],
+      "properties": {
+        "quality_sensitive_request": {"const": "CHOICE_REQUIRED"},
+        "cost_selection": {
+          "const": "ONLY_AFTER_HARD_COMPATIBILITY_CONSTRAINTS_PASS"
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": {"const": "UNFROZEN"},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    },
+    "reference_observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "manifest_id", "reason_code", "requirements"],
+      "properties": {
+        "status": {"enum": ["AVAILABLE", "UNAVAILABLE"]},
+        "manifest_id": {"type": ["string", "null"]},
+        "reason_code": {"type": ["string", "null"]},
+        "requirements": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "candidate_facts": {
+      "type": "array",
+      "minItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["candidate_id", "facts", "limitations"],
+        "properties": {
+          "candidate_id": {
+            "enum": [
+              "era5_arco_10m",
+              "atmospheric_wrf_downscaler",
+              "pinned_high_resolution_wind_artifact",
+              "operational_forecast_connector_such_as_hrrr"
+            ]
+          },
+          "facts": {"type": "object", "minProperties": 1},
+          "limitations": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "empirical_claims": {
+      "type": "array",
+      "minItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "metric_definition_id",
+          "status",
+          "estimate",
+          "conservative_bound",
+          "reference_manifest_id",
+          "protocol_id",
+          "reason_code"
+        ],
+        "properties": {
+          "metric_definition_id": {"type": "string", "minLength": 1},
+          "status": {"enum": ["KNOWN", "UNKNOWN", "NOT_APPLICABLE"]},
+          "estimate": {"type": ["string", "number", "null"]},
+          "conservative_bound": {"type": ["string", "number", "null"]},
+          "reference_manifest_id": {"type": ["string", "null"]},
+          "protocol_id": {"type": ["string", "null"]},
+          "reason_code": {"type": ["string", "null"]}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"status": {"const": "KNOWN"}}},
+            "then": {
+              "properties": {
+                "estimate": {"type": ["string", "number"]},
+                "conservative_bound": {"type": ["string", "number"]},
+                "reference_manifest_id": {"type": "string", "minLength": 1},
+                "protocol_id": {"type": "string", "minLength": 1},
+                "reason_code": {"type": "null"}
+              }
+            },
+            "else": {
+              "properties": {
+                "estimate": {"type": "null"},
+                "conservative_bound": {"type": "null"},
+                "reference_manifest_id": {"type": "null"},
+                "protocol_id": {"type": "null"},
+                "reason_code": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        ]
+      }
+    },
+    "legacy_metadata_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "field", "status", "reason"],
+      "properties": {
+        "path": {"const": "configs/registry.json"},
+        "field": {"const": "quality.trust_tier"},
+        "status": {"const": "QUARANTINED"},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

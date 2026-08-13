@@ -26,6 +26,17 @@ def _add(parameters: dict[str, Any],
     return {"result": inputs["left"] + inputs["right"]}
 
 
+def _pair(parameters: dict[str, Any],
+          inputs: dict[str, Any]) -> dict[str, Any]:
+    """Return two independently addressable outputs from one invocation.
+
+    This consequence-free operation exists to prove that Stage 2 preserves
+    co-production: the resolver may select and cost one invocation while two
+    downstream requirement uses bind to different output ports.
+    """
+    return {"left": parameters["left"], "right": parameters["right"]}
+
+
 def _scale(parameters: dict[str, Any],
            inputs: dict[str, Any]) -> dict[str, Any]:
     return {"result": inputs["value"] * parameters["factor"]}
@@ -72,6 +83,7 @@ def _identity(parameters: dict[str, Any],
 _OPERATIONS: dict[str, tuple[str, Operation, bool]] = {
     "synthetic.constant.v1": ("1.0.0", _constant, True),
     "synthetic.add.v1": ("1.0.0", _add, True),
+    "synthetic.pair.v1": ("1.0.0", _pair, True),
     "synthetic.scale.v1": ("1.0.0", _scale, True),
     "synthetic.sleep.v1": ("1.0.0", _sleep, True),
     "synthetic.fail.v1": ("1.0.0", _fail, True),
