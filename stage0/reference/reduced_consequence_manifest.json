@@ -1,0 +1,292 @@
+{
+  "schema": "stage0-reference-run-v1",
+  "fixture": "reduced-consequence",
+  "scientific_status": "conformance_only_not_validated",
+  "request": {
+    "target": "economic_loss_usd",
+    "scenario": "5 Mt Dallas-centered synthetic fixture"
+  },
+  "plan": {
+    "plan_id": "d4ad501c9f173cd1ab47a65d7020565c7e1c694b16ed946cb5e7a38631e40578",
+    "nodes": [
+      "blast_damage",
+      "econ_loss",
+      "exposure",
+      "impact_scaling"
+    ],
+    "edges": [
+      [
+        "impact_scaling",
+        "blast_damage"
+      ],
+      [
+        "blast_damage",
+        "econ_loss"
+      ],
+      [
+        "exposure",
+        "econ_loss"
+      ]
+    ]
+  },
+  "execution": {
+    "ok": true,
+    "n_steps": 4,
+    "n_errors": 0,
+    "n_skipped": 0,
+    "total_elapsed_s": 0.693821471882984,
+    "triggered": [],
+    "steps": [
+      {
+        "name": "exposure",
+        "status": "ok",
+        "elapsed_s": 0.5365780738648027,
+        "produced": {
+          "population_density": 0,
+          "asset_value_usd": 0
+        },
+        "error": null,
+        "attempts": 1,
+        "dead_letter": false,
+        "tile_count": 0,
+        "tile_metrics": [],
+        "tile_latency_summary": {}
+      },
+      {
+        "name": "impact_scaling",
+        "status": "ok",
+        "elapsed_s": 0.05190110998228192,
+        "produced": {
+          "impact_energy_j": 0,
+          "blast_overpressure_pa": 0
+        },
+        "error": null,
+        "attempts": 1,
+        "dead_letter": false,
+        "tile_count": 0,
+        "tile_metrics": [],
+        "tile_latency_summary": {}
+      },
+      {
+        "name": "blast_damage",
+        "status": "ok",
+        "elapsed_s": 0.04269900801591575,
+        "produced": {
+          "building_damage_frac": 0
+        },
+        "error": null,
+        "attempts": 1,
+        "dead_letter": false,
+        "tile_count": 0,
+        "tile_metrics": [],
+        "tile_latency_summary": {}
+      },
+      {
+        "name": "econ_loss",
+        "status": "ok",
+        "elapsed_s": 0.06264328001998365,
+        "produced": {
+          "economic_loss_usd": 0,
+          "population_exposure": 0
+        },
+        "error": null,
+        "attempts": 1,
+        "dead_letter": false,
+        "tile_count": 0,
+        "tile_metrics": [],
+        "tile_latency_summary": {}
+      }
+    ],
+    "manifest": {
+      "schema": "stage0-execution-manifest-v1",
+      "run_id": "53ce4ee9-1c3a-4a72-8a4b-b94fe4d10a97",
+      "started_at": "2026-08-13T01:51:24.668265+00:00",
+      "ended_at": "2026-08-13T01:51:25.380277+00:00",
+      "status": "succeeded",
+      "plan_id": "d4ad501c9f173cd1ab47a65d7020565c7e1c694b16ed946cb5e7a38631e40578",
+      "pipeline": "stage0-reduced-consequence",
+      "code_revision": "ca1574fada6aa74291da5292338b00c7cc380105",
+      "code_worktree_dirty": true,
+      "execution_engine": {
+        "sha256": "825733cec908aee0314106de1ab6ca3b61c20d2517d56d077e0377ff93b7aef5",
+        "source_files": [
+          "/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project/engine/identity.py",
+          "/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project/engine/pipeline.py",
+          "/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project/engine/scheduler.py"
+        ],
+        "python": "3.12.13 (main, Jul 15 2026, 15:52:03) [GCC 8.5.0 20210514 (Red Hat 8.5.0-28)]"
+      },
+      "request": {
+        "t_start": null,
+        "t_end": null,
+        "force": false,
+        "context_keys": [
+          "baseline",
+          "requested_output",
+          "scenario"
+        ],
+        "context_sha256": "98b61b8c9669e4b8542aeef12467b3481b74fcde3248139253ebd27852856164"
+      },
+      "configuration_sha256": "8552bc7283947fdc2c14302e8e57274808101b750a94576b50812ee0b949f1bf",
+      "components": [
+        {
+          "name": "blast_damage",
+          "module": "engine.adapters",
+          "qualname": "ModelFunctionAdapter",
+          "version": "source:1aa73244e622e3c4",
+          "implementation_sha256": "1aa73244e622e3c4249c3c4340f03f8377f89445d269eb08fd74576e4b256d36",
+          "configuration_sha256": "e841d7e3734363816456e9bb7731a3bb26fbd6b25c507962641dbb6c911790a9",
+          "source_files": [
+            "engine/adapters.py",
+            "models/consequence.py"
+          ],
+          "produces": [
+            "building_damage_frac"
+          ],
+          "requires": [
+            "blast_overpressure_pa"
+          ],
+          "deterministic": "unspecified",
+          "idempotent": "unspecified",
+          "resource_envelope": {
+            "memory_budget_mb": 1024,
+            "cost_hint": "cpu",
+            "tile_parallel": false,
+            "requires_barrier": false
+          }
+        },
+        {
+          "name": "econ_loss",
+          "module": "engine.adapters",
+          "qualname": "ModelFunctionAdapter",
+          "version": "source:1aa73244e622e3c4",
+          "implementation_sha256": "1aa73244e622e3c4249c3c4340f03f8377f89445d269eb08fd74576e4b256d36",
+          "configuration_sha256": "5dbc15080c99fa22361d9f20a2f54ccaa1c45c317818e78df2ec670b16f5d0a9",
+          "source_files": [
+            "engine/adapters.py",
+            "models/consequence.py"
+          ],
+          "produces": [
+            "economic_loss_usd",
+            "population_exposure"
+          ],
+          "requires": [
+            "building_damage_frac",
+            "asset_value_usd",
+            "population_density"
+          ],
+          "deterministic": "unspecified",
+          "idempotent": "unspecified",
+          "resource_envelope": {
+            "memory_budget_mb": 1024,
+            "cost_hint": "cpu",
+            "tile_parallel": false,
+            "requires_barrier": false
+          }
+        },
+        {
+          "name": "exposure",
+          "module": "engine.adapters",
+          "qualname": "DataDriverAdapter",
+          "version": "source:154080351d7fec53",
+          "implementation_sha256": "154080351d7fec532060523ed07c2f8e6cd36ce9a534da509a2e3c25051b94ed",
+          "configuration_sha256": "160c2005a562828b0367d426af9457bb23c43a9ad4f96cc23dd82a9fc2e85193",
+          "source_files": [
+            "drivers/exposure.py",
+            "engine/adapters.py"
+          ],
+          "produces": [
+            "population_density",
+            "asset_value_usd"
+          ],
+          "requires": [],
+          "deterministic": "unspecified",
+          "idempotent": "unspecified",
+          "resource_envelope": {
+            "memory_budget_mb": 512,
+            "cost_hint": "io",
+            "tile_parallel": false,
+            "requires_barrier": false
+          }
+        },
+        {
+          "name": "impact_scaling",
+          "module": "engine.adapters",
+          "qualname": "ModelFunctionAdapter",
+          "version": "source:0aee21b1b1bf4108",
+          "implementation_sha256": "0aee21b1b1bf4108dd0bafb8d554ffdc4b571014e77af279f3c2d2886c9bc6e5",
+          "configuration_sha256": "1ae86e854b047764fc4f48dac708e09635620084390b2ae70006217bfa47afbe",
+          "source_files": [
+            "engine/adapters.py",
+            "models/catalog.py"
+          ],
+          "produces": [
+            "impact_energy_j",
+            "blast_overpressure_pa"
+          ],
+          "requires": [],
+          "deterministic": "unspecified",
+          "idempotent": "unspecified",
+          "resource_envelope": {
+            "memory_budget_mb": 1024,
+            "cost_hint": "cpu",
+            "tile_parallel": false,
+            "requires_barrier": false
+          }
+        }
+      ]
+    }
+  },
+  "outputs": {
+    "population_exposure": {
+      "shape": [
+        41,
+        41
+      ],
+      "dtype": "float32",
+      "minimum": 0.0,
+      "maximum": 1500.0,
+      "sum": 470476.9318847656,
+      "sha256": "a60ebfeb954c92da7d7e2fc7c56bdb87492a92e4c6822efd392ccfaf0afc8dbb"
+    },
+    "blast_overpressure_pa": {
+      "shape": [
+        41,
+        41
+      ],
+      "dtype": "float32",
+      "minimum": 4312.8984375,
+      "maximum": 11198409.0,
+      "sum": 58693226.873046875,
+      "sha256": "dc725f66244fd537730ec2557048540cad8204ccb61dd04c330ecd02bf7cff2b"
+    },
+    "building_damage_frac": {
+      "shape": [
+        41,
+        41
+      ],
+      "dtype": "float32",
+      "minimum": 0.009890670888125896,
+      "maximum": 0.9999969005584717,
+      "sum": 266.1009696125984,
+      "sha256": "aabde7daba4cfa9807809e907e24a2d344211997efa6800f81b75cf8582ce4da"
+    },
+    "economic_loss_usd": {
+      "shape": [
+        41,
+        41
+      ],
+      "dtype": "float32",
+      "minimum": 816040.125,
+      "maximum": 543748288.0,
+      "sum": 86960390788.0,
+      "sha256": "ee277458e4006ab002468f2fd8dbb2ae303d8ec0c4f08742d32472c38429ad94"
+    }
+  },
+  "validation": {
+    "all_outputs_present": true,
+    "damage_bounded_0_1": true,
+    "pressure_center_exceeds_corner": true,
+    "economic_loss_positive": true
+  }
+}

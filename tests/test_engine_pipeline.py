@@ -238,7 +238,8 @@ def test_trigger_fires_and_runs_target():
         reg.register(p)
     pipe = (Pipeline.chain(["a", "b"])
             .on_complete("b", run="expand", when=lambda cube: True))
-    r = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+    r = PipelineRunner(reg, backend=SerialBackend(), verbose=False,
+                       allow_runtime_triggers=True)
     res = r.run(CubeStub(), pipe)
     assert res.ok
     assert "expand" in res.triggered
@@ -252,7 +253,8 @@ def test_trigger_does_not_fire_when_predicate_false():
         reg.register(MiniProducer(n, produces=(f"v_{n}",)))
     pipe = (Pipeline.chain(["a"])
             .on_complete("a", run="expand", when=lambda cube: False))
-    r = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+    r = PipelineRunner(reg, backend=SerialBackend(), verbose=False,
+                       allow_runtime_triggers=True)
     res = r.run(CubeStub(), pipe)
     assert "expand" not in res.triggered
     assert [s.name for s in res.steps] == ["a"]
@@ -272,7 +274,8 @@ def test_trigger_respects_cube_state():
     pipe = (Pipeline.chain(["source"])
             .on_complete("source", run="expand",
                          when=lambda cube: cube.state.get("edge_reached")))
-    r = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+    r = PipelineRunner(reg, backend=SerialBackend(), verbose=False,
+                       allow_runtime_triggers=True)
     res = r.run(CubeStub(), pipe)
     assert "expand" in res.triggered
 
@@ -284,7 +287,8 @@ def test_trigger_only_fires_after_source_success():
     reg.register(MiniProducer("expand", produces=("y",)))
     pipe = (Pipeline.chain(["source"])
             .on_complete("source", run="expand", when=lambda c: True))
-    r = PipelineRunner(reg, backend=SerialBackend(), verbose=False)
+    r = PipelineRunner(reg, backend=SerialBackend(), verbose=False,
+                       allow_runtime_triggers=True)
     res = r.run(CubeStub(), pipe)
     assert res.by_name()["source"].status == "error"
     assert "expand" not in res.triggered

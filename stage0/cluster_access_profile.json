@@ -1,0 +1,113 @@
+{
+  "schema": "cluster-access-profile-v1",
+  "snapshot_id": "notchpeak26-2026-08-12-stage0",
+  "captured_at": "2026-08-12T19:45:00-06:00",
+  "host": "notchpeak26",
+  "site": "CHPC (inferred from filesystem paths; authorization not inferred)",
+  "access_modes": [
+    {
+      "mode": "local_serial_on_current_host",
+      "status": "VERIFIED",
+      "evidence": "stage0/reference/reduced_consequence_manifest.json"
+    },
+    {
+      "mode": "fixed_or_interactive_allocation",
+      "status": "UNKNOWN",
+      "evidence": "no scheduler allocation environment variables; no authorization record available"
+    },
+    {
+      "mode": "batch_slurm",
+      "status": "UNAVAILABLE",
+      "evidence": "client commands exist, but sbatch/srun/squeue/sinfo/sacctmgr all fail because this process cannot load the Slurm configuration and its UID cannot be resolved"
+    },
+    {
+      "mode": "arbitrary_direct_compute_node",
+      "status": "UNAVAILABLE",
+      "evidence": "not an authorized execution mode; the workflow system must never bypass the site resource manager"
+    }
+  ],
+  "slurm": {
+    "target_capability_required": true,
+    "current_access_status": "UNAVAILABLE",
+    "client_paths_status": "VERIFIED",
+    "configuration_status": "UNAVAILABLE",
+    "accounts": {"status": "UNKNOWN", "values": []},
+    "partitions": {"status": "UNKNOWN", "values": []},
+    "qos": {"status": "UNKNOWN", "values": []},
+    "reservations": {"status": "UNKNOWN", "values": []},
+    "limits": {
+      "max_nodes": "UNKNOWN",
+      "max_tasks": "UNKNOWN",
+      "max_walltime": "UNKNOWN",
+      "max_array_size": "UNKNOWN",
+      "submission_rate": "UNKNOWN"
+    },
+    "probe_error": "Invalid user for SlurmUser slurm; Unable to process configuration file"
+  },
+  "current_host_resources": {
+    "status": "VERIFIED",
+    "architecture": "x86_64",
+    "cpu_model": "Intel Xeon Gold 6330",
+    "logical_cpus_visible": 112,
+    "cpuset": "0-111",
+    "memory_gib_visible": 503,
+    "gpus": {"status": "UNAVAILABLE", "count": 0},
+    "allocation_lifetime": "UNKNOWN"
+  },
+  "software_environments": [
+    {
+      "name": "NASA_Project .venv",
+      "status": "VERIFIED",
+      "details": "Python 3.12.13; pytest 9.1.0"
+    },
+    {
+      "name": "WRF-SFIRE executables",
+      "status": "VERIFIED",
+      "details": "wrf.exe, real.exe, and WPS executables are present; scientific/runtime conformance is not established"
+    },
+    {
+      "name": "general MPI launch profile",
+      "status": "UNKNOWN",
+      "details": "mpiexec resolves through the site Slurm tree, while no usable batch configuration or certified fixed-allocation launcher is available"
+    }
+  ],
+  "filesystems": [
+    {
+      "path": "/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan",
+      "status": "VERIFIED",
+      "type": "NFSv3",
+      "durability": "shared",
+      "locking_and_sqlite_wal": "UNVERIFIED; mount reports nolock, so it is not approved for the live scheduler database"
+    },
+    {
+      "path": "/tmp",
+      "status": "VERIFIED",
+      "type": "tmpfs",
+      "durability": "node-local and lost with node/process lifecycle",
+      "locking_and_sqlite_wal": "suitable only for local tests, not cluster recovery"
+    }
+  ],
+  "network_and_credentials": {
+    "egress_status": "UNKNOWN",
+    "compute_node_egress_status": "UNKNOWN",
+    "credential_profiles": [],
+    "credential_status": "UNKNOWN"
+  },
+  "controller_state_options": [
+    {
+      "option": "SQLite on verified local POSIX storage",
+      "status": "VERIFIED_FOR_LOCAL_TESTS_ONLY"
+    },
+    {
+      "option": "PostgreSQL or supported transactional cluster service",
+      "status": "UNKNOWN"
+    }
+  ],
+  "unknowns_and_blockers": [
+    "valid Slurm account/partition/QOS and site limits",
+    "authorized controller host and direct-node policy",
+    "certified MPI launcher/environment for a fixed allocation",
+    "transactional cluster control-store service",
+    "compute-node network egress and credential policy"
+  ]
+}

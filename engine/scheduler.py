@@ -25,15 +25,23 @@ Backend caveats:
 from __future__ import annotations
 
 import time
+import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .backends import Backend, SerialBackend
 from .contracts import Request
 from .cube_ref import CubeRef, is_cross_process_backend
+from .identity import (
+    execution_engine_identity,
+    git_revision,
+    git_worktree_dirty,
+    sha256_json,
+)
 from .log import get_logger
-from .pipeline import Pipeline, Trigger
+from .pipeline import BoundPipeline, Pipeline, Trigger
 from .registry import ProducerRegistry, producer_produces, producer_requires
 from .retry import RetryPolicy, attempt_with_retry
 from .tiled import _run_tile, is_tile_aware
@@ -113,6 +121,7 @@ class StepResult:
 class RunResult:
     steps: list[StepResult] = field(default_factory=list)
     triggered: list[str] = field(default_factory=list)
+    manifest: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -132,6 +141,7 @@ class RunResult:
             "total_elapsed_s": sum(s.elapsed_s for s in self.steps),
             "triggered": list(self.triggered),
             "steps": [s.to_dict() for s in self.steps],
+            "manifest": dict(self.manifest),
         }
 
     def save_json(self, path) -> None:
@@ -258,7 +268,8 @@ class PipelineRunner:
                  skip_when_satisfied: bool = True,
                  retry_policy: Optional[RetryPolicy] = None,
                  max_inflight_tiles: Optional[int] = None,
-                 result_dir: Optional[Any] = None) -> None:
+                 result_dir: Optional[Any] = None,
+                 allow_runtime_triggers: bool = False) -> None:
         self.registry = registry
         self.backend = backend or SerialBackend()
         self.verbose = verbose
@@ -276,11 +287,12 @@ class PipelineRunner:
         # None = don't persist. Set to a Path to drop one file per
         # .run() invocation under that directory.
         self.result_dir = result_dir
+        self.allow_runtime_triggers = allow_runtime_triggers
 
     # ------------------------------------------------------------------
     def run(self,
             cube: Any,
-            pipeline: Pipeline,
+            pipeline: Pipeline | BoundPipeline,
             *,
             t_start=None, t_end=None,
             force: bool = False,
@@ -295,23 +307,60 @@ class PipelineRunner:
         """
         request = Request(t_start=t_start, t_end=t_end, force=force,
                           context=dict(context or {}))
-        result = RunResult()
+        bound = (pipeline.bind(
+            self.registry,
+            allow_runtime_triggers=self.allow_runtime_triggers)
+                 if isinstance(pipeline, Pipeline) else pipeline)
+        if bound.triggers() and not self.allow_runtime_triggers:
+            raise RuntimeError(
+                "bound plan contains legacy runtime triggers but the runner "
+                "did not opt into them")
+        bound.verify_bindings()
+        started_at = datetime.now(timezone.utc)
+        request_record = {
+            "t_start": str(t_start) if t_start is not None else None,
+            "t_end": str(t_end) if t_end is not None else None,
+            "force": force,
+            "context_keys": sorted(str(k) for k in (context or {})),
+            "context_sha256": sha256_json(context or {}),
+        }
+        components = [node.component.to_dict() for node in bound.nodes()]
+        result = RunResult(manifest={
+            "schema": "stage0-execution-manifest-v1",
+            "run_id": str(uuid.uuid4()),
+            "started_at": started_at.isoformat(),
+            "ended_at": None,
+            "status": "running",
+            "plan_id": bound.plan_id,
+            "pipeline": bound.name,
+            "code_revision": git_revision(),
+            "code_worktree_dirty": git_worktree_dirty(),
+            "execution_engine": execution_engine_identity(),
+            "request": request_record,
+            "configuration_sha256": sha256_json({
+                "request": request_record,
+                "components": [c["configuration_sha256"]
+                               for c in components],
+            }),
+            "components": components,
+        })
         # Resolve the JSON dump target up front so the try/finally at the
         # bottom of this method can dump even on exceptional exits.
         dump_target = self._resolve_result_path(result_path)
 
         # working set: each pending node -> its unmet dependencies
         node_after: dict[str, set[str]] = {
-            n.name: set(n.after) for n in pipeline.nodes()
+            n.name: set(n.after) for n in bound.nodes()
+            if not n.trigger_only
         }
         completed: set[str] = set()
         failed: set[str] = set()
         triggers_by_source: dict[str, list[Trigger]] = {}
-        for t in pipeline.triggers():
+        for t in bound.triggers():
             triggers_by_source.setdefault(t.source, []).append(t)
 
         if self.verbose:
-            _log.info(pipeline.explain())
+            _log.info(bound.explain())
             _log.info(f"[runner] backend={self.backend.name}")
 
         while node_after:
@@ -347,7 +396,7 @@ class PipelineRunner:
                     f"pipeline stuck (no ready nodes; remaining: {stuck})")
 
             ready.sort()
-            layer_results = self._run_layer(ready, cube, request)
+            layer_results = self._run_layer(ready, cube, request, bound)
             result.steps.extend(layer_results)
 
             for sr in layer_results:
@@ -367,11 +416,18 @@ class PipelineRunner:
                         if self.verbose:
                             _log.info(f"[runner] fail_fast: stopping after "
                                   f"{sr.name} error")
+                        self._finalize_result(result)
                         self._dump_result(result, dump_target)
                         return result
 
+        self._finalize_result(result)
         self._dump_result(result, dump_target)
         return result
+
+    @staticmethod
+    def _finalize_result(result: RunResult) -> None:
+        result.manifest["ended_at"] = datetime.now(timezone.utc).isoformat()
+        result.manifest["status"] = "succeeded" if result.ok else "failed"
 
     # ------------------------------------------------------------------
     def _resolve_result_path(self, result_path) -> Optional[Any]:
@@ -438,12 +494,15 @@ class PipelineRunner:
 
     # ------------------------------------------------------------------
     def _run_layer(self, names: list[str], cube,
-                   request: Request) -> list[StepResult]:
+                   request: Request,
+                   pipeline: BoundPipeline) -> list[StepResult]:
         """Submit a layer of independent nodes to the backend."""
         # Serial fast-path: no worker overhead when only one node, or when
         # using SerialBackend explicitly.
         if isinstance(self.backend, SerialBackend) or len(names) == 1:
-            return [self._run_step(name, cube, request) for name in names]
+            return [self._run_step(
+                name, pipeline.get(name).producer, cube, request)
+                for name in names]
 
         # Pre-pass: classify nodes into skipped / tile-aware / submit.
         # Tile-aware producers drive their own backend fan-out (one
@@ -452,7 +511,7 @@ class PipelineRunner:
         results: list[StepResult] = []
         to_submit: list[str] = []
         for name in names:
-            producer = self.registry.get(name)
+            producer = pipeline.get(name).producer
             if self.skip_when_satisfied and _producer_already_satisfied(
                     producer, cube, request):
                 if self.verbose:
@@ -477,7 +536,7 @@ class PipelineRunner:
         # so the future result is a (produced, exc, attempts) tuple.
         futs: list[tuple[str, Future, float]] = []
         for name in to_submit:
-            producer = self.registry.get(name)
+            producer = pipeline.get(name).producer
             if self.verbose:
                 _log.info(f"[step] {name}  submit ({self.backend.name})")
             t0 = time.monotonic()
@@ -527,8 +586,8 @@ class PipelineRunner:
                           f"({attempts} attempts){dtag}: {exc}")
         return results
 
-    def _run_step(self, name: str, cube, request: Request) -> StepResult:
-        producer = self.registry.get(name)
+    def _run_step(self, name: str, producer, cube,
+                  request: Request) -> StepResult:
         if self.skip_when_satisfied and _producer_already_satisfied(
                 producer, cube, request):
             if self.verbose:

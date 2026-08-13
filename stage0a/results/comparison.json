@@ -1,0 +1,230 @@
+{
+  "schema": "stage0a-runtime-spike-v1",
+  "captured_at": "2026-08-13T02:18:05Z",
+  "environment": {
+    "python": "3.12.13 (main, Jul 15 2026, 15:52:03) [GCC 8.5.0 20210514 (Red Hat 8.5.0-28)]",
+    "platform": "Linux-4.18.0-553.144.1.el8_10.x86_64-x86_64-with-glibc2.28",
+    "hostname": "notchpeak26",
+    "private_development_node": true,
+    "wrf_sfire_executed": false,
+    "slurm_executed": false,
+    "work_root_policy": "/tmp only"
+  },
+  "availability": {
+    "thin-local-subprocess": {
+      "available": true,
+      "version": "project-spike-v1"
+    },
+    "dask-distributed-local": {
+      "available": true,
+      "version": "2026.3.0"
+    },
+    "parsl-local": {
+      "available": true,
+      "version": "2026.8.10"
+    }
+  },
+  "reports": [
+    {
+      "provider": "thin-local-subprocess",
+      "available": true,
+      "version": "project-spike-v1",
+      "required_pass": true,
+      "checks": {
+        "caller_identity": {
+          "passed": true,
+          "evidence": "handle preserved 'attempt-left-1' and stable token"
+        },
+        "resource_metadata": {
+          "passed": true,
+          "evidence": "caller resource metadata round-tripped in both handles"
+        },
+        "independent_dag": {
+          "passed": true,
+          "evidence": "two independent producers completed before the dependent consumer"
+        },
+        "project_owned_commit": {
+          "passed": true,
+          "evidence": "all results crossed the shared project-owned committer"
+        },
+        "late_duplicate_fencing": {
+          "passed": true,
+          "evidence": "stale completion rejected and duplicate could not overwrite value 2"
+        },
+        "cancellation": {
+          "passed": true,
+          "evidence": "cancel returned True; reconciled as CANCELLED"
+        },
+        "running_work_terminated": {
+          "passed": true,
+          "evidence": "completion marker absent after cancellation"
+        },
+        "restart_honesty": {
+          "passed": true,
+          "evidence": "new controller view reconciled RUNNING then SUCCEEDED"
+        },
+        "bounded_admission": {
+          "passed": true,
+          "evidence": "controller admitted peak=2 for eight logical partitions"
+        },
+        "external_handle_roundtrip": {
+          "passed": true,
+          "evidence": "opaque fake batch/MPI handle survived persistence without invocation"
+        },
+        "mpi_execution": {
+          "passed": false,
+          "evidence": "not executed: this private development node has no certified MPI/SLURM profile"
+        }
+      },
+      "timings_s": {
+        "three_task_dag": 0.14368286007083952
+      },
+      "notes": []
+    },
+    {
+      "provider": "dask-distributed-local",
+      "available": true,
+      "version": "2026.3.0",
+      "required_pass": false,
+      "checks": {
+        "caller_identity": {
+          "passed": true,
+          "evidence": "handle preserved 'attempt-left-1' and stable token"
+        },
+        "resource_metadata": {
+          "passed": true,
+          "evidence": "caller resource metadata round-tripped in both handles"
+        },
+        "independent_dag": {
+          "passed": true,
+          "evidence": "two independent producers completed before the dependent consumer"
+        },
+        "project_owned_commit": {
+          "passed": true,
+          "evidence": "all results crossed the shared project-owned committer"
+        },
+        "late_duplicate_fencing": {
+          "passed": true,
+          "evidence": "stale completion rejected and duplicate could not overwrite value 2"
+        },
+        "cancellation": {
+          "passed": true,
+          "evidence": "cancel returned True; reconciled as CANCELLED"
+        },
+        "running_work_terminated": {
+          "passed": false,
+          "evidence": "future was cancelled but synchronous work reached completion"
+        },
+        "restart_honesty": {
+          "passed": true,
+          "evidence": "new controller view reconciled LOST"
+        },
+        "bounded_admission": {
+          "passed": true,
+          "evidence": "controller admitted peak=2 for eight logical partitions"
+        },
+        "external_handle_roundtrip": {
+          "passed": true,
+          "evidence": "opaque fake batch/MPI handle survived persistence without invocation"
+        },
+        "mpi_execution": {
+          "passed": false,
+          "evidence": "not executed: this private development node has no certified MPI/SLURM profile"
+        }
+      },
+      "timings_s": {
+        "three_task_dag": 0.024611240020021796
+      },
+      "notes": [
+        "active work cannot be reattached; the provider honestly returns LOST and Stage 1 must fence/retry only safe work"
+      ]
+    },
+    {
+      "provider": "parsl-local",
+      "available": true,
+      "version": "2026.8.10",
+      "required_pass": false,
+      "checks": {
+        "caller_identity": {
+          "passed": true,
+          "evidence": "handle preserved 'attempt-left-1' and stable token"
+        },
+        "resource_metadata": {
+          "passed": true,
+          "evidence": "caller resource metadata round-tripped in both handles"
+        },
+        "independent_dag": {
+          "passed": true,
+          "evidence": "two independent producers completed before the dependent consumer"
+        },
+        "project_owned_commit": {
+          "passed": true,
+          "evidence": "all results crossed the shared project-owned committer"
+        },
+        "late_duplicate_fencing": {
+          "passed": true,
+          "evidence": "stale completion rejected and duplicate could not overwrite value 2"
+        },
+        "cancellation": {
+          "passed": false,
+          "evidence": "cancel returned False; reconciled as RUNNING"
+        },
+        "running_work_terminated": {
+          "passed": false,
+          "evidence": "future was cancelled but synchronous work reached completion"
+        },
+        "restart_honesty": {
+          "passed": true,
+          "evidence": "new controller view reconciled LOST"
+        },
+        "bounded_admission": {
+          "passed": true,
+          "evidence": "controller admitted peak=2 for eight logical partitions"
+        },
+        "external_handle_roundtrip": {
+          "passed": true,
+          "evidence": "opaque fake batch/MPI handle survived persistence without invocation"
+        },
+        "mpi_execution": {
+          "passed": false,
+          "evidence": "not executed: this private development node has no certified MPI/SLURM profile"
+        }
+      },
+      "timings_s": {
+        "three_task_dag": 0.002638031030073762
+      },
+      "notes": [
+        "active work cannot be reattached; the provider honestly returns LOST and Stage 1 must fence/retry only safe work"
+      ]
+    }
+  ],
+  "scores": {
+    "thin-local-subprocess": {
+      "correctness_restart_40": 40,
+      "external_mpi_fit_20": 16,
+      "dynamic_backpressure_15": 15,
+      "implementation_operations_15": 13,
+      "performance_observability_10": 7,
+      "total_100": 91,
+      "mpi_slurm_status": "NOT_TESTED"
+    },
+    "dask-distributed-local": {
+      "correctness_restart_40": 35,
+      "external_mpi_fit_20": 16,
+      "dynamic_backpressure_15": 15,
+      "implementation_operations_15": 8,
+      "performance_observability_10": 8,
+      "total_100": 82,
+      "mpi_slurm_status": "NOT_TESTED"
+    },
+    "parsl-local": {
+      "correctness_restart_40": 28,
+      "external_mpi_fit_20": 11,
+      "dynamic_backpressure_15": 15,
+      "implementation_operations_15": 7,
+      "performance_observability_10": 7,
+      "total_100": 68,
+      "mpi_slurm_status": "NOT_TESTED"
+    }
+  }
+}

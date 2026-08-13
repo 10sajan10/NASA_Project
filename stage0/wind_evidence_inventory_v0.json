@@ -1,0 +1,89 @@
+{
+  "schema": "wind-evidence-inventory-v0",
+  "captured_at": "2026-08-12",
+  "decision_policy": {
+    "mvp_general_quality_optimization": "NOT_IMPLEMENTED",
+    "automatic_quality_choice": "CHOICE_REQUIRED",
+    "cost_only_selection": "permitted later only after hard scientific constraints pass",
+    "reason": "no comparable held-out evidence currently exists for competing wind producers"
+  },
+  "requirements_descriptor_fields": [
+    "variable/vector components",
+    "units",
+    "horizontal CRS and grid/resolution",
+    "spatial extent",
+    "time coverage and cadence",
+    "vertical coordinate/reference height",
+    "forecast analysis/reference-time semantics",
+    "ensemble/member",
+    "maximum acceptable latency/staleness",
+    "quality/evidence policy"
+  ],
+  "producer_candidates": [
+    {
+      "id": "era5_arco_10m",
+      "implementation_status": "IMPLEMENTED_UNVERIFIED_REMOTE_IN_STAGE0",
+      "variables": ["wind_speed_ms", "wind_dir_deg"],
+      "native_grid": "0.25 degree; repository card records 31 km and driver documentation approximates 28 km at equator",
+      "cadence": "hourly",
+      "vertical_descriptor": "10 m above surface",
+      "coverage": "repository catalog begins 1940-01-01; end is open",
+      "binding": "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3",
+      "known_limitations": [
+        "bilinear interpolation onto a finer cube does not create finer effective information",
+        "remote snapshot/asset identity is not yet bound in an immutable AssetManifest",
+        "no site-specific held-out validation is recorded"
+      ]
+    },
+    {
+      "id": "atmospheric_wrf_downscaler",
+      "implementation_status": "CONTRACT_ONLY_NO_STANDALONE_GOLDEN_RUN",
+      "variables": ["wind vector descriptor TBD"],
+      "native_grid": "scenario-dependent",
+      "cadence": "scenario-dependent",
+      "vertical_descriptor": "must be explicit before admission",
+      "upstream": "WPS/met_em boundary collection",
+      "known_limitations": [
+        "not yet exposed as an independently validated producer",
+        "no comparable evidence against ERA5 or observations",
+        "model grid spacing is not evidence of effective wind resolution"
+      ]
+    },
+    {
+      "id": "pinned_high_resolution_wind_artifact",
+      "implementation_status": "MISSING",
+      "known_limitations": [
+        "no versioned artifact, source, license, manifest, or validation pack is present",
+        "must not be called high-resolution until empirically supported"
+      ]
+    },
+    {
+      "id": "operational_forecast_connector_such_as_hrrr",
+      "implementation_status": "NOT_IMPLEMENTED_OR_VERIFIED",
+      "known_limitations": [
+        "candidate name only; no connector contract, archive coverage, immutable binding, or evidence exists in this repository"
+      ]
+    }
+  ],
+  "reference_observations": {
+    "status": "MISSING",
+    "candidates_requiring_domain_review": ["surface station networks", "mesonets", "RAWS", "radiosondes"],
+    "required_controls": [
+      "held-out sites/times",
+      "spatial and temporal dependence-aware splits",
+      "height/exposure representativeness",
+      "quality-control and missingness policy",
+      "license and immutable retrieval manifest"
+    ]
+  },
+  "metrics": [
+    {"name": "vector RMSE", "status": "MISSING"},
+    {"name": "speed bias/RMSE", "status": "MISSING"},
+    {"name": "circular direction error", "status": "MISSING"},
+    {"name": "temporal correlation", "status": "MISSING"},
+    {"name": "extreme/event-conditioned error", "status": "MISSING"},
+    {"name": "effective-resolution or spectral/coherence evidence", "status": "MISSING"},
+    {"name": "uncertainty calibration", "status": "MISSING"}
+  ],
+  "stage0_conclusion": "Current metadata can establish compatibility, not comparative quality. Any quality-sensitive request must return CHOICE_REQUIRED until a versioned, held-out, dependence-aware evidence pack exists."
+}

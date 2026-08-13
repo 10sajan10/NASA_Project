@@ -1,0 +1,26 @@
+{
+  "schema": "runtime-substrate-decision-v1",
+  "decision": "CUSTOM_LOCAL_ONLY",
+  "accepted_at": "2026-08-12",
+  "development_site": {
+    "kind": "private_single_node",
+    "slurm_available": false,
+    "wrf_sfire_test_policy": "DO_NOT_RUN"
+  },
+  "stage1": {
+    "authoritative_controller": "project_owned_single_writer",
+    "execution_provider": "supervised_local_subprocess",
+    "artifact_committer": "project_owned",
+    "networked_worker_runtime": "FORBIDDEN",
+    "max_inflight_initial": 1,
+    "state_store": "SQLite on verified node-local POSIX storage for development",
+    "nfs_state_store": "FORBIDDEN"
+  },
+  "deferred": {
+    "dask_distributed": "optional FRAMEWORK_EXECUTOR after measured partition-scale need",
+    "parsl": "not selected; reconsider only from measured HPC integration need",
+    "slurm": "future independent ExecutionProvider when a real site profile exists",
+    "wrf_sfire": "external example model; never part of routine runtime tests"
+  },
+  "evidence": "stage0a/results/comparison.json"
+}

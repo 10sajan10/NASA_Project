@@ -9,6 +9,12 @@ This repository is the substrate, not a fixed pipeline. There is no
 baked-in fire-spread algorithm, no required data source, no scenario
 glue. You bring the model and the data; the engine wires them together.
 
+> **Current build status:** [Stage 0](stage0/) froze the baseline and kernel
+> invariants. [Stage 0A](stage0a/) selected a project-owned thin controller and
+> supervised local-subprocess provider for Stage 1 after a common comparison
+> with Dask Distributed and Parsl. WRF-SFIRE was not run; SLURM remains a future
+> provider capability and is not available on this private development node.
+
 ## Components
 
 | Layer | Purpose |

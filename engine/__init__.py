@@ -72,7 +72,15 @@ from .merge import (
     write_chunk_static_with_policy,
     write_chunk_time_with_policy,
 )
-from .pipeline import Pipeline, PipelineNode, Trigger, parallel
+from .pipeline import (
+    BoundPipeline,
+    BoundPipelineNode,
+    Pipeline,
+    PipelineNode,
+    Trigger,
+    parallel,
+)
+from .identity import ComponentBinding
 from .retry import RetryPolicy, attempt_with_retry
 from .scheduler import PipelineRunner, RunResult, StepResult, TileMetric
 
@@ -141,7 +149,10 @@ __all__ = [
     "to_engine_registry",
     "to_adapter_registry",
     "Pipeline",
+    "BoundPipeline",
+    "BoundPipelineNode",
     "PipelineNode",
+    "ComponentBinding",
     "Trigger",
     "parallel",
     "PipelineRunner",

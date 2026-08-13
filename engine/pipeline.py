@@ -19,9 +19,10 @@ Triggers attach event-driven follow-up steps:
     pipeline.on_complete("some_producer", run="follow_up_producer",
                          when=lambda cube: state_predicate(cube))
 
-The pipeline holds *names*, not producer objects. A `ProducerRegistry`
-resolves names to runnable producers at execution time, so the same
-pipeline spec is reusable across runs with different wirings.
+`Pipeline` is a mutable specification.  Before execution it is converted to a
+`BoundPipeline`, which freezes the exact producer objects and their component
+identities.  Registry changes made after that boundary cannot silently change
+what runs.
 
 Nothing in this module knows about specific models or variables. The
 engine just orchestrates declared dependencies.
@@ -31,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
+from .identity import ComponentBinding, sha256_json
 from .registry import ProducerRegistry, producer_requires
 
 
@@ -71,6 +73,75 @@ class Trigger:
     def __post_init__(self):
         if not self.name:
             self.name = f"{self.source}->{self.target}"
+
+
+@dataclass(frozen=True)
+class BoundPipelineNode:
+    """One pipeline node with its exact producer frozen for execution."""
+
+    name: str
+    after: tuple[str, ...]
+    optional: bool
+    trigger_only: bool
+    metadata_sha256: str
+    component: ComponentBinding
+    producer: Any = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class BoundPipeline:
+    """Immutable Stage-0 execution plan.
+
+    This is deliberately a small bridge for the legacy runner, not the later
+    scientific derivation/deployment plan.  Its purpose is to prevent mutable
+    registry lookup and mutable component configuration from causing
+    plan/execution divergence.
+    """
+
+    name: str
+    bound_nodes: tuple[BoundPipelineNode, ...]
+    bound_triggers: tuple[Trigger, ...]
+    plan_id: str
+
+    def nodes(self) -> list[BoundPipelineNode]:
+        return list(self.bound_nodes)
+
+    def triggers(self) -> list[Trigger]:
+        return list(self.bound_triggers)
+
+    def get(self, name: str) -> BoundPipelineNode:
+        for node in self.bound_nodes:
+            if node.name == name:
+                return node
+        raise KeyError(f"no bound pipeline node named {name!r}")
+
+    def edges(self) -> list[tuple[str, str]]:
+        return [(dep, node.name)
+                for node in self.bound_nodes for dep in node.after]
+
+    def verify_bindings(self) -> None:
+        """Reject component mutation after binding."""
+        for node in self.bound_nodes:
+            current = ComponentBinding.from_component(node.producer)
+            if current != node.component:
+                raise RuntimeError(
+                    f"component {node.name!r} changed after plan binding; "
+                    "create a new bound plan")
+
+    def explain(self) -> str:
+        components = {node.name: node.component.version
+                      for node in self.bound_nodes}
+        lines = [
+            f"bound pipeline {self.name!r}: {len(self.bound_nodes)} nodes",
+            f"  plan_id: {self.plan_id}",
+        ]
+        for node in self.bound_nodes:
+            deps = ", ".join(node.after) if node.after else "<root>"
+            lines.append(
+                f"  {node.name} [{components[node.name]}] after {deps}")
+        if self.bound_triggers:
+            lines.append("  legacy runtime triggers enabled")
+        return "\n".join(lines)
 
 
 class Pipeline:
@@ -214,6 +285,70 @@ class Pipeline:
 
     def triggers(self) -> list[Trigger]:
         return list(self._triggers)
+
+    def bind(self, registry: ProducerRegistry, *,
+             allow_runtime_triggers: bool = False) -> BoundPipeline:
+        """Freeze topology, producer objects, and component identities.
+
+        Runtime trigger expansion is unsafe for reproducible execution because
+        it changes the graph after plan identity is assigned.  Stage 0 rejects
+        it by default.  Existing trigger behavior remains available only via
+        the explicit legacy flag while later stages replace it with child-plan
+        revisions.
+        """
+        self.topological_layers()  # validate unknown dependencies and cycles
+        if self._triggers and not allow_runtime_triggers:
+            raise RuntimeError(
+                "runtime triggers are disabled for bound execution; compile "
+                "the branch before execution or opt into legacy trigger mode")
+
+        node_specs: dict[str, PipelineNode] = dict(self._nodes)
+        if allow_runtime_triggers:
+            for trigger in self._triggers:
+                node_specs.setdefault(
+                    trigger.target,
+                    PipelineNode(name=trigger.target, after=(trigger.source,)))
+
+        bound: list[BoundPipelineNode] = []
+        for name in sorted(node_specs):
+            spec = node_specs[name]
+            producer = registry.get(name)
+            component = ComponentBinding.from_component(producer)
+            bound.append(BoundPipelineNode(
+                name=name,
+                after=tuple(spec.after),
+                optional=spec.optional,
+                trigger_only=name not in self._nodes,
+                metadata_sha256=sha256_json(spec.metadata),
+                component=component,
+                producer=producer,
+            ))
+
+        identity = {
+            "schema": "stage0-bound-pipeline-v1",
+            "name": self.name,
+            "nodes": [
+                {
+                    "name": node.name,
+                    "after": node.after,
+                    "optional": node.optional,
+                    "trigger_only": node.trigger_only,
+                    "metadata_sha256": node.metadata_sha256,
+                    "component": node.component.to_dict(),
+                }
+                for node in bound
+            ],
+            "triggers": [
+                {"name": t.name, "source": t.source, "target": t.target}
+                for t in self._triggers
+            ],
+        }
+        return BoundPipeline(
+            name=self.name,
+            bound_nodes=tuple(bound),
+            bound_triggers=tuple(self._triggers),
+            plan_id=sha256_json(identity),
+        )
 
     def __contains__(self, name: str) -> bool:
         return name in self._nodes
