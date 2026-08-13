@@ -10,10 +10,11 @@ baked-in fire-spread algorithm, no required data source, no scenario
 glue. You bring the model and the data; the engine wires them together.
 
 > **Current build status:** [Stage 0](stage0/) froze the baseline and kernel
-> invariants. [Stage 0A](stage0a/) selected a project-owned thin controller and
-> supervised local-subprocess provider for Stage 1 after a common comparison
-> with Dask Distributed and Parsl. WRF-SFIRE was not run; SLURM remains a future
-> provider capability and is not available on this private development node.
+> invariants. [Stage 0A](stage0a/) selected the runtime substrate. [Stage 1](stage1/)
+> now provides the durable single-node controller, supervised subprocesses,
+> fenced validation/commit, and restart tests for an already-bound graph.
+> WRF-SFIRE was not run; MPI/SLURM remain conditional future provider
+> capabilities and are not available on this private development node.
 
 ## Components
 
