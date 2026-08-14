@@ -12,6 +12,7 @@ from contracts import (
     Cardinality,
     CompatibilityProof,
     DistinctnessPolicy,
+    EvidenceSubject,
     Requirement,
     RequirementUse,
 )
@@ -410,12 +411,16 @@ class BoundInvocation:
         spec.binder.verify_current()
         parameters = spec.parameter_schema.validate(parameterization.parameters)
         binding_seed = strict_hash({
-            "schema": "stage2-invocation-binding-seed-v1",
+            "schema": "stage2-invocation-binding-seed-v2",
             "capability_id": spec.capability_id,
             "capability_version": spec.capability_version,
             "binder": spec.binder.to_dict(),
             "implementation": spec.implementation.to_dict(),
             "parameters": strict_copy(parameters),
+            # RequirementUse identities must be local to the complete bound
+            # invocation contract.  Omitting sibling input templates allowed
+            # two distinct invocations to mint the same unchanged-port use ID.
+            "inputs": [value.to_dict() for value in spec.input_ports],
             "outputs": [value.to_dict() for value in spec.output_ports],
         })
         inputs = tuple(value.bind(binding_seed) for value in spec.input_ports)
@@ -569,6 +574,56 @@ class ArtifactLeaf:
             "ArtifactLeaf")
         raw["descriptor"] = ArtifactDescriptor.from_dict(raw["descriptor"])
         return cls(**raw)
+
+
+def invocation_evidence_subject(
+        invocation: BoundInvocation, output_port_id: str,
+) -> EvidenceSubject:
+    """Derive the only evidence subject valid for an invocation output.
+
+    Evidence identity is never accepted from a catalog caller.  It is derived
+    from the result-affecting implementation/configuration and the exact bound
+    parameters, so evidence for one parameterization cannot authorize another.
+    """
+    if not isinstance(invocation, BoundInvocation):
+        raise TypeError("invocation must be BoundInvocation")
+    invocation.output(output_port_id)
+    return EvidenceSubject(
+        component_id=invocation.implementation.component_id,
+        component_version=invocation.implementation.component_version,
+        configuration_id=strict_hash({
+            "implementation_configuration":
+                invocation.implementation.configuration_sha256,
+            "parameters": invocation.parameters,
+        }),
+        output_port_id=output_port_id,
+    )
+
+
+def artifact_evidence_subject(
+        leaf: ArtifactLeaf, output_port_id: str = "artifact",
+) -> EvidenceSubject:
+    """Bind evidence to one exact immutable artifact realization.
+
+    An artifact leaf does not expose its historical producer implementation.
+    Its admissible evidence subject is therefore the exact manifest-backed
+    realization (artifact, manifest root, and descriptor), not an arbitrary
+    subject supplied by an evidence profile.
+    """
+    if not isinstance(leaf, ArtifactLeaf):
+        raise TypeError("leaf must be ArtifactLeaf")
+    _port(output_port_id, "artifact output_port_id")
+    return EvidenceSubject(
+        component_id="artifact-manifest",
+        component_version="stage2-artifact-leaf-v1",
+        configuration_id=strict_hash({
+            "schema": "stage2-artifact-evidence-subject-v1",
+            "artifact_id": leaf.artifact_id,
+            "manifest_root_sha256": leaf.manifest_root_sha256,
+            "descriptor_id": leaf.descriptor.descriptor_id,
+        }),
+        output_port_id=output_port_id,
+    )
 
 
 class BindingRejectionCode(str, Enum):

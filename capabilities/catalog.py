@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from functools import cached_property
+from types import MappingProxyType
 from typing import Any, Iterable
 
 from contracts import (
@@ -26,6 +28,7 @@ from .model import (
     BindingRejectionCode,
     BoundInvocation,
     CapabilitySpec,
+    invocation_evidence_subject,
 )
 
 
@@ -73,6 +76,19 @@ class CapabilityCatalog:
             if profile.implementation != spec.implementation:
                 raise ValueError(
                     "capability and execution profile result implementations disagree")
+        # An invocation key is result identity.  Stage 3 v1 intentionally has
+        # one planning record (cost/evidence/profile) per result identity; it
+        # cannot silently choose between conflicting planning annotations.
+        invocation_records: dict[str, str] = {}
+        for spec in self.capabilities:
+            for parameterization in spec.parameterizations:
+                invocation = BoundInvocation.bind(spec, parameterization)
+                previous = invocation_records.setdefault(
+                    invocation.invocation_key, invocation.record_id)
+                if previous != invocation.record_id:
+                    raise ValueError(
+                        "capability catalog assigns conflicting planning "
+                        "records to one bound invocation identity")
         if self.catalog_id != self.expected_id():
             raise ValueError("capability catalog identity does not verify")
 
@@ -112,24 +128,41 @@ class CapabilityCatalog:
             raw[name] = tuple(parser(item) for item in raw[name])
         return cls(**raw)
 
+    @cached_property
+    def _spec_by_id(self):
+        return MappingProxyType({
+            value.spec_id: value for value in self.capabilities})
+
+    @cached_property
+    def _profile_by_id(self):
+        return MappingProxyType({
+            value.profile_id: value for value in self.execution_profiles})
+
+    @cached_property
+    def _specs_by_concept(self):
+        index: dict[str, list[CapabilitySpec]] = {}
+        for spec in self.capabilities:
+            for concept_id in sorted({
+                    output.descriptor.concept_id
+                    for output in spec.output_ports}):
+                index.setdefault(concept_id, []).append(spec)
+        return MappingProxyType({
+            key: tuple(values) for key, values in index.items()})
+
     def get(self, spec_id: str) -> CapabilitySpec:
         try:
-            return next(value for value in self.capabilities
-                        if value.spec_id == spec_id)
-        except StopIteration as exc:
+            return self._spec_by_id[spec_id]
+        except KeyError as exc:
             raise KeyError(spec_id) from exc
 
     def profile(self, profile_id: str) -> ExecutionProfile:
         try:
-            return next(value for value in self.execution_profiles
-                        if value.profile_id == profile_id)
-        except StopIteration as exc:
+            return self._profile_by_id[profile_id]
+        except KeyError as exc:
             raise KeyError(profile_id) from exc
 
     def lookup(self, concept_id: str) -> tuple[CapabilitySpec, ...]:
-        return tuple(spec for spec in self.capabilities if any(
-            output.descriptor.concept_id == concept_id
-            for output in spec.output_ports))
+        return self._specs_by_concept.get(concept_id, ())
 
     def bind_candidates(
             self, spec_id: str, offered_output_port: str,
@@ -211,16 +244,9 @@ class CapabilityCatalog:
             invocations = tuple(
                 BoundInvocation.bind(spec, value)
                 for value in spec.parameterizations)
-            derived_subjects = tuple(EvidenceSubject(
-                component_id=value.implementation.component_id,
-                component_version=value.implementation.component_version,
-                configuration_id=strict_hash({
-                    "implementation_configuration":
-                        value.implementation.configuration_sha256,
-                    "parameters": value.parameters,
-                }),
-                output_port_id=offered_output_port,
-            ) for value in invocations)
+            derived_subjects = tuple(
+                invocation_evidence_subject(value, offered_output_port)
+                for value in invocations)
             if evidence_subject is not None and any(
                     value != evidence_subject for value in derived_subjects):
                 return _rejected(
@@ -236,25 +262,38 @@ class CapabilityCatalog:
                 evidence_subject=subject,
                 requested_regimes=requested_regimes,
             ) for subject in derived_subjects)
-        rejected_proof = next((value for value in proofs
-                               if not value.satisfied), None)
-        if rejected_proof is not None:
-            return _rejected(
-                spec, requirement_id, offered_output_port,
+        accepted_values: list[BindingCandidate] = []
+        rejected_values: list[BindingRejection] = []
+        for invocation, candidate_proof in zip(invocations, proofs):
+            if candidate_proof.satisfied:
+                accepted_values.append(BindingCandidate(
+                    offered_output_port, invocation, candidate_proof))
+                continue
+            rejected_values.append(BindingRejection(
                 BindingRejectionCode.DIRECT_MATCH_REJECTED,
-                "offered descriptor does not directly satisfy the requirement",
-                {"compatibility_proof": rejected_proof.to_dict(),
-                 "rejection_codes": [
-                     getattr(code, "value", str(code))
-                     for code in rejected_proof.rejection_codes]},
-            )
+                spec.spec_id,
+                offered_output_port,
+                "one bound parameterization does not directly satisfy the "
+                "requirement",
+                {
+                    "invocation_key": invocation.invocation_key,
+                    "invocation_record_id": invocation.record_id,
+                    "parameters": invocation.parameters,
+                    "compatibility_proof": candidate_proof.to_dict(),
+                    "rejection_codes": [
+                        getattr(code, "value", str(code))
+                        for code in candidate_proof.rejection_codes],
+                },
+            ))
 
-        accepted = tuple(sorted((
-            BindingCandidate(offered_output_port, invocation, candidate_proof)
-            for invocation, candidate_proof in zip(invocations, proofs)
-        ), key=lambda value: value.invocation.invocation_key))
+        accepted = tuple(sorted(
+            accepted_values,
+            key=lambda value: value.invocation.invocation_key))
+        rejected = tuple(sorted(
+            rejected_values,
+            key=lambda value: strict_hash(value.to_dict())))
         return BindingEnumeration(
-            spec.spec_id, requirement_id, accepted, (), True)
+            spec.spec_id, requirement_id, accepted, rejected, True)
 
 
 def _catalog_payload(

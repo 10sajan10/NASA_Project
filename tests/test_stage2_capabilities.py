@@ -14,6 +14,7 @@ from capabilities import (
     BinderRef,
     BindingParameterization,
     BindingRejectionCode,
+    BoundInvocation,
     CapabilityCatalog,
     CapabilitySpec,
     DescriptorTemplate,
@@ -21,6 +22,7 @@ from capabilities import (
     ParameterField,
     ParameterKind,
     ParameterSchema,
+    invocation_evidence_subject,
 )
 from capabilities.binders import binder_keys
 from capabilities.deployment import (
@@ -37,6 +39,9 @@ from contracts import (
     BBoxSupport,
     DistinctnessPolicy,
     EvidenceRequirement,
+    EvidenceProfile,
+    EvidenceSnapshot,
+    MetricEvaluator,
     MissingPolicy,
     Missingness,
     MissingnessStatus,
@@ -244,6 +249,13 @@ def test_catalog_allows_alternative_producers_for_one_concept():
     assert len(catalog.lookup("scalar.left")) == 2
     assert CapabilityCatalog.from_dict(catalog.to_dict()) == catalog
 
+    with pytest.raises(TypeError):
+        catalog._spec_by_id[first.spec_id] = second
+    with pytest.raises(TypeError):
+        catalog._specs_by_concept["scalar.left"] = ()
+    assert catalog.get(first.spec_id) == first
+    assert len(catalog.lookup("scalar.left")) == 2
+
 
 def test_duplicate_scientific_binding_with_conflicting_metrics_is_rejected():
     spec, profile = _pair_spec()
@@ -264,6 +276,25 @@ def test_duplicate_scientific_binding_with_conflicting_metrics_is_rejected():
             ),
             execution_profile_id=profile.profile_id,
         )
+
+
+def test_catalog_rejects_conflicting_planning_records_for_same_invocation():
+    first, profile = _pair_spec()
+    second = CapabilitySpec.bind(
+        capability_id=first.capability_id,
+        capability_version=first.capability_version,
+        implementation=first.implementation,
+        binder=first.binder,
+        input_ports=first.input_ports,
+        output_ports=first.output_ports,
+        parameter_schema=first.parameter_schema,
+        parameterizations=first.parameterizations,
+        execution_profile_id=first.execution_profile_id,
+        cost_model_id="cost:another-declared-model",
+    )
+
+    with pytest.raises(ValueError, match="conflicting planning records"):
+        CapabilityCatalog.freeze((first, second), (profile,))
 
 
 def test_pair_binding_preserves_all_outputs_and_is_deterministic():
@@ -287,6 +318,68 @@ def test_pair_binding_preserves_all_outputs_and_is_deterministic():
     assert invocation.output("right").descriptor.concept_id == "scalar.right"
     assert invocation.implementation.verify_current()
     assert type(invocation).from_dict(invocation.to_dict()) == invocation
+
+
+def test_evidence_rejection_is_scoped_to_one_parameterization():
+    profile = _local_profile("synthetic.constant.v1")
+    parameters = (
+        BindingParameterization({"value": 20}, {"cost_units": 1}),
+        BindingParameterization({"value": 21}, {"cost_units": 1}),
+    )
+    provisional = CapabilitySpec.bind(
+        capability_id="evidence-scoped-constant",
+        capability_version="1.0.0",
+        implementation=profile.implementation,
+        binder=BinderRef.from_key("synthetic.constant.bind.v1"),
+        input_ports=(),
+        output_ports=(DescriptorTemplate(
+            "result", _descriptor("scalar.evidence")),),
+        parameter_schema=ParameterSchema((
+            ParameterField("value", ParameterKind.NUMBER),)),
+        parameterizations=parameters,
+        execution_profile_id=profile.profile_id,
+    )
+    first_invocation = BoundInvocation.bind(
+        provisional, provisional.parameterizations[0])
+    evidence = EvidenceProfile(
+        "SyntheticEvidence-v1",
+        invocation_evidence_subject(first_invocation, "result"),
+        (),
+    )
+    spec = CapabilitySpec.bind(
+        capability_id=provisional.capability_id,
+        capability_version=provisional.capability_version,
+        implementation=provisional.implementation,
+        binder=provisional.binder,
+        input_ports=provisional.input_ports,
+        output_ports=provisional.output_ports,
+        parameter_schema=provisional.parameter_schema,
+        parameterizations=provisional.parameterizations,
+        execution_profile_id=provisional.execution_profile_id,
+        evidence_profile_id=evidence.profile_id,
+    )
+    snapshot = EvidenceSnapshot(
+        "2026-08-13T00:00:00Z",
+        MetricEvaluator("synthetic-empty", "1", ()),
+        (evidence,),
+    )
+    catalog = CapabilityCatalog.freeze((spec,), (profile,))
+
+    result = catalog.bind_candidates(
+        spec.spec_id,
+        "result",
+        _requirement("scalar.evidence"),
+        evidence_profile=evidence,
+        evidence_snapshot=snapshot,
+    )
+
+    assert result.complete
+    assert len(result.accepted) == 1
+    assert len(result.rejected) == 1
+    assert (result.accepted[0].invocation.parameters
+            == first_invocation.parameters)
+    assert (result.rejected[0].details["parameters"]
+            != first_invocation.parameters)
 
 
 def test_direct_mismatch_is_structured_and_does_not_insert_conversion():
@@ -336,6 +429,42 @@ def test_add_binding_retains_distinct_equal_requirement_uses():
     assert (invocation.input_uses[0].requirement_use_id
             != invocation.input_uses[1].requirement_use_id)
     assert {use.port_id for use in invocation.input_uses} == {"left", "right"}
+
+
+def test_input_use_identity_is_local_to_the_complete_invocation_contract():
+    result_descriptor = _descriptor("scalar.sum")
+    left_a = _requirement("scalar.left-a")
+    left_b = _requirement("scalar.left-b")
+    shared_right = _requirement("scalar.right")
+    profile = _local_profile("synthetic.add.v1")
+
+    def make_spec(left):
+        return CapabilitySpec.bind(
+            capability_id="versioned-add-contract",
+            capability_version="1.0.0",
+            implementation=profile.implementation,
+            binder=BinderRef.from_key("synthetic.add.bind.v1"),
+            input_ports=(InputPortTemplate("left", left),
+                         InputPortTemplate("right", shared_right)),
+            output_ports=(DescriptorTemplate("result", result_descriptor),),
+            parameter_schema=ParameterSchema(),
+            parameterizations=(BindingParameterization(
+                {}, {"cost_units": 1}),),
+            execution_profile_id=profile.profile_id,
+        )
+
+    first = BoundInvocation.bind(
+        make_spec(left_a), BindingParameterization({}, {"cost_units": 1}))
+    second = BoundInvocation.bind(
+        make_spec(left_b), BindingParameterization({}, {"cost_units": 1}))
+    first_right = next(value for value in first.input_uses
+                       if value.port_id == "right")
+    second_right = next(value for value in second.input_uses
+                        if value.port_id == "right")
+
+    assert first.invocation_key != second.invocation_key
+    assert (first_right.requirement_use_id
+            != second_right.requirement_use_id)
 
 
 def test_artifact_leaf_is_a_distinct_committed_realization_identity():

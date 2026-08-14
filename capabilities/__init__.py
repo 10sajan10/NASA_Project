@@ -26,6 +26,8 @@ from .model import (
     CapabilitySpec,
     DescriptorTemplate,
     InputPortTemplate,
+    artifact_evidence_subject,
+    invocation_evidence_subject,
 )
 from .parameters import ParameterField, ParameterKind, ParameterSchema
 
@@ -58,4 +60,6 @@ __all__ = [
     "SiteFeasibility",
     "binder_keys",
     "binder_rule",
+    "artifact_evidence_subject",
+    "invocation_evidence_subject",
 ]

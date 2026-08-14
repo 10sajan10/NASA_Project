@@ -16,6 +16,9 @@ glue. You bring the model and the data; the engine wires them together.
 > [Stage 2](stage2/) now adds strict scientific artifact/requirement/evidence
 > contracts, a multi-producer capability catalog, immutable derivation plans,
 > an exhaustive small-graph oracle, and a verified compiler into Stage 1.
+> [Stage 3](stage3/) now recursively discovers a finite derivation hypergraph,
+> performs exact global minimum-cost selection with sharing/co-production,
+> and independently validates every selected plan before binding.
 > WRF-SFIRE was not run; MPI/SLURM remain conditional future provider
 > capabilities and are not available on this private development node.
 
@@ -28,6 +31,7 @@ glue. You bring the model and the data; the engine wires them together.
 | [contracts/](contracts/) | Stage-2 scientific artifact descriptors, consumer requirements, evidence/applicability records, and pure direct-compatibility proofs. |
 | [capabilities/](capabilities/) | Immutable multi-producer and multi-output capability catalog with closed binders and static deployment feasibility. |
 | [plans/](plans/) + [composition/](composition/) | Candidate/bound derivation identities, exhaustive correctness oracle, structured blocker trees, and verified Stage-1 compiler. |
+| [resolution/](resolution/) | Stage-3 domain-neutral recursive capability discovery, finite derivation hypergraph, exact SciPy/HiGHS global selector, independent plan validator, and planning metrics. |
 | [drivers/](drivers/) | Data-source-specific fetchers (KML, thermal-pulse, DEM, weather reanalysis, etc). These are scenario-specific — keep what you need, write more as you go. |
 | [models/](models/) | `external_model_template.py` — drop-in template for new model adapters. `wrf_sfire_adapter.py` — adapter that calls the external WRF-SFIRE model in [wrf-sfire/](wrf-sfire/). No physics ships here; adapters are wiring. |
 | [agentic/](agentic/) | Agent-queryable metadata + deterministic planning. Variable ontology, DuckDB metacatalog of dataset/model cards (coverage, provenance, regimes, cost models), `EventSpec -> RunPlan` planner, and a JSON tool surface for an LLM planner agent. |
@@ -163,7 +167,8 @@ recomputes only the stale part of the chain.
 ## Setup
 
 ```bash
-./setup.sh                       # creates .venv and installs deps
+./setup.sh                       # creates .venv and installs runtime deps
+.venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m pytest tests/
 ```
 
@@ -182,4 +187,5 @@ contracts/      strict scientific descriptor/requirement/evidence layer
 capabilities/   immutable producer capabilities and deployment compatibility
 plans/          scientific and executable derivation identities
 composition/    exhaustive oracle and Stage-1 compiler
+resolution/     recursive discovery, exact global selection, validation
 ```
