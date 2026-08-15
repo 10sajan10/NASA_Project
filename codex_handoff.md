@@ -1,22 +1,23 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-14
+Last updated: 2026-08-14 (Stage 4 complete)
 
-This is the durable handoff for a new Codex session. Treat the repository,
+This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
 context only.
 
-## First instructions for the next Codex instance
+## First instructions for the next instance
 
 1. Read this file completely.
 2. Work in `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project`.
-3. Verify branch `v2` and Stage-3 commit `36c46a8` before changing anything.
+3. Verify branch `v2` and Stage-4 commit `faf19cd` before changing anything.
 4. Inspect `git status` before edits. Preserve the user-owned dirty files listed
    below and never stage them accidentally.
-5. Read `stage3/README.md` and the Stage-4 section of the external roadmap.
-6. Run only the bounded Stage 0-3 tests initially. Do not run WRF-SFIRE, MPI,
+5. Read `stage3/README.md`, `stage4/README.md`, and the Stage-5 section of the
+   external roadmap.
+6. Run only the bounded Stage 0-4 tests initially. Do not run WRF-SFIRE, MPI,
    Slurm, remote acquisition, or other heavy workloads.
-7. Continue with Stage 4 only after reviewing its scientific and termination
+7. Continue with Stage 5 only after reviewing its acquisition and binding
    invariants. Keep the implementation domain-neutral: wind is an example, not
    a privileged concept in the architecture.
 
@@ -53,13 +54,16 @@ and source-versus-model choice. It is not special-cased by the resolver.
 - Active branch: `v2`
 - Stage-3 implementation commit:
   `36c46a8fc9b9cd4620d17089709dea780c8739cc`
+- Stage-4 implementation commit: `faf19cd`
 - External roadmap:
   `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/nasa_project_docs/scientific_workflow_composition_plan.md`
 - Original poster:
   `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/nasa_project_docs/diagrams/2026_SCposter_SajanNeupane.pdf`
 
 The roadmap was updated through Stage 3. It explicitly marks the final
-representative Stage-6 planning-latency gate as pending.
+representative Stage-6 planning-latency gate as pending. The roadmap text
+itself has **not** been updated for Stage 4; `stage4/README.md` is the
+authoritative record of what Stage 4 actually delivered.
 
 ## Files owned by the user: preserve them
 
@@ -157,6 +161,41 @@ commit `29f9898`.
 
 See `resolution/`, `stage3/`, and commit `36c46a8`.
 
+### Stage 4 — explicit semantic transformations
+
+- Added `TransformationSpec`: an immutable hyperedge between *exact* descriptor
+  states carrying kind, closed operation/binder pair, typed ports, parameters,
+  cost, semantic rule ID, and explicit scientific assumptions.
+- `to_capability_spec()` lowers each edge to an ordinary `CapabilitySpec`, so
+  Stage 3 required **no** transform-specific code path. A declared conversion
+  competes with direct data inside the same global selector.
+- `direct_match()` is unchanged and still inserts nothing.
+- Unit coefficients come only from a closed versioned affine registry; an
+  unregistered unit pair cannot become a transformation.
+- Construction-time semantic guards reject dishonest edges: outputs must
+  declare `DERIVED` origin, unit conversion may change only units, regrid may
+  not change CRS while reprojection must, and bilinear interpolation is
+  admitted only for explicitly typed continuous/intensive fields.
+- `expand_transform_catalog()` computes a finite forward-reachability fixed
+  point and returns an augmented catalog. A transform whose inputs nothing
+  produces is an ordinary unreachable frontier item, not a truncation.
+- **Correctness fix.** Transformation closure is discovery, but its
+  completeness previously never reached the selector: a closure truncated by
+  `MAX_DEPTH` still produced `READY` / `globally_optimal=True` /
+  `eligible_for_binding=True`. `WorkflowResolver` now takes
+  `upstream_discovery_complete` and `upstream_limit_codes`; the effective flag
+  is the conjunction with its own graph expansion and reaches the selector, the
+  `UNSATISFIABLE`-versus-`INCOMPLETE` decision, and the independent validator's
+  candidate-universe check. Inconsistent flag pairs raise. This channel is
+  general — **Stage 5 remote search must feed the same input.**
+- Vertical slice: against direct kilometres at cost 9 and metres at cost 4, the
+  resolver selects metres plus an explicit cost-1 conversion, validates,
+  compiles to two Stage-1 tasks, executes, and commits `1.5` from `1500` m.
+  Restricting the request to `SYNTHETIC` origin correctly falls back to the
+  direct source instead of transforming silently.
+
+See `transformations/`, `stage4/`, `stage4/README.md`, and commit `faf19cd`.
+
 ## Why the global resolver looks this way
 
 Do not replace Stage 3 with independent per-requirement greedy or local top-k
@@ -185,47 +224,49 @@ million-candidate discovery is solved.
 
 ## Verification evidence at handoff
 
-The complete bounded Stage 0-3 suite passed:
+The **entire** repository suite passed at Stage-4 commit `faf19cd`:
 
 ```text
-160 passed, 4 expected xfails
+501 passed, 1 skipped, 6 xfailed
 ```
-
-Command:
 
 ```bash
-.venv/bin/python -m pytest -q \
-  tests/test_stage0_runtime_baseline.py \
-  tests/test_stage0a_conformance.py \
-  tests/test_stage1_provider.py \
-  tests/test_stage1_runtime.py \
-  tests/test_stage2_matching.py \
-  tests/test_stage2_capabilities.py \
-  tests/test_stage2_oracle.py \
-  tests/test_stage2_integration.py \
-  tests/test_stage2_evidence_pack.py \
-  tests/test_stage3_hypergraph.py \
-  tests/test_stage3_milp.py \
-  tests/test_stage3_validator.py \
-  tests/test_stage3_integration.py
+.venv/bin/python -m pytest tests/ -q
 ```
+
+The six xfails are strict and deliberate: two quarantined WRF configuration
+decisions and four frozen legacy-runtime defects (see `stage0/`). A strict
+xfail that starts passing fails the suite and forces a decision.
+
+Note: `tests/test_stage1_runtime.py::
+test_controller_restart_reconciles_live_process_without_resubmit` is
+timing-sensitive and has been observed to fail once under full-suite load while
+passing repeatedly in isolation. Re-run it alone before treating it as a
+regression.
 
 The executable Stage-3 proof completed:
 
-- resolution status: `READY`
-- discovery complete: `true`
-- global optimum proven: `true`
-- selected capabilities: `example-pair` plus `example-add`
-- selected cost: `3`
-- Stage-1 tasks/attempts: `2 / 2`
-- committed result: `42`
-- run state: `SUCCEEDED`
+- resolution status: `READY`; discovery complete; global optimum proven
+- selected capabilities: `example-pair` plus `example-add`, cost `3`
+- Stage-1 tasks/attempts `2 / 2`; committed result `42`; `SUCCEEDED`
 
-Run it only with a fresh node-local temporary directory:
+The executable Stage-4 proof completed:
+
+- resolution status: `READY`, validated, eligible for binding
+- transformation closure complete; effective discovery complete
+- selected: `example-length-metres` +
+  `transform:example-metres-to-kilometres`, cost `5`
+- rejected direct alternative at cost `9`
+- Stage-1 tasks/attempts `2 / 2`; committed result `1.5`; `SUCCEEDED`
+
+Run either only with a fresh node-local temporary directory:
 
 ```bash
 runtime_root=$(mktemp -d /tmp/nasa-stage3-demo.XXXXXX)
 .venv/bin/python scripts/run_stage3_demo.py --runtime-root "$runtime_root"
+
+runtime_root=$(mktemp -d /tmp/nasa-stage4-demo.XXXXXX)
+.venv/bin/python scripts/run_stage4_demo.py --runtime-root "$runtime_root"
 ```
 
 Additional evidence:
@@ -246,9 +287,18 @@ Additional evidence:
 - There is no remote metadata search, durable planning-session cursor,
   progressive asset binding, payload fetch, generic mosaic, or million-asset
   manifest yet.
-- `direct_match()` performs no conversion, reprojection, interpolation,
-  regridding, filling, or vector transformation. Those must become explicit
-  Stage-4 capabilities.
+- `direct_match()` still performs no conversion, reprojection, interpolation,
+  regridding, filling, or vector transformation. As of Stage 4 those exist as
+  explicit declared capabilities; nothing became implicit.
+- Transformation catalogs are finite and in memory. Closure is forward
+  reachability over declared edges; it never synthesizes new edges.
+- The demonstrated Stage-4 slice converts a scalar. Grid, temporal,
+  reprojection, and vector operations are implemented and tested at the
+  operation and contract layers, but no multi-hop chain is promoted as a
+  scientific fixture.
+- Transformation *loss* is declared and visible but is not an optimization
+  dimension. A lowered transformation carries `evidence:unknown`; Stage 4 does
+  not invent empirical error for a conversion.
 - The automatic MVP objective is minimum declared integer cost under hard
   constraints. Quality optimization, latency objectives, Pareto enumeration,
   CP-SAT, beam/A*, and learned estimates are deferred.
@@ -263,55 +313,65 @@ Additional evidence:
   private CHPC node, not a Slurm test environment.
 - WRF-SFIRE is not a current test workload.
 
-## Next implementation stage: Stage 4
+## Stage-4 exit evidence (met)
 
-Stage 4 introduces explicit, bounded semantic transformation-path discovery.
-The roadmap currently uses wind to exercise this layer, but the implementation
-must remain applicable to any scientific artifact.
+Recorded so the next instance does not re-litigate settled ground. Each of the
+ten Stage-4 invariants was checked against the implementation:
 
-Before editing, critique the Stage-4 design against these invariants:
+- `direct_match()` remains pure; no adapter hides a scientific transformation.
+- Every conversion is a declared, versioned, costed capability with typed
+  ports, closed operation/binder identity, and explicit assumption IDs.
+- Codec/materialization operations stayed separate from semantic transforms.
+- Closure terminates over a finite descriptor-state space; every activated
+  bound marks discovery incomplete with typed reasons naming what was dropped.
+- Truncation can no longer support a global-optimality claim (this was a real
+  defect found and fixed, not merely asserted -- see the Stage-4 entry above).
+- Transformation nodes, costs, versions, and the closure identity are visible
+  in the bound plan and its snapshot references.
+- The transformed artifact validates and commits through the Stage-1 runtime.
+- Domain-neutral scalar and vector fixtures only; no resolver code depends on
+  any concept meaning.
 
-1. `direct_match()` remains pure and never inserts transformations.
-2. Every result-affecting transformation is a declared, versioned capability
-   with typed input/output descriptors, parameters, cost, evidence, and
-   implementation identity.
-3. Codec/materialization operations such as decoding, decompression, NetCDF or
-   Zarr serialization, and model staging remain explicit but separate from
-   scientific semantic transformations.
-4. Search terminates over a finite canonical descriptor-state space or another
-   documented well-founded measure.
-5. Any depth/state/candidate truncation marks discovery incomplete and cannot
-   support a global-optimality claim.
-6. Transform chains appear in the candidate/bound plan and provenance; an
-   adapter may not silently subset, interpolate, reproject, rotate, convert, or
-   fill values.
-7. The selected transform output is independently validated against the target
-   requirement before commit.
-8. Start with bounded transforms required by one vertical slice: unit
-   conversion, spatial/temporal subsetting, temporal alignment,
-   reprojection/continuous regridding, and vector representation/rotation.
-9. Use domain-neutral scalar and vector fixtures for correctness. A small local
-   wind artifact may be an integration example, but no resolver code may depend
-   on the concept being wind.
-10. Do not begin remote acquisition while implementing Stage 4; progressive
-    source discovery and exact `AssetManifest` binding belong to Stage 5.
+## Next implementation stage: Stage 5
 
-Expected Stage-4 exit evidence:
+Stage 5 introduces progressive acquisition: local plus one remote connector,
+metadata-only search, coverage alternatives, exact immutable `AssetManifest`
+binding, and payload bytes fetched **only after** binding.
 
-- no adapter hides a scientific transformation;
-- bounded search terminates and exposes incomplete frontiers honestly;
-- scalar continuous-field and generic vector tests cover units, space, time,
-  grid/CRS, alignment, and representation changes needed by the vertical
-  slice;
-- transformation nodes, proofs, costs, and versions are visible in the
-  selected plan; and
-- the transformed artifact validates and commits through the existing runtime.
+Before editing, critique the Stage-5 design against these invariants:
+
+1. Metadata search never fetches payload bytes. Binding precedes transfer.
+2. A remote source without stable conditional identity (ETag/version/checksum)
+   is `UNBINDABLE` for a scientific run. It may only be bootstrapped through a
+   separate quarantined `SnapshotIngestionPlan` whose bytes cannot satisfy a
+   scientific requirement until committed as an `ArtifactLeaf`.
+3. Discovery truncation -- page limits, asset caps, plan-count caps, timeouts,
+   provider cooldowns -- **must** flow into the resolver through the existing
+   `upstream_discovery_complete` / `upstream_limit_codes` channel that Stage 4
+   added. Do not build a second, parallel completeness mechanism.
+4. A missing or mutated bound asset ends the plan with `BINDING_STALE` and a
+   child plan recording the exclusion. It is never runtime substitution.
+5. A transient outage retries the same binding; that is not replanning.
+6. Planning sessions are durable: page cursors, cooldowns, and partial coverage
+   state survive restart without bypassing quota or silently changing the
+   frozen availability snapshot.
+7. Provider quotas are system-level and shared by planning and fetching.
+8. Secrets are referenced, never embedded in plans, manifests, or logs.
+9. Controller memory stays bounded while manifest shards stream.
+10. Gaps cannot register a complete artifact.
+
+Expected Stage-5 exit evidence:
+
+- payload transfer begins only after derivation and manifest binding;
+- a wind-shaped requirement (still domain-neutral in code) resolves against at
+  least two real direct alternatives;
+- restarting mid-pagination resumes from the persisted cursor;
+- a model whose expansion reveals a second-order data query triggers another
+  discovery round before the availability snapshot freezes; and
+- the bound derivation ID includes the manifest root.
 
 ## Later stages, briefly
 
-- **Stage 5:** progressive acquisition; local plus one remote connector;
-  metadata search; exact immutable `AssetManifest`; identity checks; quotas,
-  timeouts, and coverage; payload bytes only after binding.
 - **Stage 6:** reduced scientific vertical slice and honest evidence-based
   alternatives. This is where the representative planning graph and final
   Stage-3 latency gate can be frozen.
@@ -355,9 +415,13 @@ in there, and push `v2`.
 ## Suggested first prompt on the new machine
 
 ```text
-Read codex_handoff.md completely. Verify branch v2 and Stage-3 commit 36c46a8.
+Read codex_handoff.md completely. Verify branch v2 and Stage-4 commit faf19cd.
 Inspect git status and preserve the listed user-owned dirty files. Read
-stage3/README.md and the Stage-4 roadmap. Run the bounded Stage 0-3 acceptance
-suite without WRF-SFIRE, MPI, Slurm, or remote data. Then critique the Stage-4
-approach and implement only its first exit-gated domain-neutral slice.
+stage3/README.md, stage4/README.md, and the Stage-5 roadmap. Run the full test
+suite (expect 501 passed, 1 skipped, 6 strict xfailed) without WRF-SFIRE, MPI,
+Slurm, or remote data. Then critique the Stage-5 acquisition approach against
+the ten invariants listed in this file and implement only its first exit-gated
+domain-neutral slice. Route any Stage-5 discovery truncation through the
+existing upstream_discovery_complete channel rather than adding a second
+completeness mechanism.
 ```
