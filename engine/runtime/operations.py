@@ -643,8 +643,79 @@ def _acquisition_materialize(parameters: dict[str, Any],
         "a multi-asset manifest must materialize field-json-v1 tiles")
 
 
+def _same_grid(left: dict[str, Any], right: dict[str, Any],
+               context: str) -> None:
+    for key in ("crs", "x", "y", "time"):
+        if left[key] != right[key]:
+            raise ValueError(f"{context} disagree on {key}")
+
+
+def _sole_component(field: dict[str, Any], context: str
+                    ) -> list[list[list[float]]]:
+    components = field["components"]
+    if len(components) != 1:
+        raise ValueError(f"{context} must carry exactly one component")
+    return next(iter(components.values()))
+
+
+def _reduced_downscale(parameters: dict[str, Any],
+                       inputs: dict[str, Any]) -> dict[str, Any]:
+    """A deterministic lightweight model: gain on the coarse field plus support.
+
+    This stands in for a downscaling model.  It is deliberately trivial and
+    meaningless; what matters for Stage 6 is that it is a *model* producer with
+    its own declared evidence and applicability limits, competing against
+    direct data, rather than a semantic transformation.
+    """
+    _exact_keys(parameters, {"gain"}, "reduced-downscale parameters")
+    _exact_keys(inputs, {"coarse", "terrain"}, "reduced-downscale inputs")
+    gain = _finite_number(parameters["gain"], "gain")
+    coarse = _validate_field(inputs["coarse"], "downscale coarse")
+    terrain = _validate_field(inputs["terrain"], "downscale terrain")
+    _same_grid(coarse, terrain, "downscale coarse and terrain")
+    support = _sole_component(terrain, "downscale terrain")
+    components = {
+        name: [[[value * gain + support[t][y][x]
+                 for x, value in enumerate(row)]
+                for y, row in enumerate(plane)]
+               for t, plane in enumerate(tensor)]
+        for name, tensor in coarse["components"].items()
+    }
+    return {"result": _field_with(coarse, components=components)}
+
+
+def _reduced_consequence(parameters: dict[str, Any],
+                         inputs: dict[str, Any]) -> dict[str, Any]:
+    """A four-input reduced consequence model over meaningless quantities.
+
+    Its only job is to be a genuine multi-input producer: the selected flow
+    field, two scalars, and a static field must all be resolved, bound, and
+    executed before it can run.
+    """
+    _exact_keys(parameters, {"threshold"}, "reduced-consequence parameters")
+    _exact_keys(inputs, {"flow", "fuel", "ignition", "terrain"},
+                "reduced-consequence inputs")
+    threshold = _finite_number(parameters["threshold"], "threshold")
+    fuel = _finite_number(inputs["fuel"], "fuel")
+    ignition = _finite_number(inputs["ignition"], "ignition")
+    flow = _validate_field(inputs["flow"], "consequence flow")
+    terrain = _validate_field(inputs["terrain"], "consequence terrain")
+    _same_grid(flow, terrain, "consequence flow and terrain")
+    support = _sole_component(terrain, "consequence terrain")
+    components = {
+        name: [[[min(value * fuel + support[t][y][x] * ignition, threshold)
+                 for x, value in enumerate(row)]
+                for y, row in enumerate(plane)]
+               for t, plane in enumerate(tensor)]
+        for name, tensor in flow["components"].items()
+    }
+    return {"result": _field_with(flow, components=components)}
+
+
 _OPERATIONS: dict[str, tuple[str, Operation, bool]] = {
     "acquisition.materialize.v1": ("1.0.0", _acquisition_materialize, True),
+    "reduced.consequence.v1": ("1.0.0", _reduced_consequence, True),
+    "reduced.downscale.v1": ("1.0.0", _reduced_downscale, True),
     "synthetic.constant.v1": ("1.0.0", _constant, True),
     "synthetic.add.v1": ("1.0.0", _add, True),
     "synthetic.pair.v1": ("1.0.0", _pair, True),

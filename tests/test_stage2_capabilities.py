@@ -167,6 +167,8 @@ def test_implementation_is_minted_and_rechecked_from_closed_registry():
 def test_binder_registry_is_closed_and_stale_refs_are_rejected():
     assert binder_keys() == (
         "acquisition.materialize.bind.v1",
+        "reduced.consequence.bind.v1",
+        "reduced.downscale.bind.v1",
         "synthetic.add.bind.v1",
         "synthetic.constant.bind.v1",
         "synthetic.pair.bind.v1",

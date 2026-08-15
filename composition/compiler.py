@@ -15,13 +15,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable
+from typing import Any, Iterable
 
 from capabilities import (
     ArtifactLeaf,
     BoundInvocation,
     DeploymentCapabilitySnapshot,
     ExecutionProfile,
+    artifact_evidence_subject,
+    invocation_evidence_subject,
 )
 from engine.runtime.identity import strict_hash
 from engine.runtime.operations import operation_component
@@ -38,7 +40,7 @@ from plans import (
     ProducerKind,
     SatisfactionKind,
 )
-from contracts import RequirementUse, direct_match
+from contracts import EvidenceSnapshot, RequirementUse, direct_match
 
 from .oracle import validate_compatibility_record
 
@@ -128,6 +130,7 @@ def compile_bound_plan(
     execution_profiles: Iterable[ExecutionProfile] = (),
     root_uses: Iterable[RequirementUse] = (),
     artifact_leaves: Iterable[ArtifactLeaf] = (),
+    evidence_snapshot: EvidenceSnapshot | None = None,
 ) -> CompilationResult:
     """Compile a validated bound derivation to exactly one task per invocation."""
     if not isinstance(plan, BoundDerivationPlan):
@@ -183,7 +186,7 @@ def compile_bound_plan(
     }
     _validate_plan_shape(
         plan, invocation_by_id, satisfactions, selected, leaf_ids,
-        root_use_by_id, artifact_leaf_by_id)
+        root_use_by_id, artifact_leaf_by_id, evidence_snapshot)
     leaf_consumed_by_invocation = False
     for invocation in invocation_by_id.values():
         for use in invocation.input_uses:
@@ -414,6 +417,7 @@ def _validate_plan_shape(
     selected_leaves: set[str],
     root_uses: dict[str, RequirementUse],
     artifact_leaves: dict[str, ArtifactLeaf],
+    evidence_snapshot: EvidenceSnapshot | None = None,
 ) -> None:
     """Recheck the selected subgraph without trusting optimizer/oracle output."""
     candidate = plan.candidate_plan
@@ -446,13 +450,18 @@ def _validate_plan_shape(
             for output in binding.outputs:
                 record = proof_by_id[output.proof_id]
                 proof = validate_compatibility_record(record)
-                if any(value is not None for value in (
-                        proof.evidence_profile_id,
-                        proof.evidence_snapshot_id,
-                        proof.evidence_subject_id)):
+                evidence_bound = any(value is not None for value in (
+                    proof.evidence_profile_id,
+                    proof.evidence_snapshot_id,
+                    proof.evidence_subject_id))
+                if evidence_bound and evidence_snapshot is None:
+                    # Failing closed remains the right answer when the caller
+                    # cannot supply what direct_match actually used; replaying
+                    # an evidence-bound proof without its evidence would check
+                    # a weaker claim than the one that was selected.
                     raise ValueError(
-                        "evidence-bound proof replay is unsupported without "
-                        "the exact typed evidence inputs used by direct_match")
+                        "evidence-bound proof replay requires the frozen "
+                        "evidence snapshot used by direct_match")
                 if (not proof.satisfied
                         or (typed_use is not None
                             and proof.requirement_id
@@ -470,7 +479,13 @@ def _validate_plan_shape(
                         if value.port_id == output.output_port_id)
                     if proof.descriptor_id != descriptor.descriptor_id:
                         raise ValueError("proof covers another artifact descriptor")
-                    recomputed = direct_match(descriptor, typed_use.requirement)
+                    recomputed = direct_match(
+                        descriptor, typed_use.requirement,
+                        **_evidence_inputs(
+                            proof, evidence_snapshot,
+                            lambda: invocation_evidence_subject(
+                                invocations[output.producer_id],
+                                output.output_port_id)))
                 elif output.producer_id not in selected_leaves:
                     raise ValueError("edge references an unselected artifact leaf")
                 else:
@@ -479,9 +494,13 @@ def _validate_plan_shape(
                         if value.leaf_id == output.producer_id)
                     if proof.descriptor_id != artifact.descriptor_id:
                         raise ValueError("proof covers another artifact descriptor")
+                    leaf = artifact_leaves[output.producer_id]
                     recomputed = direct_match(
-                        artifact_leaves[output.producer_id].descriptor,
-                        typed_use.requirement)
+                        leaf.descriptor, typed_use.requirement,
+                        **_evidence_inputs(
+                            proof, evidence_snapshot,
+                            lambda: artifact_evidence_subject(
+                                leaf, output.output_port_id)))
                 if recomputed.to_dict() != proof.to_dict():
                     raise ValueError(
                         "selected proof does not equal independent direct_match")
@@ -500,6 +519,44 @@ def _validate_plan_shape(
                 not typed_input_uses[use_id].shareable
                 for use_id in consumers if use_id in typed_input_uses):
             raise ValueError("non-shareable producer output is reused")
+
+
+def _evidence_inputs(
+    proof,
+    evidence_snapshot,
+    derive_subject,
+) -> dict[str, Any]:
+    """Rebuild the exact typed evidence inputs one selected proof was made with.
+
+    The recorded identifiers are treated as claims to be checked, not as
+    lookups to be trusted: the profile must really be in the frozen snapshot,
+    the snapshot identity must match, and the subject is *derived* from the
+    producer rather than read from the proof.  A forged evidence reference
+    therefore fails here rather than replaying successfully.
+    """
+    if proof.evidence_profile_id is None:
+        return {}
+    assert evidence_snapshot is not None  # checked by the caller
+    if proof.evidence_snapshot_id != evidence_snapshot.snapshot_id:
+        raise ValueError(
+            "selected proof cites another evidence snapshot")
+    profile = next(
+        (value for value in evidence_snapshot.profiles
+         if value.profile_id == proof.evidence_profile_id), None)
+    if profile is None:
+        raise ValueError(
+            "selected proof cites an evidence profile absent from the "
+            "frozen snapshot")
+    subject = derive_subject()
+    if proof.evidence_subject_id != subject.identity:
+        raise ValueError(
+            "selected proof cites an evidence subject that this producer "
+            "cannot have produced")
+    return {
+        "evidence_profile": profile,
+        "evidence_snapshot": evidence_snapshot,
+        "evidence_subject": subject,
+    }
 
 
 def _root_bindings(

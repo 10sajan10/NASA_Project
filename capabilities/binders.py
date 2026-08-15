@@ -35,6 +35,21 @@ _BINDER_RULES: dict[str, BinderRule] = {
         output_ports=("result",),
         parameter_names=("asset_ids", "manifest_root"),
     ),
+    # Stage 6.  A lightweight model producer and a four-input reduced
+    # consequence model; both are ordinary capabilities with declared evidence,
+    # not transformations.
+    "reduced.consequence.bind.v1": BinderRule(
+        operation_key="reduced.consequence.v1",
+        input_ports=("flow", "fuel", "ignition", "terrain"),
+        output_ports=("result",),
+        parameter_names=("threshold",),
+    ),
+    "reduced.downscale.bind.v1": BinderRule(
+        operation_key="reduced.downscale.v1",
+        input_ports=("coarse", "terrain"),
+        output_ports=("result",),
+        parameter_names=("gain",),
+    ),
     "synthetic.constant.bind.v1": BinderRule(
         operation_key="synthetic.constant.v1",
         input_ports=(),
