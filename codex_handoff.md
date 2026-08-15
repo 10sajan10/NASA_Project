@@ -1,6 +1,6 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-15 (Stage 5 complete)
+Last updated: 2026-08-15 (Stage 6 complete; Composition MVP boundary reached)
 
 This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
@@ -10,17 +10,20 @@ context only.
 
 1. Read this file completely.
 2. Work in `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project`.
-3. Verify branch `v2` and Stage-5 commit `a6e4a5c` before changing anything.
+3. Verify branch `v2` and Stage-6 commit `bf4e360` before changing anything.
 4. Inspect `git status` before edits. Preserve the user-owned dirty files listed
    below and never stage them accidentally.
-5. Read `stage3/README.md`, `stage4/README.md`, `stage5/README.md`, and the
-   Stage-6 section of the external roadmap.
-6. Run only the bounded Stage 0-5 tests initially. Do not run WRF-SFIRE, MPI,
+5. Read `stage4/README.md`, `stage5/README.md`, and `stage6/README.md`, plus
+   the Composition MVP boundary note in the external roadmap.
+6. Run only the bounded Stage 0-6 tests initially. Do not run WRF-SFIRE, MPI,
    Slurm, real remote providers, or other heavy workloads. The Stage-5
    connectors are in-process; nothing in the suite touches a network.
-7. Continue with Stage 6 only after reviewing its evidence invariants. Keep the
-   implementation domain-neutral: wind is an example, not a privileged concept
-   in the architecture.
+7. **Do not start Stage 7.** Stage 6 reached the Composition MVP release
+   boundary, where the roadmap requires a user/scientist review before any
+   scale feature is added. Two findings should lead that review: the Section
+   9.5 planning-latency gate is measured and **missed**, and no real reference
+   observations exist for an evidence pack. Ask the user how they want to
+   handle both before writing code.
 
 ## User's actual objective
 
@@ -57,6 +60,7 @@ and source-versus-model choice. It is not special-cased by the resolver.
   `36c46a8fc9b9cd4620d17089709dea780c8739cc`
 - Stage-4 implementation commit: `e8b4bfd` (post-rewrite; was `faf19cd`)
 - Stage-5 implementation commit: `a6e4a5c`
+- Stage-6 implementation commit: `bf4e360`
 - External roadmap:
   `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/nasa_project_docs/scientific_workflow_composition_plan.md`
 - Original poster:
@@ -254,6 +258,53 @@ See `transformations/`, `stage4/`, `stage4/README.md`, and commit `e8b4bfd`.
 
 See `acquisition/`, `stage5/`, `stage5/README.md`, and `resolution/upstream.py`.
 
+### Stage 6 — dataset versus model, evidence gating, and the latency gate
+
+- Built the four-input reduced-consequence slice the roadmap draws: a result
+  requiring ignition, fuel, terrain, and a contested flow field that a direct
+  observed source and a coarse-source-plus-lightweight-model path both offer.
+  Terrain feeds both the consequence model and the downscaling model, so the
+  shared-input counterexample is executable rather than described.
+- **Evidence gating happens at discovery, not at selection.** Move the model's
+  `EvidenceApplicability` outside the request and it never enters the graph:
+  `direct_match` rejects it, the rejection is recorded, and no constraint or
+  objective can resurrect it. The predicate itself was Stage-2 work; Stage 6
+  makes it executable and reuses the *same* predicate in the decision report
+  rather than a second copy that could drift.
+- Added `objectives/`, implementing Section 6.4's named selection policies.
+  `MINIMUM_COST` is the only automatic objective. `EMPIRICAL_QUALITY` always
+  returns `CHOICE_REQUIRED` with no auto-selected plan.
+- Alternatives are enumerated by **re-solving the whole problem once per
+  candidate producer**, so every presented option is a globally consistent plan
+  with a real cost — necessary because producers share inputs. This is not
+  Pareto enumeration and claims no non-dominance.
+- `ranking_complete` and `nondominance_claimed` are fixed `False` properties,
+  not fields; `from_dict` rejects a payload claiming either.
+- Comparability is refused unless every alternative carries a known claim for
+  the same metric, from the same evaluator and protocol, against the same
+  reference manifest, in the same unit and bound kind, with applicability
+  covering the request. All blocking codes are reported together. Overlapping
+  confidence intervals set `separation_established=False`; missing intervals
+  fall to the safe side.
+- The sharpest property: the fixture's evidence *is* comparable and its
+  intervals *do not overlap*, so a ranking would look defensible — and the
+  system still returns `CHOICE_REQUIRED`.
+- A `ChoiceRecord` is bound to the `report_id` it was made from; a stale choice
+  raises `StaleChoiceError` instead of being applied to a changed world. The
+  accepted decision becomes a `PlanSnapshotRef("objective_decision", …)` and
+  therefore enters `bound_plan_id`: the same invocations chosen by a human and
+  chosen by cost are different plans.
+- **Closed a real compiler gap.** `compile_bound_plan` used to refuse every
+  evidence-bound proof outright. It now accepts an `evidence_snapshot` and
+  replays them faithfully — checking the profile is really in the frozen
+  snapshot, the snapshot identity matches, and deriving the evidence subject
+  from the producer rather than reading it from the proof. Without a snapshot
+  it still fails closed.
+- Added the closed `reduced.downscale.v1` and `reduced.consequence.v1`
+  operations and their binders.
+
+See `objectives/`, `stage6/`, and `stage6/README.md`.
+
 ## Why the global resolver looks this way
 
 Do not replace Stage 3 with independent per-requirement greedy or local top-k
@@ -282,14 +333,24 @@ million-candidate discovery is solved.
 
 ## Verification evidence at handoff
 
-The **entire** repository suite passed at Stage-5 commit `a6e4a5c`:
+The **entire** repository suite passed with Stage 6 in the working tree:
 
 ```text
-574 passed, 1 skipped, 6 xfailed
+617 passed, 1 skipped, 7 xfailed
 ```
 
-(Stage 4 recorded `501 passed, 1 skipped, 6 xfailed`; Stage 5 added 73 tests
-and changed no existing expectation except the closed binder-key list.)
+Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`. Stage 6
+added 43 tests and changed no existing expectation except the closed
+binder-key list.
+
+**The seventh xfail is new and is not a quarantine.** It is the strict-xfail
+Section 9.5 latency gate: a real, measured miss (see the Stage-6 exit evidence
+below). The other six remain the two quarantined WRF decisions and the four
+frozen legacy-runtime defects.
+
+If `stage6/planning_benchmark_v1.json` is ever absent, five benchmark tests
+skip instead of running; re-freeze it with
+`scripts/freeze_stage6_benchmark.py` (about 13 minutes for 30 runs).
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
@@ -333,6 +394,17 @@ The executable Stage-5 proof completed:
 - Stage-1 tasks/attempts `2 / 2`; committed the joined, converted field;
   `SUCCEEDED`
 
+The executable Stage-6 proof completed:
+
+- minimum cost selected the modelled path at cost `11`, rejecting the direct
+  path at `13`; 6 tasks / 6 attempts; committed `21.0`; `SUCCEEDED`
+- the same request outside the model's evidence applicability resolved to the
+  direct source at `13`, with the model **absent from the graph entirely**
+- a quality request returned `CHOICE_REQUIRED` with `auto_selected=false`,
+  despite comparable evidence with disjoint confidence intervals
+- a recorded human choice re-solved to the direct source and changed the bound
+  plan identity
+
 Run any of them only with a fresh node-local temporary directory:
 
 ```bash
@@ -344,6 +416,9 @@ runtime_root=$(mktemp -d /tmp/nasa-stage4-demo.XXXXXX)
 
 runtime_root=$(mktemp -d /tmp/nasa-stage5-demo.XXXXXX)
 .venv/bin/python scripts/run_stage5_demo.py --runtime-root "$runtime_root"
+
+runtime_root=$(mktemp -d /tmp/nasa-stage6-demo.XXXXXX)
+.venv/bin/python scripts/run_stage6_demo.py --runtime-root "$runtime_root"
 ```
 
 Additional evidence:
@@ -404,6 +479,23 @@ Additional evidence:
   node-loss durability and must not be placed on unverified NFS/Lustre storage.
 - Slurm remains a future conditional provider. The development machine is a
   private CHPC node, not a Slurm test environment.
+- **Stage-6 planning latency misses the Section 9.5 target by roughly 5x** on a
+  representative graph. This is the largest known gap at the MVP boundary.
+- Stage-6 evidence is **synthetic fixture data**. Real wind evidence remains
+  unavailable and was not invented; `stage2/wind_evidence_pack_v1.json` is
+  still frozen at `status: UNAVAILABLE`. Nothing in Stage 6 is a claim about
+  ERA5, WRF, or any real wind product.
+- The Stage-6 "lightweight model" is meaningless gain-plus-support arithmetic.
+  It is a model architecturally -- a producer with declared evidence and
+  applicability limits -- not scientifically.
+- Comparability is judged on provenance and applicability, not statistical
+  power. Overlapping intervals are reported; no hypothesis test runs, and the
+  block-bootstrap method is *declared* by the fixture rather than executed.
+- Quality alternatives are include-constrained re-solves, one per candidate
+  producer. Not Pareto enumeration, no non-dominance claim. Only one contested
+  concept per decision report is supported.
+- `quality_under_budget`, `minimum_dependency_latency`, and user-defined
+  lexicographic policies from Section 6.4 remain deferred.
 - WRF-SFIRE is not a current test workload.
 
 ## Stage-4 exit evidence (met)
@@ -479,26 +571,74 @@ Stage-5 scope. Lowering to a capability keeps acquisition inside the ordinary
 selector without touching the compiler, and mirrors how Stage 4 lowered
 transformations.
 
-## Next implementation stage: Stage 6
+## Stage-6 exit evidence (mostly met; one gate MISSED)
 
-Stage 6 is the dataset-versus-model vertical slice and the honest evidence
-story: a lightweight deterministic model competing with direct data, a
-populated `WindEvidencePack-v1` (or one frozen with unavailable metrics and
-stated reasons), and `CHOICE_REQUIRED` for every quality-objective request.
+Six of the seven Stage-6 exit criteria are met and asserted by tests. The
+seventh -- the Section 9.5 planning-latency budget -- was measured and **is not
+met on this node**. It is recorded as a real miss rather than engineered around.
 
-It is also where the representative planning benchmark and the final Stage-3
-latency gate get frozen — the one gate the roadmap has carried as pending since
-Stage 3. Section 9.5 of the roadmap holds the targets.
+Met:
 
-Before editing, note two things Stage 5 leaves on the table for it:
+- **Direct and model-produced sources compete in the global selector.** The
+  modelled path wins at cost 11 against a real direct alternative at 13.
+- **Model output qualifies only where its evidence applies.** Out of scope it
+  is rejected during *discovery* and never becomes a candidate, which is
+  stronger than losing on cost.
+- **`discovery_complete` + `OPTIMAL` really means globally minimum cost** for
+  the frozen graph; the shared terrain input is counted once.
+- **Every quality request returns `CHOICE_REQUIRED`**, including the case where
+  the evidence is comparable and its intervals are disjoint. Comparable metrics
+  are decision support attached to a human's recorded choice, never an
+  automatic quality optimizer.
+- **Full execution follows the selected immutable derivation** -- six tasks,
+  six attempts, committed result, `SUCCEEDED`.
+- **The result retains inputs, outputs, configuration, evidence snapshot, and
+  attempt provenance**, and a recorded choice changes `bound_plan_id`.
 
-- evidence for an acquired artifact is still `evidence:unknown`; Stage 6 is
-  where evidence stops being a placeholder, and it must not invent metrics
-  where no reference exists; and
-- **Composition MVP release boundary.** The roadmap says to stop after Stage 6,
-  run a user/scientist review, and repair correctness or usefulness problems
-  before adding any scale features. Stages 7+ are separately justified post-MVP
-  work, not prerequisites.
+Missed:
+
+- **Warm end-to-end planning does not meet the Section 9.5 target.** On the
+  frozen representative graph (126 invocations, 250 arcs, 6 levels -- all
+  inside the 1,000/5,000/12 caps) the p95 is roughly **23 s against a 5 s
+  budget**. The MILP solve is ~83% of planning time and scales sharply: 30
+  invocations 1.1 s, 64 invocations 5.5 s, 126 invocations ~23 s. Enabling
+  HiGHS presolve helps (4.6 s to 3.1 s solve at 64 invocations) but nowhere
+  near enough, and presolve is off by default because Stage 3 found this build
+  returning a false infeasibility on a valid regression.
+
+  The assertion lives as a **strict xfail** in `tests/test_stage6_benchmark.py`.
+  If solver work ever makes it pass, the suite fails and forces a re-freeze and
+  an updated claim. `test_the_frozen_profile_is_a_real_graph_not_a_toy` asserts
+  a floor on graph size so the gate cannot be met by shrinking the problem.
+
+One design decision worth not re-litigating: the decision record binds into
+`bound_plan_id` through a `PlanSnapshotRef`, not into `CandidateDerivationPlan`
+identity. The roadmap says "candidate-plan identity"; the bound plan is what
+executes, and reaching it this way avoided changing Stage-2 core identity.
+
+## Next: the Composition MVP release boundary -- not Stage 7
+
+The roadmap stops here deliberately: *"stop here, run a user/scientist review,
+and repair correctness or usefulness problems before adding scale features. The
+remaining stages are separately justified post-MVP work, not prerequisites for
+the first usable system."*
+
+**Do not begin Stage 7 without the user's direction.** Bring these two findings
+to the review first:
+
+1. **Planning latency misses its target by roughly 5x** on a representative
+   graph. This is a solver-strategy problem, not a graph-size problem. Options
+   worth costing: re-examining the two-phase cost/tie-break formulation and its
+   solver-call count, the disabled presolve (which needs the Stage-3 HiGHS
+   false-infeasibility bug re-checked against a current build), warm starts,
+   CP-SAT as an alternative backend, or accepting a larger budget and saying so
+   in Section 9.5.
+2. **There is still no real reference observation dataset.**
+   `stage2/wind_evidence_pack_v1.json` remains frozen at `status: UNAVAILABLE`
+   with `NO_REVIEWED_IMMUTABLE_HELD_OUT_REFERENCE`. Stage 6's evidence is
+   synthetic fixture data and is labelled as such everywhere. Populating a real
+   pack needs held-out observations with a reviewed licence and QC policy --
+   a data-acquisition and review task, not a coding task.
 
 ## Later stages, briefly
 
@@ -542,14 +682,19 @@ in there, and push `v2`.
 ## Suggested first prompt on the new machine
 
 ```text
-Read codex_handoff.md completely. Verify branch v2 and Stage-5 commit a6e4a5c.
-Inspect git status and preserve the listed user-owned dirty files. Read stage3/README.md,
-stage4/README.md, stage5/README.md, and the Stage-6 roadmap section. Run the
-full test suite (expect 574 passed, 1 skipped, 6 strict xfailed) without
-WRF-SFIRE, MPI, Slurm, or any real remote provider. Then critique the Stage-6
-evidence approach and implement only its first exit-gated domain-neutral slice.
-Stage 6 also owns the pending representative planning-latency gate from Section
-9.5. Keep routing every discovery truncation through UpstreamCompleteness into
-the existing upstream_discovery_complete channel; do not add a second
-completeness mechanism.
+Read codex_handoff.md completely. Verify branch v2 and Stage-6 commit bf4e360.
+Inspect git status and preserve the listed user-owned dirty files. Read
+stage4/README.md, stage5/README.md, and stage6/README.md. Run the full test
+suite (expect 617 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
+or any real remote provider.
+
+Do NOT start Stage 7. Stage 6 reached the Composition MVP release boundary,
+where the roadmap requires a user/scientist review first. Two findings should
+lead that review: the Section 9.5 planning-latency gate is measured and missed
+(the MILP solve dominates and blows the 5 s p95 budget at ~126 invocations,
+well inside the 1,000-node cap), and no real reference observations exist to
+populate an evidence pack. Ask the user how they want to handle both before
+writing any code. If they direct you to work on latency, treat solver strategy
+as the target, not graph shrinking -- the benchmark deliberately asserts a
+floor on graph size so the gate cannot be gamed.
 ```
