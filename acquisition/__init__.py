@@ -1,0 +1,164 @@
+"""Stage-5 progressive acquisition: metadata search, binding, then bytes.
+
+The ordering this package exists to enforce, in one line:
+
+``search metadata -> assess coverage -> bind an exact manifest -> only then fetch``
+
+Nothing here reaches a network during planning, and nothing fetches payload
+without a :class:`~acquisition.connector.FetchAuthorization` that only a bound
+manifest can mint.
+"""
+
+from .binding import (
+    BindingRejection,
+    BindingRejectionCode,
+    BindingResult,
+    BindingStatus,
+    BindingVerification,
+    BoundAssetManifest,
+    ExclusionChildPlan,
+    StaleReason,
+    StaleReasonCode,
+    bind_manifest,
+    derive_exclusion_plan,
+    verify_binding,
+)
+from .connector import (
+    AssetCandidate,
+    AssetMissingError,
+    AssetMutatedError,
+    CredentialRef,
+    EnvironmentSecretResolver,
+    FetchAuthorization,
+    MetadataPage,
+    MetadataQuery,
+    PermanentSourceError,
+    ProviderClass,
+    SecretResolver,
+    SourceConnector,
+    SourceDescriptor,
+    SourceSearchError,
+    TransientSourceError,
+)
+from .coverage import (
+    CoverageAssessment,
+    CoverageStatus,
+    assess_coverage,
+    expand_bbox,
+    order_assets,
+)
+from .fetch import (
+    BindingStaleError,
+    FetchReceipt,
+    PayloadFetcher,
+    PayloadStore,
+)
+from .lowering import (
+    ACQUISITION_BINDER_KEY,
+    ACQUISITION_OPERATION_KEY,
+    acquisition_capability_id,
+    lower_manifest_to_capability,
+)
+from .manifest import (
+    AssetConditionalIdentity,
+    AssetExtent,
+    AssetManifest,
+    AssetRef,
+    ConditionalIdentityKind,
+    ManifestShard,
+    ManifestShardStore,
+)
+from .quarantine import (
+    IngestionResult,
+    IngestionStatus,
+    SnapshotIngestionPlan,
+    ingest_snapshot,
+)
+from .search import (
+    AcquisitionExpansion,
+    AcquisitionLimitCode,
+    AcquisitionLimitReason,
+    AcquisitionLimits,
+    AcquisitionRequest,
+    AcquisitionSearch,
+    QueryOutcome,
+    SecondOrderQuerySpec,
+    second_order_rule,
+    second_order_rule_keys,
+)
+from .session import (
+    CursorState,
+    PlanningSessionStore,
+    ProviderQuota,
+    QuotaExceededError,
+    QuotaUsage,
+)
+
+__all__ = [
+    "ACQUISITION_BINDER_KEY",
+    "ACQUISITION_OPERATION_KEY",
+    "AcquisitionExpansion",
+    "AcquisitionLimitCode",
+    "AcquisitionLimitReason",
+    "AcquisitionLimits",
+    "AcquisitionRequest",
+    "AcquisitionSearch",
+    "AssetCandidate",
+    "AssetConditionalIdentity",
+    "AssetExtent",
+    "AssetManifest",
+    "AssetMissingError",
+    "AssetMutatedError",
+    "AssetRef",
+    "BindingRejection",
+    "BindingRejectionCode",
+    "BindingResult",
+    "BindingStaleError",
+    "BindingStatus",
+    "BindingVerification",
+    "BoundAssetManifest",
+    "ConditionalIdentityKind",
+    "CoverageAssessment",
+    "CoverageStatus",
+    "CredentialRef",
+    "CursorState",
+    "EnvironmentSecretResolver",
+    "ExclusionChildPlan",
+    "FetchAuthorization",
+    "FetchReceipt",
+    "IngestionResult",
+    "IngestionStatus",
+    "ManifestShard",
+    "ManifestShardStore",
+    "MetadataPage",
+    "MetadataQuery",
+    "PayloadFetcher",
+    "PayloadStore",
+    "PermanentSourceError",
+    "PlanningSessionStore",
+    "ProviderClass",
+    "ProviderQuota",
+    "QueryOutcome",
+    "QuotaExceededError",
+    "QuotaUsage",
+    "SecondOrderQuerySpec",
+    "SecretResolver",
+    "SnapshotIngestionPlan",
+    "SourceConnector",
+    "SourceDescriptor",
+    "SourceSearchError",
+    "StaleReason",
+    "StaleReasonCode",
+    "TransientSourceError",
+    "acquisition_capability_id",
+    "assess_coverage",
+    "bind_manifest",
+    "derive_exclusion_plan",
+    "expand_bbox",
+    "ingest_snapshot",
+    "lower_manifest_to_capability",
+    "order_assets",
+    "second_order_rule",
+    "second_order_rule_keys",
+    "verify_binding",
+]

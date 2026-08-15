@@ -7,12 +7,16 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 from bisect import bisect_right
 from pathlib import Path
 from typing import Any, Callable
 
+from .identity import strict_json_loads
 from .types import ExecutableComponent
+
+ASSET_STORE_ENVIRONMENT = "NASA_STAGE5_ASSET_STORE"
 
 
 Operation = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
@@ -515,7 +519,132 @@ def _vector_uv_to_speed_direction(parameters: dict[str, Any],
     }
 
 
+def _assemble_tiles(tiles: list[dict[str, Any]]) -> dict[str, Any]:
+    """Join single-source tiles along x in bound manifest order.
+
+    This is ordered concatenation of tiles that already agree on CRS, rows, and
+    time — not a general mosaic.  Overlaps and holes raise instead of being
+    blended, because a silently blended seam is indistinguishable from data.
+    """
+    if len(tiles) == 1:
+        return tiles[0]
+    fields = [_validate_field(tile, f"acquired tile[{index}]")
+              for index, tile in enumerate(tiles)]
+    reference = fields[0]
+    for index, field in enumerate(fields[1:], start=1):
+        for key in ("crs", "y", "time"):
+            if field[key] != reference[key]:
+                raise ValueError(
+                    f"acquired tile[{index}] disagrees on {key}; Stage 5 joins "
+                    "only tiles that share rows, CRS, and time")
+        if set(field["components"]) != set(reference["components"]):
+            raise ValueError(
+                f"acquired tile[{index}] has different components")
+    ordered = sorted(fields, key=lambda item: item["x"][0])
+    x: list[float] = []
+    for index, field in enumerate(ordered):
+        if x and field["x"][0] <= x[-1]:
+            raise ValueError(
+                "acquired tiles overlap or repeat along x; the manifest does "
+                "not describe a clean partition")
+        x.extend(field["x"])
+    components: dict[str, list[list[list[float]]]] = {}
+    for name in sorted(reference["components"]):
+        planes: list[list[list[float]]] = []
+        for time_index in range(len(reference["time"])):
+            rows: list[list[float]] = []
+            for y_index in range(len(reference["y"])):
+                row: list[float] = []
+                for field in ordered:
+                    row.extend(field["components"][name][time_index][y_index])
+                rows.append(row)
+            planes.append(rows)
+        components[name] = planes
+    return _field_with(reference, x=x, components=components)
+
+
+def _acquisition_materialize(parameters: dict[str, Any],
+                             inputs: dict[str, Any]) -> dict[str, Any]:
+    """Materialize payload that a Stage-5 manifest binding already fetched.
+
+    This operation never reaches a network.  It reads a local content-addressed
+    store whose location is a *site* property (the environment variable below),
+    while *what* it reads is pinned by the manifest root and asset list in its
+    scientific parameters and by the sha256 of every blob.  Two nodes with
+    different store paths therefore still produce identical results, and a
+    tampered blob fails closed rather than flowing into a commit.
+    """
+    _exact_keys(parameters, {"manifest_root", "asset_ids"},
+                "acquisition-materialize parameters")
+    _exact_keys(inputs, set(), "acquisition-materialize inputs")
+    manifest_root = parameters["manifest_root"]
+    if not isinstance(manifest_root, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", manifest_root):
+        raise ValueError("manifest_root must be a lowercase sha256 digest")
+    asset_ids = parameters["asset_ids"]
+    if (not isinstance(asset_ids, (list, tuple)) or not asset_ids
+            or any(not isinstance(item, str) or not item
+                   for item in asset_ids)):
+        raise ValueError("asset_ids must be a non-empty array of strings")
+
+    root = os.environ.get(ASSET_STORE_ENVIRONMENT, "")
+    if not root:
+        raise RuntimeError(
+            f"{ASSET_STORE_ENVIRONMENT} must name the local asset store")
+    store = Path(root)
+    if not store.is_absolute():
+        raise ValueError(f"{ASSET_STORE_ENVIRONMENT} must be an absolute path")
+
+    receipt_path = store / "receipts" / f"{manifest_root}.json"
+    if not receipt_path.exists():
+        raise RuntimeError(
+            f"no fetch receipt for manifest {manifest_root}; payload transfer "
+            "must complete before materialization")
+    receipt = strict_json_loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(receipt, dict) or \
+            receipt.get("schema") != "stage5-fetch-receipt-v1":
+        raise ValueError("fetch receipt schema is not stage5-fetch-receipt-v1")
+    if receipt.get("manifest_root") != manifest_root:
+        raise ValueError("fetch receipt does not match the requested manifest")
+    digests = receipt.get("asset_digests")
+    if not isinstance(digests, list):
+        raise ValueError("fetch receipt asset digests are malformed")
+    digest_by_asset: dict[str, str] = {}
+    for entry in digests:
+        if (not isinstance(entry, list) or len(entry) != 2
+                or not all(isinstance(item, str) for item in entry)):
+            raise ValueError("fetch receipt asset digests are malformed")
+        digest_by_asset[entry[0]] = entry[1]
+    absent = [item for item in asset_ids if item not in digest_by_asset]
+    if absent:
+        raise RuntimeError(
+            f"the receipt for {manifest_root} is missing assets {sorted(absent)}")
+
+    tiles: list[Any] = []
+    for asset_id in asset_ids:
+        digest = digest_by_asset[asset_id]
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(f"receipt digest for {asset_id!r} is malformed")
+        blob = store / digest[:2] / digest
+        if not blob.exists():
+            raise RuntimeError(f"payload {digest} is absent from the store")
+        payload = blob.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise RuntimeError(
+                f"payload {digest} failed its content check; refusing to "
+                "materialize tampered bytes")
+        tiles.append(strict_json_loads(payload.decode("utf-8")))
+
+    if all(isinstance(item, dict) for item in tiles):
+        return {"result": _assemble_tiles(tiles)}
+    if len(tiles) == 1:
+        return {"result": tiles[0]}
+    raise ValueError(
+        "a multi-asset manifest must materialize field-json-v1 tiles")
+
+
 _OPERATIONS: dict[str, tuple[str, Operation, bool]] = {
+    "acquisition.materialize.v1": ("1.0.0", _acquisition_materialize, True),
     "synthetic.constant.v1": ("1.0.0", _constant, True),
     "synthetic.add.v1": ("1.0.0", _add, True),
     "synthetic.pair.v1": ("1.0.0", _pair, True),

@@ -35,6 +35,7 @@ from .service import (
     ResolutionStatus,
     WorkflowResolver,
 )
+from .upstream import UpstreamCompleteness
 from .validator import (
     ArtifactCommitAttestation,
     ProofReplayContext,
@@ -73,6 +74,7 @@ __all__ = [
     "ResolutionStatus",
     "SelectedPlanValidationReport",
     "SelectionConstraints",
+    "UpstreamCompleteness",
     "ValidationBlocker",
     "ValidationBlockerTree",
     "ValidationCode",

@@ -26,6 +26,15 @@ class BinderRule:
 
 
 _BINDER_RULES: dict[str, BinderRule] = {
+    # Stage 5.  Reads only assets that a manifest already bound: the root and
+    # the asset list are scientific parameters, so a plan that reads different
+    # bytes is a different plan.
+    "acquisition.materialize.bind.v1": BinderRule(
+        operation_key="acquisition.materialize.v1",
+        input_ports=(),
+        output_ports=("result",),
+        parameter_names=("asset_ids", "manifest_root"),
+    ),
     "synthetic.constant.bind.v1": BinderRule(
         operation_key="synthetic.constant.v1",
         input_ports=(),
