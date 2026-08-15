@@ -1,6 +1,6 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-14 (Stage 4 complete)
+Last updated: 2026-08-15 (Stage 5 complete)
 
 This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
@@ -10,16 +10,17 @@ context only.
 
 1. Read this file completely.
 2. Work in `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project`.
-3. Verify branch `v2` and Stage-4 commit `faf19cd` before changing anything.
+3. Verify branch `v2` and Stage-5 commit `a6e4a5c` before changing anything.
 4. Inspect `git status` before edits. Preserve the user-owned dirty files listed
    below and never stage them accidentally.
-5. Read `stage3/README.md`, `stage4/README.md`, and the Stage-5 section of the
-   external roadmap.
-6. Run only the bounded Stage 0-4 tests initially. Do not run WRF-SFIRE, MPI,
-   Slurm, remote acquisition, or other heavy workloads.
-7. Continue with Stage 5 only after reviewing its acquisition and binding
-   invariants. Keep the implementation domain-neutral: wind is an example, not
-   a privileged concept in the architecture.
+5. Read `stage3/README.md`, `stage4/README.md`, `stage5/README.md`, and the
+   Stage-6 section of the external roadmap.
+6. Run only the bounded Stage 0-5 tests initially. Do not run WRF-SFIRE, MPI,
+   Slurm, real remote providers, or other heavy workloads. The Stage-5
+   connectors are in-process; nothing in the suite touches a network.
+7. Continue with Stage 6 only after reviewing its evidence invariants. Keep the
+   implementation domain-neutral: wind is an example, not a privileged concept
+   in the architecture.
 
 ## User's actual objective
 
@@ -54,16 +55,23 @@ and source-versus-model choice. It is not special-cased by the resolver.
 - Active branch: `v2`
 - Stage-3 implementation commit:
   `36c46a8fc9b9cd4620d17089709dea780c8739cc`
-- Stage-4 implementation commit: `faf19cd`
+- Stage-4 implementation commit: `e8b4bfd` (post-rewrite; was `faf19cd`)
+- Stage-5 implementation commit: `a6e4a5c`
 - External roadmap:
   `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/nasa_project_docs/scientific_workflow_composition_plan.md`
 - Original poster:
   `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/nasa_project_docs/diagrams/2026_SCposter_SajanNeupane.pdf`
 
-The roadmap was updated through Stage 3. It explicitly marks the final
-representative Stage-6 planning-latency gate as pending. The roadmap text
-itself has **not** been updated for Stage 4; `stage4/README.md` is the
-authoritative record of what Stage 4 actually delivered.
+The roadmap has been updated through Stage 5, including an execution-status
+block on the Stage-5 section. It still marks the representative Stage-6
+planning-latency gate as pending. `stage4/README.md` and `stage5/README.md`
+remain the authoritative records of what those stages actually delivered.
+
+**Note on the roadmap file.** `scientific_workflow_composition_plan.md` lives in
+a *separate* repository (`nasa_project_docs`, remote
+`https://github.com/10sajan10/nasa_project_docs.git`) and, as of this handoff,
+is still **untracked** there — it has never been committed or pushed. It exists
+only on this node's filesystem. Treat backing it up as a standing task.
 
 ## Files owned by the user: preserve them
 
@@ -194,7 +202,57 @@ See `resolution/`, `stage3/`, and commit `36c46a8`.
   Restricting the request to `SYNTHETIC` origin correctly falls back to the
   direct source instead of transforming silently.
 
-See `transformations/`, `stage4/`, `stage4/README.md`, and commit `faf19cd`.
+See `transformations/`, `stage4/`, `stage4/README.md`, and commit `e8b4bfd`.
+
+### Stage 5 — progressive acquisition, coverage, and real alternatives
+
+- Acquisition became a planning act with a type-enforced order:
+  `search metadata -> assess coverage -> bind an exact manifest -> fetch bytes`.
+  `SourceConnector.search_metadata()` cannot return bytes, and
+  `open_payload()` requires a `FetchAuthorization` whose only constructor is
+  `BoundAssetManifest.authorization()`. The demo measures zero bytes moved
+  while the availability snapshot is being built.
+- `AssetManifest` is summary-only: shard digests, counts, and a root that
+  commits to shard *order*. Assets stream one shard at a time from a
+  content-addressed `ManifestShardStore`, so controller memory tracks shard
+  count rather than asset count.
+- A bound manifest lowers to an ordinary `CapabilitySpec` through
+  `lower_manifest_to_capability()`, exactly as Stage 4 lowered a
+  transformation. Stage 3 again needed **no** acquisition-specific code path,
+  and an acquired artifact competes with conversions and models in one global
+  selection. `manifest_root` and `asset_ids` are scientific parameters, so the
+  manifest identity reaches the bound derivation ID for free.
+- Discovery is a genuine fixed point. A producer's expansion can open a
+  second-order data query — the fixture's model needs support data over the
+  extent the coarse source *actually* returned, which the overhanging tiles
+  make unknowable in round zero — and the snapshot cannot freeze until no new
+  query appears. Second-order rules come from a closed registry keyed by rule
+  ID; a caller cannot supply a callable.
+- **Every Stage-5 truncation feeds the Stage-4 channel, not a new one.**
+  `resolution/upstream.py` adds `UpstreamCompleteness`, which folds discovery
+  layers by conjunction of completeness and union of typed reasons and emits
+  exactly the two keyword arguments `WorkflowResolver` already accepts. It
+  refuses to assemble an inconsistent pair, mirroring the resolver's own rule.
+- Planning sessions are durable. Cursors, candidates, cooldowns, persisted
+  truncation reasons, and a provider quota ledger live in SQLite; a page and
+  its cursor advance commit in one transaction. A restart resumes from the
+  persisted page and cannot re-spend quota it already spent. Only a *whole*
+  search freezes the session; a truncated one stays resumable.
+- Snapshot identity covers what was found and whether the search was whole —
+  manifest roots, completeness, limit reasons — not the pagination history. A
+  resumed search that finds the same assets yields the same snapshot ID.
+- Staleness ends a plan rather than patching it. A mutated or missing bound
+  asset raises `BINDING_STALE` and yields an `ExclusionChildPlan` that records
+  what may not be used again, with no replacement field. A *transient* outage
+  is the opposite case: the same binding is retried, the manifest root does not
+  change, and no metadata search runs.
+- A source with no ETag, version, or checksum is `UNBINDABLE`. It can only be
+  bootstrapped through a quarantined `SnapshotIngestionPlan` that
+  content-hashes what it observed and commits an `ArtifactLeaf`.
+- Secrets are referenced (`CredentialRef`), resolved only at transfer time, and
+  asserted absent from every serialized record.
+
+See `acquisition/`, `stage5/`, `stage5/README.md`, and `resolution/upstream.py`.
 
 ## Why the global resolver looks this way
 
@@ -224,11 +282,14 @@ million-candidate discovery is solved.
 
 ## Verification evidence at handoff
 
-The **entire** repository suite passed at Stage-4 commit `faf19cd`:
+The **entire** repository suite passed at Stage-5 commit `a6e4a5c`:
 
 ```text
-501 passed, 1 skipped, 6 xfailed
+574 passed, 1 skipped, 6 xfailed
 ```
+
+(Stage 4 recorded `501 passed, 1 skipped, 6 xfailed`; Stage 5 added 73 tests
+and changed no existing expectation except the closed binder-key list.)
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
@@ -259,7 +320,20 @@ The executable Stage-4 proof completed:
 - rejected direct alternative at cost `9`
 - Stage-1 tasks/attempts `2 / 2`; committed result `1.5`; `SUCCEEDED`
 
-Run either only with a fresh node-local temporary directory:
+The executable Stage-5 proof completed:
+
+- discovery ran 2 rounds; the second-order query fired before the snapshot froze
+- 3 manifests bound; coverage `COMPLETE` from two tiles
+- bytes transferred during planning: `0`; after binding: `685`
+- binding `FRESH` at transfer time; manifest root present in the bound plan
+- resolution `READY`, validated, globally optimal
+- selected: `acquire:remote-tiled-archive:…` + `transform:example-mps-to-kmph`,
+  cost `5`
+- rejected the pinned local alternative at cost `8`
+- Stage-1 tasks/attempts `2 / 2`; committed the joined, converted field;
+  `SUCCEEDED`
+
+Run any of them only with a fresh node-local temporary directory:
 
 ```bash
 runtime_root=$(mktemp -d /tmp/nasa-stage3-demo.XXXXXX)
@@ -267,6 +341,9 @@ runtime_root=$(mktemp -d /tmp/nasa-stage3-demo.XXXXXX)
 
 runtime_root=$(mktemp -d /tmp/nasa-stage4-demo.XXXXXX)
 .venv/bin/python scripts/run_stage4_demo.py --runtime-root "$runtime_root"
+
+runtime_root=$(mktemp -d /tmp/nasa-stage5-demo.XXXXXX)
+.venv/bin/python scripts/run_stage5_demo.py --runtime-root "$runtime_root"
 ```
 
 Additional evidence:
@@ -284,9 +361,25 @@ Additional evidence:
 
 - Stage 3 uses a finite frozen in-memory catalog. Discovery bounds limit the
   retained graph, not necessarily the work of an eager binder.
-- There is no remote metadata search, durable planning-session cursor,
-  progressive asset binding, payload fetch, generic mosaic, or million-asset
-  manifest yet.
+- **No real network provider has been contacted.** Stage 5's two connectors run
+  in process. They implement the full contract — pagination, conditional
+  identity, mutation, disappearance, transient outages — but a real HTTP/S3
+  connector is not written, and nothing is claimed about live provider
+  behaviour, TLS, or authentication flows.
+- Stage-5 coverage is single-source and axis-aligned. Cross-provider mosaics,
+  coverage atoms, and general polygon unions remain unimplemented; manifest
+  sharding is a two-level digest tree, not a general Merkle structure with
+  inclusion proofs. The largest manifest exercised is 2,000 assets, so
+  million-asset discovery is still not claimed.
+- `acquisition.materialize.v1` reads a local content-addressed store whose
+  location comes from the `NASA_STAGE5_ASSET_STORE` environment variable. What
+  it reads is pinned by manifest root, asset list, and per-blob sha256, so the
+  result does not depend on the path — but the operation is not pure over its
+  parameters alone. This is a deliberate, documented exception.
+- Stage-5 transfer is single-threaded and per-asset: no parallel fetch, range
+  requests, or resume mid-asset. Provider quota is one SQLite ledger on one
+  node, not a distributed quota. Connector deadlines are checked between pages,
+  not as cancellation of an in-flight request.
 - `direct_match()` still performs no conversion, reprojection, interpolation,
   regridding, filling, or vector transformation. As of Stage 4 those exist as
   explicit declared capabilities; nothing became implicit.
@@ -332,49 +425,83 @@ ten Stage-4 invariants was checked against the implementation:
 - Domain-neutral scalar and vector fixtures only; no resolver code depends on
   any concept meaning.
 
-## Next implementation stage: Stage 5
+## Stage-5 exit evidence (met)
 
-Stage 5 introduces progressive acquisition: local plus one remote connector,
-metadata-only search, coverage alternatives, exact immutable `AssetManifest`
-binding, and payload bytes fetched **only after** binding.
+Each of the ten Stage-5 invariants was checked against the implementation, and
+each expected exit criterion is asserted by a test rather than only observed in
+the demo:
 
-Before editing, critique the Stage-5 design against these invariants:
+1. **Metadata search never fetches payload bytes.** Enforced by types:
+   `search_metadata()` cannot return bytes, and `open_payload()` requires an
+   unforgeable `FetchAuthorization`. Byte counters read zero at snapshot freeze.
+2. **No stable conditional identity means `UNBINDABLE`.** Such candidates are
+   named, never silently dropped, and only the quarantined
+   `SnapshotIngestionPlan` can content-address and commit them.
+3. **Truncation flows through the existing channel.** `UpstreamCompleteness`
+   folds acquisition and transformation layers into the same two resolver
+   arguments Stage 4 added. No second completeness mechanism was built.
+4. **A missing or mutated bound asset ends the plan.** `BINDING_STALE` plus an
+   `ExclusionChildPlan` with no replacement field; the surviving neighbour is
+   never promoted to cover for the excluded one.
+5. **A transient outage retries the same binding.** Same manifest root, same
+   asset set, zero additional metadata searches.
+6. **Planning sessions are durable.** Cursors, candidates, cooldowns, and limits
+   survive restart; resumption re-reads only the remaining pages; only a whole
+   search freezes the session, and re-freezing at a different snapshot raises.
+7. **Quota is system-level.** One provider ledger debited by both search and
+   transfer, surviving restart so a resumed session cannot re-spend.
+8. **Secrets are referenced, never embedded.** A test asserts the secret value
+   is absent from every serialized expansion, manifest, and descriptor.
+9. **Controller memory stays bounded.** The manifest holds only shard digests;
+   a 2,000-asset manifest streams with at most one shard resident.
+10. **Gaps cannot register a complete artifact.** A hole is a typed
+    `SPATIAL_GAP`/`TEMPORAL_GAP` that refuses to bind, and lowering rejects a
+    descriptor claiming `COMPLETE` missingness over incomplete coverage.
 
-1. Metadata search never fetches payload bytes. Binding precedes transfer.
-2. A remote source without stable conditional identity (ETag/version/checksum)
-   is `UNBINDABLE` for a scientific run. It may only be bootstrapped through a
-   separate quarantined `SnapshotIngestionPlan` whose bytes cannot satisfy a
-   scientific requirement until committed as an `ArtifactLeaf`.
-3. Discovery truncation -- page limits, asset caps, plan-count caps, timeouts,
-   provider cooldowns -- **must** flow into the resolver through the existing
-   `upstream_discovery_complete` / `upstream_limit_codes` channel that Stage 4
-   added. Do not build a second, parallel completeness mechanism.
-4. A missing or mutated bound asset ends the plan with `BINDING_STALE` and a
-   child plan recording the exclusion. It is never runtime substitution.
-5. A transient outage retries the same binding; that is not replanning.
-6. Planning sessions are durable: page cursors, cooldowns, and partial coverage
-   state survive restart without bypassing quota or silently changing the
-   frozen availability snapshot.
-7. Provider quotas are system-level and shared by planning and fetching.
-8. Secrets are referenced, never embedded in plans, manifests, or logs.
-9. Controller memory stays bounded while manifest shards stream.
-10. Gaps cannot register a complete artifact.
+Exit criteria:
 
-Expected Stage-5 exit evidence:
-
-- payload transfer begins only after derivation and manifest binding;
-- a wind-shaped requirement (still domain-neutral in code) resolves against at
-  least two real direct alternatives;
-- restarting mid-pagination resumes from the persisted cursor;
+- payload transfer begins only after binding — **met** (0 bytes during planning);
+- a wind-shaped requirement resolves against at least two real direct
+  alternatives — **met** (pinned local at cost 8 versus remote tiles at cost 3
+  plus a declared cost-2 conversion, with an admissible model alternative at 8
+  losing on cost rather than on feasibility);
+- restarting mid-pagination resumes from the persisted cursor — **met**;
 - a model whose expansion reveals a second-order data query triggers another
-  discovery round before the availability snapshot freezes; and
-- the bound derivation ID includes the manifest root.
+  discovery round before the snapshot freezes — **met** (2 rounds); and
+- the bound derivation ID includes the manifest root — **met** (`manifest_root`
+  is a scientific parameter of the acquisition capability).
+
+One design decision worth not re-litigating: acquisition lowers to an
+executable *capability*, not to an `ArtifactLeaf`. That was deliberate. The
+Stage-1 compiler still fails closed on a selected external leaf feeding an
+invocation (`BRIDGE_EXTERNAL_LEAF_UNSUPPORTED`), and fixing that bridge is not
+Stage-5 scope. Lowering to a capability keeps acquisition inside the ordinary
+selector without touching the compiler, and mirrors how Stage 4 lowered
+transformations.
+
+## Next implementation stage: Stage 6
+
+Stage 6 is the dataset-versus-model vertical slice and the honest evidence
+story: a lightweight deterministic model competing with direct data, a
+populated `WindEvidencePack-v1` (or one frozen with unavailable metrics and
+stated reasons), and `CHOICE_REQUIRED` for every quality-objective request.
+
+It is also where the representative planning benchmark and the final Stage-3
+latency gate get frozen — the one gate the roadmap has carried as pending since
+Stage 3. Section 9.5 of the roadmap holds the targets.
+
+Before editing, note two things Stage 5 leaves on the table for it:
+
+- evidence for an acquired artifact is still `evidence:unknown`; Stage 6 is
+  where evidence stops being a placeholder, and it must not invent metrics
+  where no reference exists; and
+- **Composition MVP release boundary.** The roadmap says to stop after Stage 6,
+  run a user/scientist review, and repair correctness or usefulness problems
+  before adding any scale features. Stages 7+ are separately justified post-MVP
+  work, not prerequisites.
 
 ## Later stages, briefly
 
-- **Stage 6:** reduced scientific vertical slice and honest evidence-based
-  alternatives. This is where the representative planning graph and final
-  Stage-3 latency gate can be frozen.
 - **Stage 7:** lazy partition/collection runtime with bounded admission and
   `10^4`-partition correctness.
 - **Stage 8:** resource-aware local/fixed-allocation scheduling and placement.
@@ -415,13 +542,14 @@ in there, and push `v2`.
 ## Suggested first prompt on the new machine
 
 ```text
-Read codex_handoff.md completely. Verify branch v2 and Stage-4 commit faf19cd.
-Inspect git status and preserve the listed user-owned dirty files. Read
-stage3/README.md, stage4/README.md, and the Stage-5 roadmap. Run the full test
-suite (expect 501 passed, 1 skipped, 6 strict xfailed) without WRF-SFIRE, MPI,
-Slurm, or remote data. Then critique the Stage-5 acquisition approach against
-the ten invariants listed in this file and implement only its first exit-gated
-domain-neutral slice. Route any Stage-5 discovery truncation through the
-existing upstream_discovery_complete channel rather than adding a second
+Read codex_handoff.md completely. Verify branch v2 and Stage-5 commit a6e4a5c.
+Inspect git status and preserve the listed user-owned dirty files. Read stage3/README.md,
+stage4/README.md, stage5/README.md, and the Stage-6 roadmap section. Run the
+full test suite (expect 574 passed, 1 skipped, 6 strict xfailed) without
+WRF-SFIRE, MPI, Slurm, or any real remote provider. Then critique the Stage-6
+evidence approach and implement only its first exit-gated domain-neutral slice.
+Stage 6 also owns the pending representative planning-latency gate from Section
+9.5. Keep routing every discovery truncation through UpstreamCompleteness into
+the existing upstream_discovery_complete channel; do not add a second
 completeness mechanism.
 ```
