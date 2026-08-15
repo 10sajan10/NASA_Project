@@ -44,6 +44,54 @@ _BINDER_RULES: dict[str, BinderRule] = {
         output_ports=("result",),
         parameter_names=(),
     ),
+    "transform.unit_affine.bind.v1": BinderRule(
+        operation_key="transform.unit_affine.v1",
+        input_ports=("source",),
+        output_ports=("result",),
+        parameter_names=("factor", "offset"),
+    ),
+    "transform.spatial_subset.bind.v1": BinderRule(
+        operation_key="transform.spatial_subset.v1",
+        input_ports=("source",),
+        output_ports=("result",),
+        parameter_names=("x_start", "x_stop", "y_start", "y_stop"),
+    ),
+    "transform.temporal_subset.bind.v1": BinderRule(
+        operation_key="transform.temporal_subset.v1",
+        input_ports=("source",),
+        output_ports=("result",),
+        parameter_names=("start", "stop"),
+    ),
+    "transform.temporal_align.bind.v1": BinderRule(
+        operation_key="transform.temporal_align.v1",
+        input_ports=("source",),
+        output_ports=("result",),
+        parameter_names=("count", "start_index", "step"),
+    ),
+    "transform.regrid_bilinear.bind.v1": BinderRule(
+        operation_key="transform.regrid_bilinear.v1",
+        input_ports=("source",),
+        output_ports=("result",),
+        parameter_names=("target_x", "target_y"),
+    ),
+    "transform.reproject_bilinear.bind.v1": BinderRule(
+        operation_key="transform.reproject_bilinear.v1",
+        input_ports=("source",),
+        output_ports=("result",),
+        parameter_names=("source_crs", "target_crs", "target_x", "target_y"),
+    ),
+    "transform.vector_rotate.bind.v1": BinderRule(
+        operation_key="transform.vector_rotate.v1",
+        input_ports=("source",),
+        output_ports=("result",),
+        parameter_names=("angle_degrees",),
+    ),
+    "transform.vector_uv_to_speed_direction.bind.v1": BinderRule(
+        operation_key="transform.vector_uv_to_speed_direction.v1",
+        input_ports=("source",),
+        output_ports=("speed", "direction"),
+        parameter_names=(),
+    ),
 }
 
 

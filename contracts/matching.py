@@ -40,6 +40,7 @@ class CheckStatus(str, Enum):
 
 class MatchCode(str, Enum):
     MATCH = "MATCH"
+    DESCRIPTOR_IDENTITY_MISMATCH = "DESCRIPTOR_IDENTITY_MISMATCH"
     CONCEPT_MISMATCH = "CONCEPT_MISMATCH"
     SCHEMA_VERSION_MISMATCH = "SCHEMA_VERSION_MISMATCH"
     REPRESENTATION_MISMATCH = "REPRESENTATION_MISMATCH"
@@ -249,6 +250,11 @@ def direct_match(
             "Requirement.required_regimes")
     regimes = requirement.required_regimes
 
+    checks.append(_check(
+        "descriptor_identity",
+        (requirement.exact_descriptor_id is None
+         or descriptor.descriptor_id == requirement.exact_descriptor_id),
+        MatchCode.DESCRIPTOR_IDENTITY_MISMATCH))
     checks.append(_check("concept", descriptor.concept_id == requirement.concept_id,
                          MatchCode.CONCEPT_MISMATCH))
     checks.append(_check(

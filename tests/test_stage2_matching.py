@@ -160,6 +160,29 @@ def test_exact_match_is_stable_and_round_trips() -> None:
     assert first.to_dict() == second.to_dict()
     assert CompatibilityProof.from_dict(first.to_dict()) == first
     assert CompatibilityProof.identity_schema == "compatibility-proof-v1"
+    assert Requirement.identity_schema == "requirement-v3"
+
+
+def test_exact_descriptor_requirement_is_a_closed_transform_input_boundary() -> None:
+    offered = descriptor()
+    exact = replace(requirement(), exact_descriptor_id=offered.descriptor_id)
+
+    assert direct_match(offered, exact).satisfied
+
+    scientifically_compatible_but_distinct = replace(
+        offered,
+        intrinsic_uncertainty=IntrinsicUncertainty.unknown(
+            "DIFFERENT_DECLARED_UNCERTAINTY"),
+    )
+    proof = direct_match(scientifically_compatible_but_distinct, exact)
+    assert not proof.satisfied
+    assert MatchCode.DESCRIPTOR_IDENTITY_MISMATCH in codes(proof)
+    assert Requirement.from_dict(exact.to_dict()) == exact
+
+    malformed = exact.to_dict()
+    malformed["exact_descriptor_id"] = "not-a-digest"
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        Requirement.from_dict(malformed)
 
 
 def test_intrinsic_and_estimate_uncertainty_are_distinct_stable_contracts() -> None:

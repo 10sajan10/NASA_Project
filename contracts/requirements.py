@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 from typing import Any
 
 from .identity import (
@@ -383,8 +384,9 @@ class Requirement(ScientificIdentity):
     missing_policy: MissingPolicy
     minimum_evidence: EvidenceRequirement = field(default_factory=EvidenceRequirement)
     required_regimes: tuple[str, ...] = ()
+    exact_descriptor_id: str | None = None
 
-    identity_schema = "requirement-v2"
+    identity_schema = "requirement-v3"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "concept_id", required_text(
@@ -422,6 +424,12 @@ class Requirement(ScientificIdentity):
         object.__setattr__(self, "allowed_origins", origins)
         object.__setattr__(self, "required_regimes", sorted_unique_text(
             self.required_regimes, "required evidence regimes"))
+        if self.exact_descriptor_id is not None:
+            if (not isinstance(self.exact_descriptor_id, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", self.exact_descriptor_id)
+                    is None):
+                raise ValueError(
+                    "exact_descriptor_id must be a lowercase SHA-256 digest")
         # Unit constraints normalize spelling without doing conversions.
         if self.units.mode is not ConstraintMode.ANY:
             object.__setattr__(self, "units", ValueConstraint(
@@ -441,6 +449,7 @@ class Requirement(ScientificIdentity):
                 "allowed_origins", "max_native_resolution",
                 "max_effective_resolution", "missing_policy",
                 "minimum_evidence", "required_regimes",
+                "exact_descriptor_id",
             ),
             "Requirement",
         )
@@ -467,6 +476,7 @@ class Requirement(ScientificIdentity):
             minimum_evidence=EvidenceRequirement.from_dict(value["minimum_evidence"]),
             required_regimes=require_sequence(
                 value["required_regimes"], "Requirement.required_regimes"),
+            exact_descriptor_id=value["exact_descriptor_id"],
         )
 
 

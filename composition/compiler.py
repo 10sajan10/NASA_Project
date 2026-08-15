@@ -344,7 +344,7 @@ def compile_bound_plan(
             outputs=tuple(OutputSpec(
                 name=output.port_id,
                 media_type="application/json",
-                validation={"kind": "finite_json"},
+                validation=_output_validation(invocation, output),
             ) for output in invocation.outputs),
             resources=resource,
         ))
@@ -553,6 +553,42 @@ def _validate_executable_output_representations(
                     f"{output.descriptor.representation!r} for invocation "
                     f"{invocation.invocation_key} port {output.port_id!r}; "
                     "Stage-2 finite_json lowering requires application/json")
+
+
+def _output_validation(invocation: BoundInvocation, output) -> dict[str, object]:
+    """Lower a typed field descriptor to the narrow Stage-4 commit validator."""
+    descriptor = output.descriptor
+    if descriptor.schema_version != "field-json-v1":
+        return {"kind": "finite_json"}
+    if descriptor.grid is None:
+        raise ValueError(
+            "field-json-v1 executable output requires an exact grid descriptor")
+    if (descriptor.grid.crs != descriptor.spatial_support.crs
+            or descriptor.grid.axis_order
+            != descriptor.spatial_support.axis_order):
+        raise ValueError(
+            "field-json-v1 grid and spatial support CRS/axes disagree")
+    temporal = descriptor.temporal_support
+    component_names: list[str] = []
+    if invocation.implementation.operation_key == "transform.vector_rotate.v1":
+        component_names = ["u", "v"]
+    elif (invocation.implementation.operation_key
+          == "transform.vector_uv_to_speed_direction.v1"):
+        component_names = [output.port_id]
+    return {
+        "kind": "field_json_v1",
+        "descriptor_id": descriptor.descriptor_id,
+        "crs": descriptor.spatial_support.crs,
+        "grid_shape": list(descriptor.grid.shape),
+        "grid_affine": list(descriptor.grid.affine),
+        "temporal": {
+            "kind": temporal.kind.value,
+            "start": temporal.start,
+            "end": temporal.end,
+            "cadence_s": temporal.cadence_s,
+        },
+        "component_names": component_names,
+    }
 
 
 def _topological_invocations(

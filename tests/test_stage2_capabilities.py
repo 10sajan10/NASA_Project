@@ -169,6 +169,14 @@ def test_binder_registry_is_closed_and_stale_refs_are_rejected():
         "synthetic.add.bind.v1",
         "synthetic.constant.bind.v1",
         "synthetic.pair.bind.v1",
+        "transform.regrid_bilinear.bind.v1",
+        "transform.reproject_bilinear.bind.v1",
+        "transform.spatial_subset.bind.v1",
+        "transform.temporal_align.bind.v1",
+        "transform.temporal_subset.bind.v1",
+        "transform.unit_affine.bind.v1",
+        "transform.vector_rotate.bind.v1",
+        "transform.vector_uv_to_speed_direction.bind.v1",
     )
     reference = BinderRef.from_key("synthetic.pair.bind.v1")
     assert reference.verify_current().output_ports == ("left", "right")

@@ -88,10 +88,21 @@ class ResolutionOutcome:
     require_proven_optimal: bool
     eligible_for_binding: bool
     metrics: PlanningMetrics
+    # Truncation reported by discovery that ran *before* this resolver and
+    # produced its catalog (Stage-4 transformation closure, later Stage-5
+    # remote search).  Empty means no upstream limit fired.
+    upstream_limit_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ResolutionStatus):
             raise TypeError("resolution status must be ResolutionStatus")
+        if (not isinstance(self.upstream_limit_codes, tuple)
+                or any(not isinstance(value, str) or not value.strip()
+                       for value in self.upstream_limit_codes)
+                or self.upstream_limit_codes
+                != tuple(sorted(set(self.upstream_limit_codes)))):
+            raise ValueError(
+                "upstream limit codes must be unique, sorted, non-empty text")
         if type(self.require_proven_optimal) is not bool:
             raise TypeError("require_proven_optimal must be bool")
         if type(self.eligible_for_binding) is not bool:
@@ -126,6 +137,7 @@ class ResolutionOutcome:
                 self.validation.report_id if self.validation else None),
             "require_proven_optimal": self.require_proven_optimal,
             "eligible_for_binding": self.eligible_for_binding,
+            "upstream_limit_codes": list(self.upstream_limit_codes),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -136,7 +148,18 @@ class ResolutionOutcome:
             "hypergraph_id": self.hypergraph.graph_id,
             "selector_problem_id": self.selector_problem.problem_id,
             "discovery": {
-                "complete": self.hypergraph.discovery_complete,
+                # ``complete`` is the effective value the optimality claim
+                # rests on: this resolver's own expansion *and* any upstream
+                # discovery that produced its catalog.
+                # ``complete`` is what the optimality claim rests on;
+                # ``graph_expansion_complete`` isolates this resolver's own
+                # expansion so an upstream truncation stays attributable.
+                # Upstream completeness is not re-derived from these two: a
+                # conjunction cannot be inverted, and the limit codes below
+                # already name every truncation that actually fired.
+                "complete": self.selection.discovery_complete,
+                "graph_expansion_complete": self.hypergraph.discovery_complete,
+                "upstream_limit_codes": list(self.upstream_limit_codes),
                 "requirements": len(self.hypergraph.requirement_nodes),
                 "uses": len(self.hypergraph.use_nodes),
                 "invocations": len(self.hypergraph.invocation_nodes),
@@ -199,18 +222,39 @@ class WorkflowResolver:
         availability_snapshot: ArtifactAvailabilitySnapshot | None = None,
         evidence_snapshot: EvidenceSnapshot | None = None,
         discovery_limits: DiscoveryLimits = DiscoveryLimits(),
+        upstream_discovery_complete: bool = True,
+        upstream_limit_codes: Iterable[str] = (),
     ) -> None:
         if not isinstance(catalog, CapabilityCatalog):
             raise TypeError("catalog must be CapabilityCatalog")
         if not isinstance(deployment_snapshot, DeploymentCapabilitySnapshot):
             raise TypeError(
                 "deployment_snapshot must be DeploymentCapabilitySnapshot")
+        if type(upstream_discovery_complete) is not bool:
+            raise TypeError("upstream_discovery_complete must be bool")
+        codes = tuple(upstream_limit_codes)
+        if any(not isinstance(value, str) or not value.strip()
+               for value in codes):
+            raise TypeError("upstream limit codes must be non-empty text")
+        if upstream_discovery_complete and codes:
+            raise ValueError(
+                "complete upstream discovery cannot report limit codes")
+        if not upstream_discovery_complete and not codes:
+            raise ValueError(
+                "incomplete upstream discovery must name its limit codes")
         self.catalog = catalog
         self.deployment_snapshot = deployment_snapshot
         self.artifact_leaves = tuple(artifact_leaves)
         self.availability_snapshot = availability_snapshot
         self.evidence_snapshot = evidence_snapshot
         self.discovery_limits = discovery_limits
+        # Discovery performed before this resolver — Stage-4 transformation
+        # closure today, Stage-5 remote metadata search later — may itself be
+        # truncated.  A selection that is optimal over a catalog which is
+        # missing candidates is not globally optimal, so upstream truncation
+        # has to reach the same completeness flag the graph builder feeds.
+        self.upstream_discovery_complete = upstream_discovery_complete
+        self.upstream_limit_codes = tuple(sorted(set(codes)))
 
     def resolve(
         self,
@@ -243,11 +287,14 @@ class WorkflowResolver:
         selector_problem = project_oracle_problem(graph)
         projection_ns = perf_counter_ns() - projection_started
 
+        discovery_complete = (
+            graph.discovery_complete and self.upstream_discovery_complete)
         selection_request = MilpSelectionProblem.bind(
             selector_problem,
-            discovery_complete=graph.discovery_complete,
+            discovery_complete=discovery_complete,
             discovery_limit_codes=(
-                value.code.value for value in graph.limit_reasons),
+                tuple(value.code.value for value in graph.limit_reasons)
+                + self.upstream_limit_codes),
             deployment_options=_deployment_options(graph),
             constraints=request_constraints,
         )
@@ -258,7 +305,7 @@ class WorkflowResolver:
         validation_started = perf_counter_ns()
         validation = self._validate(
             root_values, graph, selector_problem, selection,
-            request_constraints)
+            request_constraints, discovery_complete)
         validation_ns = perf_counter_ns() - validation_started
 
         structurally_valid = validation is not None and validation.valid
@@ -274,10 +321,12 @@ class WorkflowResolver:
             status = ResolutionStatus.INVALID_SELECTION
         elif selection.status is MilpStatus.UNSATISFIABLE:
             # Infeasible over a truncated candidate universe is epistemically
-            # unknown, never proof that no derivation exists.
+            # unknown, never proof that no derivation exists.  Truncation
+            # upstream of this resolver counts the same as truncation inside
+            # its own graph expansion.
             status = (
                 ResolutionStatus.UNSATISFIABLE
-                if graph.discovery_complete else ResolutionStatus.INCOMPLETE)
+                if discovery_complete else ResolutionStatus.INCOMPLETE)
         elif selection.status is MilpStatus.LIMIT_NO_INCUMBENT:
             status = ResolutionStatus.INCOMPLETE
         elif selection.status is MilpStatus.ERROR:
@@ -313,6 +362,7 @@ class WorkflowResolver:
             "require_proven_optimal": require_proven_optimal,
             "eligible_for_binding": eligible,
             "metrics": metrics,
+            "upstream_limit_codes": self.upstream_limit_codes,
         }
         for name, value in identity_values.items():
             object.__setattr__(provisional, name, value)
@@ -326,6 +376,7 @@ class WorkflowResolver:
         selector_problem: OracleProblem,
         selection: MilpSelectionResult,
         constraints: SelectionConstraints,
+        candidate_universe_complete: bool,
     ) -> SelectedPlanValidationReport | None:
         plan = selection.plan
         if plan is None:
@@ -352,7 +403,7 @@ class WorkflowResolver:
                 plan, self.evidence_snapshot),
             artifact_availability_snapshot=self.availability_snapshot,
             constraints=_validator_constraints(constraints),
-            candidate_universe_complete=graph.discovery_complete,
+            candidate_universe_complete=candidate_universe_complete,
         )
 
 
