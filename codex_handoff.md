@@ -1,6 +1,7 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-16 (audit remediation + Stage 9A-Core; MVP review outstanding)
+Last updated: 2026-08-16 (Stage 9A-Core, then the Stage-9B placement
+prerequisite; Stage 9B itself is blocked; MVP review outstanding)
 
 This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
@@ -514,6 +515,68 @@ provider), job-script generation from a `TaskTemplate`, the MPI gang task, all
 of 9A-Scale arrays, and the cluster control-state deployment decision that
 opens the 9A-Core build list. See `stage9a/README.md`.
 
+## Stage 9B — blocked; its 253/1001 blocker is now typed
+
+**Stage 9B has not started.** Its roadmap gates all fail: no R1 golden fixture
+is promoted (`stage0/wrf_interface_audit.md`: *"no run is promoted as a trusted
+golden scientific fixture in Stage 0"*), no R2/R2A real-data lane exists, and
+no provider is certified — Stage 9A is simulated only. Starting 9B anyway would
+mean using WRF as the first runtime correctness test, which the roadmap
+explicitly forbids.
+
+What was built is the one prerequisite that needs no cluster, no WRF binary,
+and no invented fixture: the placement contract for the recurrent 253/1001
+defect that the Stage-0 audit calls *"a blocker for WRF output publication."*
+
+The recorded failure, from
+`logs/20260708_005323_cascade_20190904T120000_targets.json`: `arrival_s: array
+shape (253, 253) != grid (1001, 1001)`, `dead_letter: true`, after
+`elapsed_s: 174849.76` — **48.6 hours of compute lost to a shape comparison**,
+across three separate logs.
+
+Two faults, and only one is about shapes.
+
+*Wrong time.* `cube/store.py` compares shapes at write time, which is the last
+thing a run does. Placement depends only on the two grid **descriptors**, so it
+is decidable before any core-hour is spent. `contracts/placement.py` is pure
+and allocates nothing; `cube/preflight.py` runs it over a whole publication
+plan up front and reports every blocking variable at once, so a doomed run is
+not rediscovered one relaunch at a time.
+
+*Wrong question.* Shape answers placement in neither direction: a 100 m fire
+mesh and a 900 m cube differ in shape and place exactly (900/100 = 9), while
+two 1001×1001 grids in different CRSs share a shape and do not place at all.
+`assess_placement` therefore returns a typed verdict naming the relationship —
+`EXACT_MATCH`, `INTEGER_REFINEMENT`, `INTEGER_COARSENING`,
+`REQUIRES_DECLARED_RESAMPLING`, `UNDEFINED_NO_GEOREFERENCE`, `CRS_MISMATCH`,
+`AXIS_ORDER_MISMATCH`, `ROTATED_OR_SKEWED`, `DEGENERATE_GRID`,
+`OUTSIDE_TARGET_EXTENT`. Only the first three are `placeable`;
+`REQUIRES_DECLARED_RESAMPLING` deliberately is not, because that data is usable
+only through an explicit Stage-4 transformation with its own cost and
+assumptions. Treating it as placeable is how a silent regrid gets back in.
+
+The recorded case is `UNDEFINED_NO_GEOREFERENCE`. The old error text naming two
+shapes and nothing else *is* the evidence: two shapes were all the failure site
+had, because the producer declared no georeference. The real geometry shows why
+no reshape would have been correct — `outputs.pixel_m: 900`,
+`domain.resolutions_m` ending at a 1000 m nest, `domain.fire_mesh_ratio: 10`
+giving 100 m fire cells. 1000 m against 900 m is not an integer ratio either
+way, and the 253 km nest covers a fraction of the 900.9 km cube. Code that had
+"successfully" reshaped (253,253) into (1001,1001) would have published a
+silently wrong answer, which is worse than the dead-letter.
+
+Exactness is enforced, not assumed: an aligned 9× refinement is only exact when
+the source spans whole 9-cell blocks. 253 is 28 blocks plus one cell, so the
+edge target cell is partly covered and that case is refused as well.
+
+Not done: nothing resamples here; `cube/store.py` is not wired to the preflight
+(its write-time check remains the last line of defence); no WRF output was
+inspected, and the producer-side declaration belongs in the user-owned
+`models/wrf_sfire_adapter.py`, which was not touched — that declaration is the
+remaining half of the fix. Vertical and temporal placement are out of scope,
+and Stage 9B remains blocked on R1 and provider certification. See
+`stage9b/README.md`.
+
 ## Why the global resolver looks this way
 
 Do not replace Stage 3 with independent per-requirement greedy or local top-k
@@ -542,14 +605,15 @@ million-candidate discovery is solved.
 
 ## Verification evidence at handoff
 
-The **entire** repository suite passes after the audit remediation:
+The **entire** repository suite passes:
 
 ```text
-744 passed, 1 skipped, 7 xfailed
+772 passed, 1 skipped, 7 xfailed
 ```
 
 Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`,
-Stage 7 `662/1/7`, Stage 8 `691/1/7`, audit remediation `718/1/7`.
+Stage 7 `662/1/7`, Stage 8 `691/1/7`, audit remediation `718/1/7`,
+Stage 9A-Core `744/1/7`, placement contract `772/1/7`.
 
 **The seventh xfail is new and is not a quarantine.** It is the strict-xfail
 Section 9.5 latency gate: a real, measured miss (see the Stage-6 exit evidence
@@ -720,6 +784,12 @@ Additional evidence:
   SLURM submit environment, so real-cluster behaviour -- accounting lag,
   `sacct` purge windows, QOS rejection, federation job-ID suffixes -- is
   entirely unverified.
+- **The 253/1001 fix is half done.** `contracts/placement.py` can decide any
+  publication, but only once the producer declares the grid its output is on.
+  WRF-SFIRE does not yet declare one, so the recorded case still resolves to
+  `UNDEFINED_NO_GEOREFERENCE` — correctly, and now before the run rather than
+  48 hours into it. Nothing here resamples, and `cube/store.py` still performs
+  its own write-time shape check independently of the preflight.
 - **Stage-6 planning latency misses the Section 9.5 target by roughly 5x** on a
   representative graph. This is the largest known gap at the MVP boundary.
 - Stage-6 evidence is **synthetic fixture data**. Real wind evidence remains
@@ -970,10 +1040,25 @@ the worker to emit `TaskObservation` values. That would make Stages 7 and 8
 real rather than adjacent, and would let the fusion-overhead and makespan
 claims be measured on wall-clock rather than simulated.
 
-If instead the user wants to keep moving down the roadmap, Stage 9A is the
-conditional SLURM provider — but note it is explicitly gated on an eligible
-workload or site requiring it, and this development machine is a private CHPC
-node, not a Slurm test environment.
+Moving further down the roadmap is currently **blocked**, and it is worth being
+precise about by what. Stage 9A is built but simulated. Stage 9B cannot start:
+no R1 golden fixture is promoted, no R2/R2A lane exists, and no provider is
+certified. The placement contract removed one of 9B's blockers; the ones that
+remain need either a real cluster or a promoted reference run, and neither can
+be manufactured here.
+
+The two concrete pieces of 9B prerequisite work that *are* doable without a
+cluster:
+
+1. **Declare the WRF-SFIRE output georeference.** The placement contract can
+   only decide a publication when the producer says which grid its array is on.
+   That declaration belongs in `models/wrf_sfire_adapter.py`, which is
+   user-owned and was deliberately not touched. This is the remaining half of
+   the 253/1001 fix.
+2. **Wire `cube/store.py` to the preflight**, so the legacy cascade refuses an
+   unplaceable plan at launch rather than 48 hours in. Not done here because it
+   changes the running v1 pipeline and there is no way to exercise it end to
+   end on this node.
 
 ## Later stages, briefly
 
@@ -981,6 +1066,8 @@ node, not a Slurm test environment.
   workload/site requires it.
 - **Stage 9B:** WRF integration through a proven execution provider, using
   reference fixtures; never use WRF as the first runtime correctness test.
+  **Blocked** — see the Stage 9B section above. The 253/1001 placement blocker
+  is typed and tested; R1 promotion and provider certification are not.
 - **Stage 10+:** measurement-triggered arrays/pilot/million-scale hardening,
   operations, standards export, and finally the research paper.
 
@@ -1014,11 +1101,17 @@ in there, and push `v2`.
 ## Suggested first prompt on the new machine
 
 ```text
-Read codex_handoff.md completely. Verify branch v2 and Stage-8 commit 538eb65.
+Read codex_handoff.md completely. Verify branch v2 and its head commit.
 Inspect git status and preserve the listed user-owned dirty files. Read
-stage6/README.md, stage7/README.md, and stage8/README.md. Run the full test
-suite (expect 744 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
-or any real remote provider.
+stage6/README.md, stage7/README.md, stage8/README.md, stage9a/README.md, and
+stage9b/README.md. Run the full test suite (expect 772 passed, 1 skipped,
+7 xfailed) without WRF-SFIRE, MPI, Slurm, or any real remote provider.
+
+Do not attempt Stage 9B. Its gates fail: no R1 golden fixture is promoted, no
+R2/R2A lane exists, and no provider is certified (Stage 9A has never submitted
+a job). The 253/1001 placement blocker is typed and tested, but its producer
+half -- WRF-SFIRE declaring the grid its output is on -- is unwritten, and it
+lives in user-owned models/wrf_sfire_adapter.py. Ask before touching that file.
 
 Do not assume the Composition MVP review happened -- it was deferred when the
 user chose to continue past the Stage-6 boundary. Four findings are queued for

@@ -43,6 +43,14 @@ from .requirements import (
     ValueConstraint,
     VerticalRequirement,
 )
+from .placement import (
+    PlacementAssessment,
+    PlacementStatus,
+    PlacementUndefined,
+    assess_array_placement,
+    assess_placement,
+    require_placement,
+)
 from .types import (
     ArtifactDescriptor,
     BBoxSupport,
@@ -72,11 +80,13 @@ __all__ = [
     "IntrinsicUncertainty", "MatchCode",
     "MetricComposition", "MetricDefinition", "MetricEvaluator",
     "MissingPolicy", "Missingness", "MissingnessStatus", "OriginClass",
+    "PlacementAssessment", "PlacementStatus", "PlacementUndefined",
     "Requirement", "RequirementUse", "SampleSemantics", "ScaleBasis",
     "ScientificIdentity", "SpatialRequirement", "SpatialScale",
     "TemporalKind", "TemporalRequirement", "TemporalSupport",
     "UncertaintyStatus", "UnknownPolicy",
     "ValueConstraint", "VerticalKind", "VerticalRequirement", "VerticalSupport",
+    "assess_array_placement", "assess_placement",
     "canonical_crs", "canonical_decimal", "canonical_timestamp",
-    "canonical_unit", "direct_match",
+    "canonical_unit", "direct_match", "require_placement",
 ]
