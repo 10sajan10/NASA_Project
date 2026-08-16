@@ -23,7 +23,12 @@ from typing import Any, Iterable, Mapping
 
 from capabilities.implementation import _digest, _required_text
 from contracts import BBoxSupport, TemporalSupport
-from engine.runtime.identity import require_object_fields, strict_hash
+from engine.runtime.identity import (
+    freeze_json,
+    require_object_fields,
+    strict_copy,
+    strict_hash,
+)
 
 from .connector import (
     AssetCandidate,
@@ -99,6 +104,25 @@ class BoundAssetManifest:
                 "a manifest cannot be bound over incomplete coverage")
         if not isinstance(self.query_payload, dict):
             raise TypeError("bound manifest query payload must be an object")
+        # Detach and freeze before doing any identity checks.  ``frozen=True``
+        # on a dataclass does not make a nested dict immutable; without this a
+        # caller could mutate the query after binding and relabel the same
+        # manifest root as a different scientific concept.
+        object.__setattr__(self, "query_payload", freeze_json(
+            self.query_payload))
+        query = MetadataQuery.from_dict(strict_copy(self.query_payload))
+        if query.query_id != self.manifest.query_id:
+            raise ValueError(
+                "bound query identity does not match the manifest query_id")
+        if query.source_id != self.manifest.source_id:
+            raise ValueError(
+                "bound query source does not match the manifest source")
+        if self.coverage.selected_asset_ids != tuple(sorted(set(
+                self.coverage.selected_asset_ids))):
+            raise ValueError("bound asset IDs must be unique and sorted")
+        if len(self.coverage.selected_asset_ids) != self.manifest.asset_count:
+            raise ValueError(
+                "coverage asset count does not match the exact manifest")
 
     @property
     def manifest_root(self) -> str:
@@ -125,8 +149,17 @@ class BoundAssetManifest:
         return {
             "manifest": self.manifest.to_dict(),
             "coverage": self.coverage.to_dict(),
-            "query_payload": self.query_payload,
+            "query_payload": strict_copy(self.query_payload),
         }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "BoundAssetManifest":
+        raw = require_object_fields(
+            value, {"manifest", "coverage", "query_payload"},
+            "BoundAssetManifest")
+        raw["manifest"] = AssetManifest.from_dict(raw["manifest"])
+        raw["coverage"] = CoverageAssessment.from_dict(raw["coverage"])
+        return cls(**raw)
 
 
 @dataclass(frozen=True)

@@ -41,9 +41,10 @@ def _spec(tiles: int = 10, windows: int = 10) -> PartitionSetSpec:
 
 
 def _template() -> PartitionTaskTemplate:
-    return PartitionTaskTemplate.bind(
-        invocation_key="inv-1", operation_key="synthetic.constant.v1",
-        input_slot_ids=("slot:a",), parameters={"value": 1.0})
+    # A real resolved invocation, not a restated one: the template must carry
+    # the science the resolver actually chose.
+    from stage7.fixtures import resolve_one_selection
+    return PartitionTaskTemplate.bind(resolve_one_selection(), retry_safe=True)
 
 
 def _manifest(spec: PartitionSetSpec,

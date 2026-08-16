@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from capabilities import BoundInvocation
 from partitions import (
     AxisKind,
     CollectionManifest,
@@ -37,6 +38,7 @@ class Stage7Fixture:
     manifest: CollectionManifest
     invocation_key: str
     selected_capability_id: str
+    bound_invocation: BoundInvocation
 
 
 def make_partition_space(*, tiles: int = TILE_COUNT,
@@ -51,16 +53,11 @@ def make_partition_space(*, tiles: int = TILE_COUNT,
     ))
 
 
-_SELECTION_CACHE: tuple[str, str] | None = None
+_SELECTION_CACHE: BoundInvocation | None = None
 
 
-def resolve_one_selection() -> tuple[str, str]:
-    """Resolve the Stage-3 counterexample once and return its selection.
-
-    Returns ``(invocation_key, capability_id)``.  This is deliberately a real
-    resolver call: the partition layer must consume a selection it did not
-    invent.
-    """
+def resolve_one_selection() -> BoundInvocation:
+    """Resolve once and return the exact selected root invocation."""
     global _SELECTION_CACHE
     if _SELECTION_CACHE is not None:
         # The point of Stage 7 is that this resolves *once*; re-solving per
@@ -76,13 +73,43 @@ def resolve_one_selection() -> tuple[str, str]:
             f"Stage-7 fixture could not resolve a selection: "
             f"{outcome.status.value}")
     chosen = set(outcome.selection.plan.selected_invocation_ids)
-    node = min(
-        (item for item in outcome.hypergraph.invocation_nodes
-         if item.invocation_id in chosen),
-        key=lambda item: item.invocation.capability_id)
-    _SELECTION_CACHE = (node.invocation.invocation_key,
-                        node.invocation.capability_id)
+    roots = [
+        item.invocation for item in outcome.hypergraph.invocation_nodes
+        if (item.invocation_id in chosen
+            and item.invocation.capability_id == "example-add")]
+    if len(roots) != 1:
+        raise RuntimeError(
+            "Stage-7 fixture expected exactly one selected example-add root")
+    _SELECTION_CACHE = roots[0]
     return _SELECTION_CACHE
+
+
+_ALL_SELECTED_CACHE: tuple[BoundInvocation, ...] | None = None
+
+
+def resolve_all_selected() -> tuple[BoundInvocation, ...]:
+    """Every invocation the Stage-3 counterexample selected, sorted by key.
+
+    Tests need two *genuinely different* selections to show that partitioning
+    one cannot be confused with partitioning another. Fabricating a second
+    invocation would reintroduce exactly the restatement this stage removed.
+    """
+    global _ALL_SELECTED_CACHE
+    if _ALL_SELECTED_CACHE is not None:
+        return _ALL_SELECTED_CACHE
+    fixture = make_composition_fixture()
+    outcome = WorkflowResolver(
+        fixture.catalog, fixture.deployment_snapshot,
+    ).resolve(fixture.root_uses)
+    if (outcome.status is not ResolutionStatus.READY
+            or outcome.selection.plan is None):
+        raise RuntimeError("Stage-7 fixture could not resolve a selection")
+    chosen = set(outcome.selection.plan.selected_invocation_ids)
+    _ALL_SELECTED_CACHE = tuple(sorted(
+        (item.invocation for item in outcome.hypergraph.invocation_nodes
+         if item.invocation_id in chosen),
+        key=lambda item: item.invocation_key))
+    return _ALL_SELECTED_CACHE
 
 
 def make_stage7_fixture(
@@ -96,12 +123,9 @@ def make_stage7_fixture(
     retry_safe: bool = True,
 ) -> Stage7Fixture:
     spec = make_partition_space(tiles=tiles, windows=windows)
-    invocation_key, capability_id = resolve_one_selection()
+    invocation = resolve_one_selection()
     template = PartitionTaskTemplate.bind(
-        invocation_key=invocation_key,
-        operation_key="synthetic.constant.v1",
-        input_slot_ids=("slot:example-input",),
-        parameters={"value": 1.0},
+        invocation,
         estimated_cost_units=estimated_cost_units,
         retry_safe=retry_safe)
     manifest = CollectionManifest.bind(
@@ -109,8 +133,9 @@ def make_stage7_fixture(
         expected=spec.total, policy=policy,
         minimum_committed=minimum_committed,
         minimum_fraction=minimum_fraction)
-    return Stage7Fixture(spec, template, manifest, invocation_key,
-                         capability_id)
+    return Stage7Fixture(
+        spec, template, manifest, invocation.invocation_key,
+        invocation.capability_id, invocation)
 
 
 __all__ = [
@@ -120,5 +145,6 @@ __all__ = [
     "WINDOW_COUNT",
     "make_partition_space",
     "make_stage7_fixture",
+    "resolve_all_selected",
     "resolve_one_selection",
 ]

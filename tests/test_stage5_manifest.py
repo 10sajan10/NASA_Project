@@ -190,8 +190,11 @@ def test_no_intersecting_asset_is_distinct_from_a_gap():
 
 def test_halo_admits_neighbours_and_reports_them_separately():
     target = BBoxSupport(CRS, AXES, ("1", "1", "3", "3"))
-    core = _asset("core", ("0", "0", "4", "4"))
-    neighbour = _asset("halo", ("4", "0", "6", "4"))
+    # The halo-expanded target is (-0.5, -0.5) .. (4.5, 4.5), and the assets
+    # must actually cover all of it -- a requested halo is mandatory input
+    # coverage, not a hint.
+    core = _asset("core", ("-1", "-1", "4", "5"))
+    neighbour = _asset("halo", ("4", "-1", "6", "5"))
     assessment = assess_coverage(
         (core, neighbour), target_spatial=target, target_temporal=_window(),
         halo="1.5")
@@ -199,6 +202,24 @@ def test_halo_admits_neighbours_and_reports_them_separately():
     assert set(assessment.selected_asset_ids) == {"core", "halo"}
     # The neighbour supports the edges; it is not part of the answer itself.
     assert assessment.halo_asset_ids == ("halo",)
+
+
+def test_a_requested_halo_must_actually_be_covered():
+    """Covering the target but not its halo is a gap, not a success.
+
+    A later interpolation reads outside the target cells; if those inputs were
+    never acquired it would silently invent edge values.
+    """
+    target = BBoxSupport(CRS, AXES, ("1", "1", "3", "3"))
+    exactly_the_target = _asset("core", ("1", "1", "3", "3"))
+    assert assess_coverage(
+        (exactly_the_target,), target_spatial=target,
+        target_temporal=_window(), halo="0").complete
+    gapped = assess_coverage(
+        (exactly_the_target,), target_spatial=target,
+        target_temporal=_window(), halo="1.5")
+    assert gapped.status is CoverageStatus.SPATIAL_GAP
+    assert "halo" in gapped.detail
 
 
 def test_expand_bbox_grows_symmetrically_and_rejects_negative():

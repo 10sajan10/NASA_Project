@@ -120,12 +120,17 @@ class WorkPacket:
 
 @dataclass(frozen=True)
 class PacketAttempt:
-    """One provider submission of a packet, reporting members independently."""
+    """Identity minted *before* a provider submission starts.
+
+    Outcomes cannot be part of attempt identity because they do not exist at
+    submission time. ``fence_token`` distinguishes leases/restarts and lets a
+    durable controller reject a late result from an earlier worker.
+    """
 
     attempt_id: str
     packet_id: str
     attempt_number: int
-    outcomes: tuple[tuple[str, MemberOutcome], ...]
+    fence_token: str
 
     def __post_init__(self) -> None:
         _digest(self.attempt_id, "packet attempt_id")
@@ -134,51 +139,118 @@ class PacketAttempt:
                 or not isinstance(self.attempt_number, int)
                 or self.attempt_number < 1):
             raise ValueError("attempt number must be a positive integer")
+        _required_text(self.fence_token, "attempt fence_token")
+        if self.attempt_id != self.expected_id():
+            raise ValueError("packet attempt identity does not verify")
+
+    @classmethod
+    def bind(cls, packet: WorkPacket, attempt_number: int, *,
+             fence_token: str) -> "PacketAttempt":
+        payload = cls._payload(packet.packet_id, attempt_number, fence_token)
+        return cls(strict_hash(payload), packet.packet_id, attempt_number,
+                   fence_token)
+
+    @staticmethod
+    def _payload(packet_id: str, attempt_number: int,
+                 fence_token: str) -> dict[str, Any]:
+        return {
+            "schema": "stage7-packet-attempt-v2",
+            "packet_id": packet_id,
+            "attempt_number": attempt_number,
+            "fence_token": fence_token,
+        }
+
+    def expected_id(self) -> str:
+        return strict_hash(self._payload(
+            self.packet_id, self.attempt_number, self.fence_token))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "stage7-packet-attempt-v2",
+            "attempt_id": self.attempt_id,
+            "packet_id": self.packet_id,
+            "attempt_number": self.attempt_number,
+            "fence_token": self.fence_token,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "PacketAttempt":
+        raw = require_object_fields(
+            value,
+            {"schema", "attempt_id", "packet_id", "attempt_number",
+             "fence_token"},
+            "PacketAttempt")
+        if raw.pop("schema") != "stage7-packet-attempt-v2":
+            raise ValueError("PacketAttempt schema is not stage7-packet-attempt-v2")
+        return cls(**raw)
+
+
+@dataclass(frozen=True)
+class PacketResult:
+    """A separately identified result for one pre-existing packet attempt."""
+
+    result_id: str
+    attempt_id: str
+    packet_id: str
+    outcomes: tuple[tuple[str, MemberOutcome], ...]
+
+    def __post_init__(self) -> None:
+        _digest(self.result_id, "packet result_id")
+        _digest(self.attempt_id, "packet result attempt_id")
+        _digest(self.packet_id, "packet result packet_id")
         if not isinstance(self.outcomes, tuple) or not self.outcomes:
-            raise ValueError("a packet attempt must report every member")
+            raise ValueError("a packet result must report every member")
         for entry in self.outcomes:
             if (not isinstance(entry, tuple) or len(entry) != 2
+                    or not isinstance(entry[0], str) or not entry[0]
                     or not isinstance(entry[1], MemberOutcome)):
                 raise TypeError(
                     "outcomes must be (logical_task_key, MemberOutcome) pairs")
         keys = [item[0] for item in self.outcomes]
         if len(set(keys)) != len(keys):
-            raise ValueError("a packet attempt cannot report a member twice")
+            raise ValueError("a packet result cannot report a member twice")
+        if self.result_id != self.expected_id():
+            raise ValueError("packet result identity does not verify")
 
     @classmethod
-    def bind(cls, packet: WorkPacket, attempt_number: int,
-             outcomes: Iterable[tuple[str, MemberOutcome]]) -> "PacketAttempt":
+    def bind(cls, attempt: PacketAttempt, packet: WorkPacket,
+             outcomes: Iterable[tuple[str, MemberOutcome]]) -> "PacketResult":
+        if attempt.packet_id != packet.packet_id:
+            raise ValueError("packet attempt does not belong to this packet")
         values = tuple(outcomes)
-        reported = {item[0] for item in values}
-        if reported != set(packet.logical_task_keys):
+        if {item[0] for item in values} != set(packet.logical_task_keys):
             raise ValueError(
-                "a packet attempt must report exactly its packet's members")
-        return cls(
-            strict_hash({
-                "schema": "stage7-packet-attempt-v1",
-                "packet_id": packet.packet_id,
-                "attempt_number": attempt_number,
-                "outcomes": [[key, outcome.value] for key, outcome in values],
-            }),
-            packet.packet_id, attempt_number, values)
+                "a packet result must report exactly its packet's members")
+        payload = cls._payload(attempt.attempt_id, packet.packet_id, values)
+        return cls(strict_hash(payload), attempt.attempt_id,
+                   packet.packet_id, values)
+
+    @staticmethod
+    def _payload(attempt_id: str, packet_id: str,
+                 outcomes: tuple[tuple[str, MemberOutcome], ...]
+                 ) -> dict[str, Any]:
+        return {
+            "schema": "stage7-packet-result-v1",
+            "attempt_id": attempt_id,
+            "packet_id": packet_id,
+            "outcomes": [[key, outcome.value] for key, outcome in outcomes],
+        }
+
+    def expected_id(self) -> str:
+        return strict_hash(self._payload(
+            self.attempt_id, self.packet_id, self.outcomes))
 
     def outcome_for(self, logical_task_key: str) -> MemberOutcome:
         for key, outcome in self.outcomes:
             if key == logical_task_key:
                 return outcome
-        raise KeyError(f"{logical_task_key!r} is not a member of this packet")
+        raise KeyError(f"{logical_task_key!r} is not in this result")
 
     def committed_keys(self) -> tuple[str, ...]:
         return tuple(sorted(key for key, outcome in self.outcomes
                             if outcome is MemberOutcome.COMMITTED))
 
-    def retryable_keys(self, *, retry_safe: bool) -> tuple[str, ...]:
-        """Members that may be attempted again.
-
-        Committed members are never retried.  When the template is not
-        retry-safe, nothing is retried automatically: re-running a
-        non-idempotent operation is a decision for a human, not a default.
-        """
+    def retryable_keys(self, *, retry_safe: bool = False) -> tuple[str, ...]:
         if not retry_safe:
             return ()
         return tuple(sorted(
@@ -186,22 +258,20 @@ class PacketAttempt:
             if outcome in (MemberOutcome.FAILED, MemberOutcome.NOT_ATTEMPTED)))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema": "stage7-packet-attempt-v1",
-            "attempt_id": self.attempt_id,
-            "packet_id": self.packet_id,
-            "attempt_number": self.attempt_number,
-            "outcomes": [[key, outcome.value] for key, outcome in self.outcomes],
-        }
+        payload = self._payload(self.attempt_id, self.packet_id, self.outcomes)
+        payload["result_id"] = self.result_id
+        return payload
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "PacketAttempt":
+    def from_dict(cls, value: dict[str, Any]) -> "PacketResult":
         raw = require_object_fields(
             value,
-            {"schema", "attempt_id", "packet_id", "attempt_number", "outcomes"},
-            "PacketAttempt")
-        if raw.pop("schema") != "stage7-packet-attempt-v1":
-            raise ValueError("PacketAttempt schema is not stage7-packet-attempt-v1")
+            {"schema", "result_id", "attempt_id", "packet_id", "outcomes"},
+            "PacketResult")
+        if raw.pop("schema") != "stage7-packet-result-v1":
+            raise ValueError("PacketResult schema is not stage7-packet-result-v1")
+        if not isinstance(raw["outcomes"], list):
+            raise ValueError("PacketResult.outcomes must be an array")
         raw["outcomes"] = tuple(
             (item[0], MemberOutcome(item[1])) for item in raw["outcomes"])
         return cls(**raw)
@@ -237,6 +307,7 @@ def fuse_members(members: Iterable[PacketMember], template_id: str, *,
 __all__ = [
     "MemberOutcome",
     "PacketAttempt",
+    "PacketResult",
     "PacketMember",
     "WorkPacket",
     "fuse_members",

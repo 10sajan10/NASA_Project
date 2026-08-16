@@ -1,125 +1,122 @@
-"""One scientific selection, shared by every partition that is compatible.
+"""Compile one verified scientific invocation into partitioned task identity.
 
-The template is where "resolve once, execute many" becomes structural.  It
-holds the *single* bound invocation the resolver selected, and every partition
-derives its logical task key from that same invocation.  Partitions cannot
-drift onto different producers, because there is only one to drift from.
-
-Logical task identity follows Section 8.7 exactly:
-
-```text
-bound invocation/subgraph hash
-    + operation and ordered prospective input slot IDs
-    + task-template ID
-    + partition key
-```
-
-Input *slot* IDs rather than content digests, because generated inputs have no
-content digest at compile time.  Commit later binds those slots to digests
-without renaming any task.
+The partition layer is not allowed to restate an operation selected by the
+resolver. A template therefore carries the complete, self-verifying
+``BoundInvocation``: implementation digest, parameters, input requirements,
+and output descriptors all travel together. Partitioning adds only the
+partition key and execution-policy metadata.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from capabilities.implementation import _digest, _required_text
-from engine.runtime.identity import (
-    freeze_json,
-    require_object_fields,
-    strict_copy,
-    strict_hash,
-)
+from capabilities import BoundInvocation
+from capabilities.implementation import _digest
+from engine.runtime.identity import require_object_fields, strict_hash
 
 from .space import PartitionKey
 
 
 @dataclass(frozen=True)
 class PartitionTaskTemplate:
-    """The operation shared by every partition of one collection."""
+    """A verified invocation shared by every partition in one collection."""
 
     template_id: str
-    invocation_key: str
-    operation_key: str
-    input_slot_ids: tuple[str, ...]
-    parameters: dict[str, Any] = field(default_factory=dict)
-    estimated_cost_units: int = 1
-    retry_safe: bool = True
+    invocation: BoundInvocation
+    estimated_cost_units: int
+    retry_safe: bool = False
 
     def __post_init__(self) -> None:
         _digest(self.template_id, "template_id")
-        _required_text(self.invocation_key, "template invocation_key")
-        _required_text(self.operation_key, "template operation_key")
-        if (not isinstance(self.input_slot_ids, tuple)
-                or any(not isinstance(item, str) or not item
-                       for item in self.input_slot_ids)):
-            raise TypeError("input slot IDs must be a text tuple")
-        object.__setattr__(self, "parameters", freeze_json(
-            strict_copy(dict(self.parameters))))
+        if not isinstance(self.invocation, BoundInvocation):
+            raise TypeError("partition template requires a BoundInvocation")
+        self.invocation.implementation.verify_current()
         if (isinstance(self.estimated_cost_units, bool)
                 or not isinstance(self.estimated_cost_units, int)
                 or self.estimated_cost_units < 0):
             raise ValueError("estimated cost must be a non-negative integer")
         if type(self.retry_safe) is not bool:
             raise TypeError("retry_safe must be bool")
+        if self.retry_safe and not self.invocation.implementation.retry_safe:
+            raise ValueError(
+                "automatic retry cannot exceed the implementation contract")
         if self.template_id != self.expected_id():
             raise ValueError("partition task template identity does not verify")
 
     @classmethod
-    def bind(cls, *, invocation_key: str, operation_key: str,
-             input_slot_ids: tuple[str, ...] = (),
-             parameters: dict[str, Any] | None = None,
-             estimated_cost_units: int = 1,
-             retry_safe: bool = True) -> "PartitionTaskTemplate":
-        values = dict(parameters or {})
-        payload = cls._payload(invocation_key, operation_key,
-                               tuple(input_slot_ids), values,
-                               estimated_cost_units, retry_safe)
-        return cls(strict_hash(payload), invocation_key, operation_key,
-                   tuple(input_slot_ids), values, estimated_cost_units,
+    def bind(cls, invocation: BoundInvocation, *,
+             estimated_cost_units: int | None = None,
+             retry_safe: bool = False) -> "PartitionTaskTemplate":
+        """Compile from a resolver output; automatic retry is opt-in."""
+        if not isinstance(invocation, BoundInvocation):
+            raise TypeError("bind requires a BoundInvocation")
+        if estimated_cost_units is None:
+            value = invocation.metric_estimates.get("cost_units", 1)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    "bound invocation cost_units must be an integer")
+            estimated_cost_units = value
+        payload = cls._payload(invocation, estimated_cost_units, retry_safe)
+        return cls(strict_hash(payload), invocation, estimated_cost_units,
                    retry_safe)
 
     @staticmethod
-    def _payload(invocation_key: str, operation_key: str,
-                 input_slot_ids: tuple[str, ...], parameters: dict[str, Any],
-                 estimated_cost_units: int, retry_safe: bool) -> dict[str, Any]:
+    def _payload(invocation: BoundInvocation, estimated_cost_units: int,
+                 retry_safe: bool) -> dict[str, Any]:
         return {
-            "schema": "stage7-partition-task-template-v1",
-            "invocation_key": invocation_key,
-            "operation_key": operation_key,
-            "input_slot_ids": list(input_slot_ids),
-            "parameters": strict_copy(parameters),
+            "schema": "stage7-partition-task-template-v2",
+            "invocation": invocation.to_dict(),
             "estimated_cost_units": estimated_cost_units,
             "retry_safe": retry_safe,
         }
 
+    @property
+    def invocation_key(self) -> str:
+        return self.invocation.invocation_key
+
+    @property
+    def capability_id(self) -> str:
+        return self.invocation.capability_id
+
+    @property
+    def operation_key(self) -> str:
+        return self.invocation.implementation.operation_key
+
+    @property
+    def implementation_sha256(self) -> str:
+        return self.invocation.implementation.implementation_sha256
+
+    @property
+    def input_slot_ids(self) -> tuple[str, ...]:
+        return tuple(use.requirement_use_id for use in self.invocation.input_uses)
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return self.invocation.parameters
+
+    @property
+    def outputs(self):
+        return self.invocation.outputs
+
     def expected_id(self) -> str:
         return strict_hash(self._payload(
-            self.invocation_key, self.operation_key, self.input_slot_ids,
-            dict(self.parameters), self.estimated_cost_units, self.retry_safe))
+            self.invocation, self.estimated_cost_units, self.retry_safe))
 
     def logical_task_key(self, partition: PartitionKey) -> str:
-        """The stable identity of this template applied to one partition.
-
-        Deliberately independent of deployment, resources, and attempt number:
-        revising one task's resource envelope must not rename every unaffected
-        logical task.
-        """
+        """Stable identity for this exact invocation and one partition."""
         if not isinstance(partition, PartitionKey):
             raise TypeError("logical_task_key requires a PartitionKey")
         return strict_hash({
-            "schema": "stage7-logical-task-key-v1",
+            "schema": "stage7-logical-task-key-v2",
             "invocation_key": self.invocation_key,
-            "operation_key": self.operation_key,
-            "input_slot_ids": list(self.input_slot_ids),
             "template_id": self.template_id,
             "partition_key_id": partition.key_id,
         })
 
     def to_dict(self) -> dict[str, Any]:
         payload = self._payload(
-            self.invocation_key, self.operation_key, self.input_slot_ids,
-            dict(self.parameters), self.estimated_cost_units, self.retry_safe)
+            self.invocation, self.estimated_cost_units, self.retry_safe)
         payload["template_id"] = self.template_id
         return payload
 
@@ -127,15 +124,14 @@ class PartitionTaskTemplate:
     def from_dict(cls, value: dict[str, Any]) -> "PartitionTaskTemplate":
         raw = require_object_fields(
             value,
-            {"schema", "template_id", "invocation_key", "operation_key",
-             "input_slot_ids", "parameters", "estimated_cost_units",
-             "retry_safe"},
+            {"schema", "template_id", "invocation",
+             "estimated_cost_units", "retry_safe"},
             "PartitionTaskTemplate")
-        if raw.pop("schema") != "stage7-partition-task-template-v1":
+        if raw.pop("schema") != "stage7-partition-task-template-v2":
             raise ValueError(
                 "PartitionTaskTemplate schema is not "
-                "stage7-partition-task-template-v1")
-        raw["input_slot_ids"] = tuple(raw["input_slot_ids"])
+                "stage7-partition-task-template-v2")
+        raw["invocation"] = BoundInvocation.from_dict(raw["invocation"])
         return cls(**raw)
 
 

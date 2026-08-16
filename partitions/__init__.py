@@ -17,6 +17,7 @@ from .packet import (
     MemberOutcome,
     PacketAttempt,
     PacketMember,
+    PacketResult,
     WorkPacket,
     fuse_members,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "CursorState",
     "MemberOutcome",
     "PacketAttempt",
+    "PacketResult",
     "PacketMember",
     "PartitionAxis",
     "PartitionKey",

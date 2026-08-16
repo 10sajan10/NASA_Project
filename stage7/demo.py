@@ -24,6 +24,7 @@ from partitions import (
     CompletionPolicy,
     MemberOutcome,
     PacketAttempt,
+    PacketResult,
     PartitionStore,
 )
 
@@ -49,12 +50,14 @@ def _run_to_completion(store: PartitionStore, fixture: fx.Stage7Fixture,
         for packet in batch:
             packets += 1
             attempt = PacketAttempt.bind(
-                packet, 1,
+                packet, 1, fence_token=f"fence-{packet.packet_id[:12]}")
+            result = PacketResult.bind(
+                attempt, packet,
                 tuple((key, MemberOutcome.COMMITTED)
                       for key in packet.logical_task_keys))
             outcomes.extend(
                 (key, MemberOutcome.COMMITTED)
-                for key in attempt.committed_keys())
+                for key in result.committed_keys())
         # One flush per batch rather than one per partition.
         committed += store.record_outcomes(controller.collection_id, outcomes)
     state = controller.state()
@@ -169,7 +172,9 @@ def run_demo(runtime_root: Path | str) -> dict[str, Any]:
     partial.top_up()
     packet = partial.next_packets(limit=8)[0]
     keys = packet.logical_task_keys
-    mixed = PacketAttempt.bind(packet, 1, tuple(
+    partial_attempt = PacketAttempt.bind(
+        packet, 1, fence_token="fence-partial")
+    mixed = PacketResult.bind(partial_attempt, packet, tuple(
         (key, MemberOutcome.COMMITTED if index % 2 == 0
          else MemberOutcome.FAILED)
         for index, key in enumerate(keys)))

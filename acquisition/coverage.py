@@ -2,10 +2,11 @@
 
 Stage 5 claims exactly one coverage capability: assets *from one source* that
 share a CRS and axis order and that jointly contain the requested region and
-window.  A hole anywhere in that union is a ``GAP`` and stops the binding.  It
-is never filled, never interpolated across, and never rounded away, because a
-partially covered artifact that reports itself complete is the most damaging
-failure this layer could have.
+window.  Coverage is assessed over the Cartesian space-time product, not as
+independent spatial and temporal projections.  A hole anywhere in that product
+is a ``GAP`` and stops the binding.  It is never filled, never interpolated
+across, and never rounded away, because a partially covered artifact that
+reports itself complete is the most damaging failure this layer could have.
 
 Cross-provider mosaics and coverage atoms are deliberately out of scope.
 """
@@ -29,6 +30,7 @@ class CoverageStatus(str, Enum):
     NO_ASSETS = "NO_ASSETS"
     SPATIAL_GAP = "SPATIAL_GAP"
     TEMPORAL_GAP = "TEMPORAL_GAP"
+    SPATIOTEMPORAL_GAP = "SPATIOTEMPORAL_GAP"
     CRS_MISMATCH = "CRS_MISMATCH"
 
 
@@ -50,6 +52,8 @@ class CoverageAssessment:
                     or any(not isinstance(item, str) or not item
                            for item in values)):
                 raise TypeError(f"{label} must be a text tuple")
+            if values != tuple(sorted(set(values))):
+                raise ValueError(f"{label} must be unique and sorted")
         if set(self.halo_asset_ids) - set(self.selected_asset_ids):
             raise ValueError("halo assets must also be selected assets")
         if self.status is CoverageStatus.COMPLETE and not self.selected_asset_ids:
@@ -127,10 +131,17 @@ def assess_coverage(
 ) -> CoverageAssessment:
     """Choose the assets that cover a request, or explain the gap.
 
-    Selection keeps every asset that intersects the halo-expanded target, then
-    verifies containment of the *unexpanded* target.  Assets retained only for
-    the halo are reported separately so a consumer can tell which inputs exist
-    for edge support rather than for the answer itself.
+    Selection keeps every asset that intersects the halo-expanded target and
+    verifies containment of that expanded target.  For a temporal series the
+    check partitions the requested window at every asset boundary and requires
+    full spatial coverage during every resulting interval.  This prevents two
+    assets whose spatial and temporal *projections* look complete from hiding
+    holes in their Cartesian product.
+
+    Assets retained only for the halo are reported separately so a consumer
+    can tell which inputs exist for edge support rather than for the answer
+    itself.  A non-zero requested halo is mandatory input coverage, not merely
+    a hint used during candidate selection.
     """
     if not isinstance(target_spatial, BBoxSupport):
         raise TypeError("target_spatial must be BBoxSupport")
@@ -162,15 +173,23 @@ def assess_coverage(
             CoverageStatus.NO_ASSETS, (), (),
             "no discovered asset intersects the requested region and window")
 
-    if not bbox_union_covers(selected, target_spatial):
+    if not bbox_union_covers(selected, expanded):
         return CoverageAssessment(
             CoverageStatus.SPATIAL_GAP, (), (),
-            "the discovered assets leave a hole in the requested region; "
+            "the discovered assets leave a hole in the requested region or "
+            "its required halo; "
             "Stage 5 refuses to register a partially covered artifact")
     if not temporal_union_covers(selected, target_temporal):
         return CoverageAssessment(
             CoverageStatus.TEMPORAL_GAP, (), (),
             "the discovered assets leave a hole in the requested window")
+
+    if not _space_time_product_covers(
+            selected, expanded, target_temporal):
+        return CoverageAssessment(
+            CoverageStatus.SPATIOTEMPORAL_GAP, (), (),
+            "spatial and temporal projections are individually complete, "
+            "but the assets leave a hole in the requested space-time product")
 
     core = tuple(
         item.asset_id for item in selected
@@ -181,6 +200,56 @@ def assess_coverage(
     return CoverageAssessment(
         CoverageStatus.COMPLETE, ordered, halo_only,
         "")
+
+
+def _space_time_product_covers(
+    assets: Sequence[AssetRef],
+    spatial: BBoxSupport,
+    temporal: TemporalSupport,
+) -> bool:
+    """Return whether one asset covers every point of each time slab.
+
+    Asset interval endpoints plus the target endpoints form a finite exact
+    partition.  Within one open slab the active asset set is constant, so a
+    two-dimensional union check for every slab is equivalent to coverage of
+    the full three-dimensional Cartesian product.  Boundary points are covered
+    by the adjacent closed extents under the manifest's interval convention.
+    """
+    if temporal.kind is TemporalKind.TIME_INVARIANT:
+        invariant = tuple(
+            item for item in assets
+            if item.extent.temporal.kind is TemporalKind.TIME_INVARIANT)
+        return bbox_union_covers(invariant, spatial)
+
+    from contracts.identity import timestamp_value
+
+    start = timestamp_value(temporal.start)
+    end = timestamp_value(temporal.end)
+    boundaries = {start, end}
+    intervals: list[tuple[AssetRef, Any, Any]] = []
+    for asset in assets:
+        offered = asset.extent.temporal
+        if offered.kind is TemporalKind.TIME_INVARIANT:
+            # The Stage-5 contract does not silently reinterpret a static
+            # field as a sampled series.
+            continue
+        offered_start = max(timestamp_value(offered.start), start)
+        offered_end = min(timestamp_value(offered.end), end)
+        if offered_start < offered_end:
+            intervals.append((asset, offered_start, offered_end))
+            boundaries.add(offered_start)
+            boundaries.add(offered_end)
+
+    ordered = sorted(boundaries)
+    for slab_start, slab_end in zip(ordered, ordered[1:]):
+        if slab_start >= slab_end:
+            continue
+        active = tuple(
+            asset for asset, offered_start, offered_end in intervals
+            if offered_start <= slab_start and offered_end >= slab_end)
+        if not active or not bbox_union_covers(active, spatial):
+            return False
+    return bool(intervals)
 
 
 def order_assets(assets: Sequence[AssetRef],

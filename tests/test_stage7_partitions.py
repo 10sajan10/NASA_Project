@@ -16,6 +16,7 @@ from partitions import (
     CompletionPolicy,
     MemberOutcome,
     PacketAttempt,
+    PacketResult,
     PacketMember,
     PartitionAxis,
     PartitionKey,
@@ -35,12 +36,16 @@ def _spec(tiles: int = 4, windows: int = 3) -> PartitionSetSpec:
     ))
 
 
-def _template(**overrides) -> PartitionTaskTemplate:
-    base = dict(invocation_key="inv-1", operation_key="synthetic.constant.v1",
-                input_slot_ids=("slot:a",), parameters={"value": 1.0},
-                estimated_cost_units=1, retry_safe=True)
+def _invocation(index: int = 0):
+    """One of the genuinely selected invocations, by stable order."""
+    from stage7.fixtures import resolve_all_selected
+    return resolve_all_selected()[index]
+
+
+def _template(index: int = 0, **overrides) -> PartitionTaskTemplate:
+    base = dict(estimated_cost_units=1, retry_safe=True)
     base.update(overrides)
-    return PartitionTaskTemplate.bind(**base)
+    return PartitionTaskTemplate.bind(_invocation(index), **base)
 
 
 # -- the partition space --------------------------------------------------
@@ -126,8 +131,8 @@ def test_one_template_gives_every_partition_a_distinct_stable_key():
 
 def test_the_same_partition_under_a_different_selection_is_a_different_task():
     spec = _spec()
-    first = _template(invocation_key="inv-1")
-    second = _template(invocation_key="inv-2")
+    first = _template(0)
+    second = _template(1)
     assert (first.logical_task_key(spec.key_at(0))
             != second.logical_task_key(spec.key_at(0)))
 
@@ -203,36 +208,39 @@ def test_a_partial_packet_keeps_committed_members_and_retries_the_rest():
     template = _template()
     packet = WorkPacket.bind(template.template_id, _members(4, template, spec))
     keys = packet.logical_task_keys
-    attempt = PacketAttempt.bind(packet, 1, (
+    attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
+    result = PacketResult.bind(attempt, packet, (
         (keys[0], MemberOutcome.COMMITTED),
         (keys[1], MemberOutcome.FAILED),
         (keys[2], MemberOutcome.COMMITTED),
         (keys[3], MemberOutcome.NOT_ATTEMPTED)))
 
-    assert attempt.committed_keys() == tuple(sorted((keys[0], keys[2])))
+    assert result.committed_keys() == tuple(sorted((keys[0], keys[2])))
     # Only the uncommitted members come back, and committed work is never
     # recomputed because one sibling in the bundle failed.
-    assert attempt.retryable_keys(retry_safe=True) == tuple(
+    assert result.retryable_keys(retry_safe=True) == tuple(
         sorted((keys[1], keys[3])))
-    assert set(attempt.retryable_keys(retry_safe=True)).isdisjoint(
-        attempt.committed_keys())
+    assert set(result.retryable_keys(retry_safe=True)).isdisjoint(
+        result.committed_keys())
 
 
 def test_a_non_retry_safe_template_retries_nothing_automatically():
     spec = _spec(10, 10)
     template = _template(retry_safe=False)
     packet = WorkPacket.bind(template.template_id, _members(2, template, spec))
-    attempt = PacketAttempt.bind(packet, 1, tuple(
+    attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
+    result = PacketResult.bind(attempt, packet, tuple(
         (key, MemberOutcome.FAILED) for key in packet.logical_task_keys))
-    assert attempt.retryable_keys(retry_safe=False) == ()
+    assert result.retryable_keys(retry_safe=False) == ()
 
 
 def test_an_attempt_must_report_exactly_its_packet():
     spec = _spec(10, 10)
     template = _template()
     packet = WorkPacket.bind(template.template_id, _members(2, template, spec))
+    attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
     with pytest.raises(ValueError, match="exactly its packet's members"):
-        PacketAttempt.bind(packet, 1, (
+        PacketResult.bind(attempt, packet, (
             (packet.logical_task_keys[0], MemberOutcome.COMMITTED),))
 
 
@@ -241,9 +249,20 @@ def test_packet_records_round_trip():
     template = _template()
     packet = WorkPacket.bind(template.template_id, _members(3, template, spec))
     assert WorkPacket.from_dict(packet.to_dict()) == packet
-    attempt = PacketAttempt.bind(packet, 1, tuple(
-        (key, MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
+    attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
     assert PacketAttempt.from_dict(attempt.to_dict()) == attempt
+    result = PacketResult.bind(attempt, packet, tuple(
+        (key, MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
+    assert PacketResult.from_dict(result.to_dict()) == result
+
+    # A relabelled outcome must not survive deserialisation: the audit found
+    # FAILED -> COMMITTED was accepted when identity was not re-verified.
+    forged = result.to_dict()
+    forged["outcomes"] = [[key, "COMMITTED"] for key, _ in result.outcomes]
+    if forged["outcomes"] != [[key, outcome.value]
+                              for key, outcome in result.outcomes]:
+        with pytest.raises(ValueError, match="identity does not verify"):
+            PacketResult.from_dict(forged)
 
 
 # -- collection completeness ----------------------------------------------
