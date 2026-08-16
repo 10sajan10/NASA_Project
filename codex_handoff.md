@@ -569,13 +569,45 @@ Exactness is enforced, not assumed: an aligned 9× refinement is only exact when
 the source spans whole 9-cell blocks. 253 is 28 blocks plus one cell, so the
 edge target cell is partly covered and that case is refused as well.
 
-Not done: nothing resamples here; `cube/store.py` is not wired to the preflight
-(its write-time check remains the last line of defence); no WRF output was
-inspected, and the producer-side declaration belongs in the user-owned
-`models/wrf_sfire_adapter.py`, which was not touched — that declaration is the
-remaining half of the fix. Vertical and temporal placement are out of scope,
-and Stage 9B remains blocked on R1 and provider certification. See
-`stage9b/README.md`.
+### The producer half, against real WRF output
+
+`models/wrf_georeference.py` derives a **verified** `GridDescriptor` from a
+wrfout file's own metadata. It was written against the real WRF-SFIRE output on
+disk (`wrf-sfire-stack/WRF-SFIRE/test/em_real/wrfout_d0?_2019-09-04_12:00:00`,
+gitignored at 131 MB each), so the following are measurements, not assumptions.
+
+**The blocker is the projection, not the shape.** WRF writes a domain-centred
+Lambert Conformal on a 6,370 km sphere with no EPSG code; the analysis cube is
+UTM. Real d03 output placed against a UTM cube returns `CRS_MISMATCH`. No
+reshape reconciles that, and the old shape check could never have said so.
+Declared in WRF's own CRS, the 90 m fire mesh places onto a 900 m cube as an
+exact, aligned, whole-blocked 10x `INTEGER_REFINEMENT` — so the geometry was
+never the problem; the missing thing was a declared reprojection.
+
+**The origin cannot be computed from `CEN_LAT`/`CEN_LON`** — that puts the
+domain 1.7 degrees of latitude out. It is taken from the file's own
+`XLONG`/`XLAT` corner and then verified against the whole coordinate field;
+a derivation missing WRF's coordinates by over 30 m is refused rather than
+returned. Measured agreement is 2.7–3.4 m across all three nests, a fraction of
+one 90 m fire cell.
+
+**The fire subgrid is padded and its arrays disagree about where they end.**
+`west_east` 213, `west_east_stag` 214, `west_east_subgrid` 2140 = 214 x 10. On
+that single allocated array, `TIGN_G`/`LFN` hold data to 2130 (the true
+213 x 10 extent), `FXLONG` runs one halo column further to 2131, and
+`NFUEL_CAT` fills all 2140 because it is an ingested input rather than fire
+state. Three arrays, one subgrid, three answers — which is precisely why an
+array's extent cannot establish its grid. Block-reducing the full 2140 folds
+ten columns of padded fuel into the result silently.
+
+Not done: nothing resamples; `cube/store.py` is not wired to the preflight (its
+write-time check remains the last line of defence); the reader is not wired to
+`models/wrf_sfire_adapter.py`, which is user-owned and untouched, so nothing in
+the running pipeline consumes the declaration yet; and **no Stage-4
+reprojection WRF→cube is declared** — knowing the CRSs disagree is not the same
+as having a costed transformation between them. Vertical and temporal placement
+are out of scope, and Stage 9B remains blocked on R1 and provider
+certification. See `stage9b/README.md`.
 
 ## Why the global resolver looks this way
 
@@ -608,12 +640,13 @@ million-candidate discovery is solved.
 The **entire** repository suite passes:
 
 ```text
-772 passed, 1 skipped, 7 xfailed
+794 passed, 1 skipped, 7 xfailed
 ```
 
 Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`,
 Stage 7 `662/1/7`, Stage 8 `691/1/7`, audit remediation `718/1/7`,
-Stage 9A-Core `744/1/7`, placement contract `772/1/7`.
+Stage 9A-Core `744/1/7`, placement contract `772/1/7`,
+WRF georeference reader `794/1/7`.
 
 **The seventh xfail is new and is not a quarantine.** It is the strict-xfail
 Section 9.5 latency gate: a real, measured miss (see the Stage-6 exit evidence
@@ -784,12 +817,14 @@ Additional evidence:
   SLURM submit environment, so real-cluster behaviour -- accounting lag,
   `sacct` purge windows, QOS rejection, federation job-ID suffixes -- is
   entirely unverified.
-- **The 253/1001 fix is half done.** `contracts/placement.py` can decide any
-  publication, but only once the producer declares the grid its output is on.
-  WRF-SFIRE does not yet declare one, so the recorded case still resolves to
-  `UNDEFINED_NO_GEOREFERENCE` — correctly, and now before the run rather than
-  48 hours into it. Nothing here resamples, and `cube/store.py` still performs
-  its own write-time shape check independently of the preflight.
+- **The 253/1001 fix stops one step short of publication.** Placement can now
+  be decided and WRF's grid can now be read, and together they show the real
+  answer is `CRS_MISMATCH` — WRF's Lambert against the cube's UTM. What does
+  not exist is the declared Stage-4 reprojection that would resolve it, so no
+  WRF output can be published yet. It fails closed, before the run, instead of
+  48 hours in. Nothing resamples, `cube/store.py` still does its own write-time
+  shape check independently of the preflight, and the user-owned
+  `models/wrf_sfire_adapter.py` does not yet consume the reader.
 - **Stage-6 planning latency misses the Section 9.5 target by roughly 5x** on a
   representative graph. This is the largest known gap at the MVP boundary.
 - Stage-6 evidence is **synthetic fixture data**. Real wind evidence remains
@@ -1104,14 +1139,17 @@ in there, and push `v2`.
 Read codex_handoff.md completely. Verify branch v2 and its head commit.
 Inspect git status and preserve the listed user-owned dirty files. Read
 stage6/README.md, stage7/README.md, stage8/README.md, stage9a/README.md, and
-stage9b/README.md. Run the full test suite (expect 772 passed, 1 skipped,
+stage9b/README.md. Run the full test suite (expect 794 passed, 1 skipped,
 7 xfailed) without WRF-SFIRE, MPI, Slurm, or any real remote provider.
 
 Do not attempt Stage 9B. Its gates fail: no R1 golden fixture is promoted, no
 R2/R2A lane exists, and no provider is certified (Stage 9A has never submitted
 a job). The 253/1001 placement blocker is typed and tested, but its producer
-half -- WRF-SFIRE declaring the grid its output is on -- is unwritten, and it
-lives in user-owned models/wrf_sfire_adapter.py. Ask before touching that file.
+half is now readable via models/wrf_georeference.py, and it shows the real
+answer is CRS_MISMATCH: WRF writes Lambert Conformal on a sphere, the cube is
+UTM. The declared Stage-4 reprojection that would resolve that does not exist,
+and wiring the reader into user-owned models/wrf_sfire_adapter.py needs the
+user's say-so. Ask before touching that file.
 
 Do not assume the Composition MVP review happened -- it was deferred when the
 user chose to continue past the Stage-6 boundary. Four findings are queued for

@@ -108,14 +108,57 @@ exact if the source spans **whole** 9-cell blocks. 253 is 28 blocks plus one
 cell, so the edge target cell would be partly covered, and deciding what to do
 about that is a resampling policy. That case is refused too.
 
+## The producer half, and what real WRF output actually says
+
+`models/wrf_georeference.py` derives a **verified** `GridDescriptor` from a
+wrfout file's own metadata, so the contract has a source grid to reason about.
+It was written against real WRF-SFIRE output on disk
+(`wrf-sfire-stack/WRF-SFIRE/test/em_real/wrfout_d0?_2019-09-04_12:00:00`),
+not against assumptions. Three things it found:
+
+**The origin cannot be computed from `CEN_LAT`/`CEN_LON`.** Doing so puts the
+domain 1.7° of latitude out. The origin is taken from the file's own
+`XLONG`/`XLAT` corner and then verified against the entire coordinate field;
+a derivation that misses WRF's coordinates by more than 30 m is refused rather
+than returned. Measured agreement on the reference file is 2.7–3.4 m across
+all three nests, a fraction of one 90 m fire cell.
+
+**The fire subgrid is padded, and its arrays disagree about where they end.**
+`west_east` is 213, `west_east_stag` is 214, `west_east_subgrid` is
+2140 = 214 × 10. On that one allocated array:
+
+| variable | populated to | why |
+|---|---|---|
+| `TIGN_G`, `LFN` | 2130 | true fire extent, 213 × 10 |
+| `FXLONG` | 2131 | one halo coordinate column |
+| `NFUEL_CAT` | 2140 | ingested input, fills the padding too |
+
+Three arrays on one subgrid, three answers. An array's own extent therefore
+cannot establish its grid, and block-reducing the full 2140 folds ten columns
+of padded fuel into the result silently.
+
+**The blocker is the projection, not the shape.** WRF writes a domain-centred
+Lambert Conformal on a 6,370 km sphere, with no EPSG code; the analysis cube is
+UTM. Placement of real d03 output onto a UTM cube returns `CRS_MISMATCH` — no
+reshape reconciles that, and the old shape check could never have said so.
+
+The geometry itself was never the problem. Declared in WRF's own CRS, the 90 m
+fire mesh places onto a 900 m cube as an exact, aligned, whole-blocked 10×
+`INTEGER_REFINEMENT`. The fire mesh always could have been published; what was
+missing was a declared reprojection.
+
 ## Test coverage
 
 - `tests/test_placement_contract.py` — 18 tests. Every grid is built from the
   real project configuration rather than convenient numbers.
 - `tests/test_cube_preflight.py` — 10 tests reconstructing the recorded
   `outputs.targets` plan and refusing it before the run.
+- `tests/test_wrf_georeference.py` — 22 tests. The real-file lane asserts only
+  what was read off the files and skips when they are absent (they are
+  gitignored, 131 MB each); the synthetic lane covers every refusal path and
+  runs everywhere.
 
-Suite: 772 passed, 1 skipped, 7 xfailed.
+Suite: 794 passed, 1 skipped, 7 xfailed.
 
 ## What this does not do
 
@@ -125,10 +168,16 @@ Suite: 772 passed, 1 skipped, 7 xfailed.
   as the last line of defence. Making the legacy v1 cascade call the preflight
   is a change to the running pipeline and was not made without a way to
   exercise it end to end.
-- **No WRF output was inspected.** The producer-side grid must come from the
-  adapter declaring its output georeference, and `models/wrf_sfire_adapter.py`
-  is user-owned and untouched. That declaration is the remaining half of the
-  fix and is not written.
+- **The adapter is not wired to the reader.** `models/wrf_georeference.py`
+  produces the declaration, but `models/wrf_sfire_adapter.py` is user-owned and
+  untouched, so nothing in the running pipeline consumes it yet. Connecting the
+  two — and deciding the reprojection WRF→cube that `CRS_MISMATCH` demands — is
+  the remaining work.
+- **No reprojection is declared.** Knowing that WRF's Lambert and the cube's
+  UTM disagree is not the same as having a costed, evidence-bearing Stage-4
+  transformation between them. That transformation is not written.
+- **Only the 12:00 files were read.** The georeference is time-invariant, so
+  this is sound for grid geometry, but no time series was inspected.
 - **It does not unblock Stage 9B.** R1 still has no promoted golden fixture and
   no provider is certified. This removes one blocker of several.
 - **Vertical and temporal placement are out of scope.** Only the horizontal
