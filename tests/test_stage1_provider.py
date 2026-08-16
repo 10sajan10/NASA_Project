@@ -98,12 +98,16 @@ def test_local_worker_publishes_complete_result_marker_last(tmp_path):
     assert observation.state is AttemptState.RESULT_READY
     result_path = Path(observation.result_manifest_path)
     result = json.loads(result_path.read_text())
+    # Peak RSS is optional telemetry beside the scientific result; it never
+    # participates in artifact identity or commit.
+    peak = result.pop("peak_memory_kb", None)
     assert result == {
         "schema": "stage1-attempt-result-v1",
         "attempt_id": spec.attempt_id,
         "attempt_token": spec.attempt_token,
         "outputs": {"result": {"path": "outputs/result/payload.json"}},
     }
+    assert isinstance(peak, int) and peak > 0
     assert json.loads(
         (Path(spec.stage_dir) / "outputs/result/payload.json").read_text()) == 42
     assert not (Path(spec.stage_dir) / "error.json").exists()

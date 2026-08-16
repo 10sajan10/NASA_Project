@@ -250,9 +250,21 @@ class ArtifactCommitter:
             raise InvalidArtifactError(
                 "result manifest must be the attempt root result.json")
         result = _read_strict_json(result_path, max_bytes=_MAX_RESULT_BYTES)
-        if not isinstance(result, dict) or set(result) != {
-                "schema", "attempt_id", "attempt_token", "outputs"}:
+        # ``peak_memory_kb`` is telemetry, not part of the scientific result:
+        # it is optional so an older attempt receipt still validates, and it is
+        # never allowed to influence artifact identity or commit.
+        if not isinstance(result, dict) or not (
+                {"schema", "attempt_id", "attempt_token", "outputs"}
+                <= set(result)
+                <= {"schema", "attempt_id", "attempt_token", "outputs",
+                    "peak_memory_kb"}):
             raise InvalidArtifactError("attempt result has an invalid field set")
+        if "peak_memory_kb" in result and (
+                isinstance(result["peak_memory_kb"], bool)
+                or not isinstance(result["peak_memory_kb"], int)
+                or result["peak_memory_kb"] < 0):
+            raise InvalidArtifactError(
+                "attempt result peak_memory_kb must be a non-negative integer")
         if (result["schema"] != _RESULT_SCHEMA
                 or result["attempt_id"] != spec.attempt_id
                 or result["attempt_token"] != spec.attempt_token):

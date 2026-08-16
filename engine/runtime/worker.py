@@ -62,6 +62,10 @@ def main(argv: list[str] | None = None) -> int:
             "attempt_id": spec.attempt_id,
             "attempt_token": spec.attempt_token,
             "outputs": result_outputs,
+            # Real peak resident memory for this worker process. Reported so
+            # the Stage-8 revision machinery works from a measurement rather
+            # than from the envelope somebody reserved.
+            "peak_memory_kb": _peak_memory_kb(),
         })
         return 0
     except BaseException as exc:
@@ -96,6 +100,21 @@ def _verify_invocation(spec: AttemptSpec, token: str, stage: Path) -> None:
         raise RuntimeError("attempt input artifact bindings do not match task ports")
     for recipe in spec.task.outputs:
         _validate_port(recipe.output_name)
+
+
+def _peak_memory_kb() -> int:
+    """Peak RSS of this worker process, in kilobytes.
+
+    ``ru_maxrss`` is kilobytes on Linux and bytes on macOS; this runtime is
+    Linux-only (the site preflight refuses anything else), so the raw value is
+    already the unit we want.  Returns 0 when the platform cannot report it,
+    which the consumer treats as "no measurement" rather than as zero usage.
+    """
+    try:
+        import resource
+        return max(0, int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
+    except (ImportError, OSError, ValueError):  # pragma: no cover - platform
+        return 0
 
 
 def _claim_worker(supervisor: Path, spec: AttemptSpec) -> None:

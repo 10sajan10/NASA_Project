@@ -158,3 +158,36 @@ def test_reservations_are_all_released_when_the_run_finishes(tmp_path):
     # Nothing leaked: the node is fully free again.
     assert ledger.live_task_keys() == ()
     assert ledger.available("node").cpu_cores == 4
+
+
+def test_observations_carry_real_measured_memory(tmp_path):
+    """Peak memory is the worker's ru_maxrss, not the reserved envelope.
+
+    Before this, nothing sampled memory, so the revision machinery ran on the
+    figure somebody had reserved -- which can never reveal an underestimate.
+    """
+    history = ObservationHistory(minimum_samples=1)
+    _wall, state = _run(tmp_path / "run", 3, 2, observations=history)
+    assert state is RunState.SUCCEEDED
+
+    declared = 64          # what _graph reserves per task
+    estimate = history.memory_estimate("t0", declared_mb=declared)
+    assert estimate.measured
+    # A real CPython worker is bigger than the 64 MB reservation, so this is
+    # visibly a measurement rather than an echo of the request.
+    assert estimate.value != float(declared)
+    assert estimate.value > 0
+
+
+def test_a_measured_underestimate_produces_a_revision(tmp_path):
+    """The full loop: measure, compare to the declared envelope, propose."""
+    history = ObservationHistory(minimum_samples=1)
+    _wall, state = _run(tmp_path / "run", 2, 2, observations=history)
+    assert state is RunState.SUCCEEDED
+
+    declared = ResourceEnvelopeSpec(cpu_cores=1, memory_mb=64)
+    revision = history.review_envelope("t0", declared)
+    assert revision is not None
+    assert "memory_mb" in revision.dimensions
+    assert revision.proposed.memory_mb > declared.memory_mb
+    assert declared.memory_mb == 64          # still not mutated

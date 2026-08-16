@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from .artifacts import ArtifactCommitter, CommitDisposition
-from .identity import strict_copy, strict_hash
+from .identity import strict_copy, strict_hash, strict_json_loads
 from .operations import operation_component
 from .provider import LocalSubprocessProvider, SubmissionOutcomeUnknown
 from .site import current_private_site, preflight_request, validate_runtime_root
@@ -492,23 +492,47 @@ class WorkflowController:
         """Emit a measured observation for a finished task, if asked to.
 
         Duration is wall clock from reservation to release.  Peak memory is
-        *not* sampled by this controller, so the observation records the
-        reserved envelope rather than a measurement; overstating that as a
-        measured peak would feed the revision machinery invented numbers.
+        the worker's real ``ru_maxrss`` when the attempt reported one; when it
+        did not, the reserved envelope is used unchanged rather than a
+        fabricated figure, so the revision machinery never sees an invented
+        measurement.
         """
         if self.observations is None:
             return
-        from scheduling import ObservationKind, TaskObservation
+        from scheduling import (ObservationKind, ResourceEnvelopeSpec,
+                                TaskObservation)
         row = next((item for item in self.store.task_rows(run_id)
                     if item["task_id"] == task_id), None)
         if row is None:
             return
         kind = (ObservationKind.COMPLETED if row["state"] == "SUCCEEDED"
                 else ObservationKind.FAILED)
+        measured = self._measured_peak(run_id, task_id)
+        if measured is not None:
+            envelope = ResourceEnvelopeSpec(
+                cpu_cores=envelope.cpu_cores, memory_mb=measured,
+                gpus=envelope.gpus, scratch_mb=envelope.scratch_mb)
         self.observations.record(TaskObservation(
             task_key=row["task_key"],
             duration_s=max(time.monotonic() - started, 0.0),
             peak=envelope, kind=kind))
+
+    def _measured_peak(self, run_id: str, task_id: str) -> int | None:
+        """The worker's reported peak RSS in MB, or None when unavailable."""
+        stage_dir = self.store.latest_attempt_stage_dir(run_id, task_id)
+        if stage_dir is None:
+            return None
+        result = Path(stage_dir) / "result.json"
+        if not result.exists():
+            return None
+        try:
+            payload = strict_json_loads(result.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        raw = payload.get("peak_memory_kb") if isinstance(payload, dict) else None
+        if not isinstance(raw, int) or raw <= 0:
+            return None
+        return max(1, raw // 1024)
 
     def _global_active_attempt_count(self) -> int:
         active = tuple(state.value for state in (

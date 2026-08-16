@@ -510,6 +510,16 @@ class RuntimeStore:
             return list(con.execute(
                 "SELECT * FROM tasks WHERE run_id=? ORDER BY task_id", (run_id,)))
 
+    def latest_attempt_stage_dir(self, run_id: str,
+                                 task_id: str) -> str | None:
+        """Stage directory of the most recent attempt for one task."""
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT stage_dir FROM attempts WHERE run_id=? AND task_id=? "
+                "ORDER BY created_at DESC, attempt_id DESC LIMIT 1",
+                (run_id, task_id)).fetchone()
+        return None if row is None else row[0]
+
     def ready_tasks(self, run_id: str, now: float | None = None) -> list[BoundTask]:
         now = time.time() if now is None else now
         with self.connect() as con:
