@@ -19,6 +19,7 @@ from typing import Any
 
 from partitions import (
     AdmissionPolicy,
+    execute_packet,
     BoundedAdmissionController,
     CollectionManifest,
     CompletionPolicy,
@@ -193,8 +194,12 @@ def run_demo(runtime_root: Path | str) -> dict[str, Any]:
     survived = partial_store.state(partial.collection_id).committed == \
         partial_state.committed
 
+    # -- 6: partitions that actually execute ----------------------------
+    executed = _execute_for_real(root, fixture, policy)
+
     return {
         "schema": "stage7-demo-result-v1",
+        "real_execution": executed,
         "one_selection_reused": {
             "invocation_key": fixture.invocation_key,
             "selected_capability_id": fixture.selected_capability_id,
@@ -269,6 +274,41 @@ def run_demo(runtime_root: Path | str) -> dict[str, Any]:
             "failed": partial_state.failed,
             "satisfies_all_policy": partial_state.satisfies(fixture.manifest),
         },
+    }
+
+
+def _execute_for_real(root: Path, fixture: fx.Stage7Fixture,
+                      policy: AdmissionPolicy) -> dict[str, Any]:
+    """Run a bounded slice of partitions as real Stage-1 tasks.
+
+    The 10,000-partition figures above measure the control plane. This runs a
+    small slice for real, so "committed" means a subprocess executed and an
+    artifact was published rather than a row being set.
+    """
+    small = fx.make_stage7_fixture(tiles=2, windows=4)
+    store = PartitionStore(root / "executed.sqlite3")
+    controller = BoundedAdmissionController(
+        store, small.manifest, small.spec, small.template, policy=policy)
+    controller.top_up()
+    packets = controller.next_packets(limit=8)
+    committed = 0
+    states = []
+    for index, packet in enumerate(packets, start=1):
+        decision, run_state = execute_packet(
+            store, controller.collection_id, small.template, packet,
+            runtime_root=root / f"runtime-{index}")
+        committed += len(decision.committed)
+        states.append(run_state.value)
+    state = store.state(controller.collection_id)
+    return {
+        "partitions": small.spec.total,
+        "packets_executed": len(packets),
+        "run_states": states,
+        "committed": committed,
+        "collection_state": state.to_dict(),
+        "collection_complete": state.satisfies(small.manifest),
+        "capability_executed": small.template.capability_id,
+        "operation_executed": small.template.operation_key,
     }
 
 

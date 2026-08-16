@@ -1,11 +1,11 @@
 # Stage 7 — Lazy partitions, bounded admission, and collection completeness
 
-Status: **control-plane prototype** — implemented and acceptance-tested on
-2026-08-15 for 10^4 partitions, revised 2026-08-16 after an external audit.
-The gap that matters: partitions are admitted, packetised, retried, and
-committed through their full lifecycle, but those commits are durable *state
-transitions*; per-partition scientific execution through the Stage-1 runtime is
-still unbuilt. See "What this does not do". No WRF-SFIRE, MPI, Slurm, or real
+Status: **control plane, now with real partition execution** — implemented and
+acceptance-tested on 2026-08-15, revised 2026-08-16 after an external audit.
+Partitions compile into Stage-1 tasks and run: a committed partition means a
+subprocess executed and an artifact was published, not a row being set. The
+10^4-partition figures below still measure the *control plane*; the executed
+slice is smaller and is reported separately. No WRF-SFIRE, MPI, Slurm, or real
 remote provider was run.
 
 **Audit corrections (2026-08-16).** The template restated an operation as loose
@@ -190,16 +190,19 @@ runtime_root=$(mktemp -d /tmp/nasa-stage7-demo.XXXXXX)
 
 ## What this does not do
 
-- **Partitions are not executed through the Stage-1 runtime.** The demo drives
-  all 10,000 through admission → packetisation → outcome → commit, but the
-  outcomes are recorded rather than produced by running 10,000 subprocess
-  tasks. Bridging `WorkPacket` members to `BoundExecutionGraph` tasks is the
-  top Stage-7 follow-up, and until it exists this stage demonstrates the
-  partition *control plane*, not partitioned science.
-- **`PacketAttempt` is a record, not a submission.** There is no provider
-  integration, no external handle, and no fencing of duplicate packet results
-  at the provider boundary — only the per-member dedup that
-  `record_outcome` gives.
+- **Partitions execute, but they do not yet differ.** `compile_packet` turns a
+  packet into one Stage-1 task per partition and `execute_packet` runs it,
+  feeding real per-member outcomes back into the store. What is missing is
+  per-partition *input binding*: every partition of a template runs the same
+  resolved invocation, so this executes real science identically across the
+  space rather than tiling a dataset across it. That binding is the
+  acquisition bridge and is not built.
+- **The 10^4 figures measure the control plane, not 10^4 executions.** Running
+  ten thousand subprocesses is not what those numbers show; the executed slice
+  in the demo is eight partitions.
+- **A template whose invocation has unbound inputs refuses to execute.** That
+  is deliberate — inventing inputs is exactly what this stage must not do — but
+  it means only input-free invocations are partitionable today.
 - **The legacy eager tiling is untouched.** The roadmap says to remove eager
   `list(tile_iter)` behaviour "from the scalable path". The scalable path here
   is new and lazy by construction; `engine/tiled.py` remains the frozen Stage-0

@@ -12,6 +12,11 @@ from .admission import (
     BoundedAdmissionController,
     TopUpResult,
 )
+from .execution import (
+    PartitionNotExecutable,
+    compile_packet,
+    execute_packet,
+)
 from .manifest import CollectionManifest, CollectionState, CompletionPolicy
 from .packet import (
     MemberOutcome,
@@ -45,6 +50,7 @@ __all__ = [
     "PacketAttempt",
     "PacketResult",
     "PacketMember",
+    "PartitionNotExecutable",
     "PartitionAxis",
     "PartitionKey",
     "PartitionSetSpec",
@@ -53,5 +59,7 @@ __all__ = [
     "RetryDecision",
     "TopUpResult",
     "WorkPacket",
+    "compile_packet",
+    "execute_packet",
     "fuse_members",
 ]

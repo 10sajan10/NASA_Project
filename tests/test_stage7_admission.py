@@ -493,3 +493,97 @@ def test_a_committed_member_survives_a_late_duplicate_result(tmp_path):
 
     assert decision.committed == () and decision.requeued == ()
     assert store.state(manifest.collection_id).committed == committed
+
+
+# -- real partition execution --------------------------------------------
+
+
+def test_partitions_compile_into_real_stage_1_tasks(tmp_path):
+    from partitions import compile_packet
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+
+    graph = compile_packet(template, packet)
+    # One task per partition, and the runtime key *is* the partition's logical
+    # key, so results map back without a side table.
+    assert len(graph.tasks) == len(packet.members)
+    assert {task.key for task in graph.tasks} == set(packet.logical_task_keys)
+    assert all(task.component.operation_key == template.operation_key
+               for task in graph.tasks)
+
+
+def test_a_template_with_unbound_inputs_refuses_to_execute(tmp_path):
+    """Refuse rather than invent inputs the acquisition bridge would supply."""
+    from partitions import PartitionNotExecutable, compile_packet
+    from stage7.fixtures import resolve_all_selected
+
+    consuming = next(item for item in resolve_all_selected()
+                     if item.input_uses)
+    template = PartitionTaskTemplate.bind(consuming)
+    spec = _spec(2, 2)
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = CollectionManifest.bind(
+        set_id=spec.set_id, template_id=template.template_id,
+        expected=spec.total, policy=CompletionPolicy.ALL)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+
+    with pytest.raises(PartitionNotExecutable, match="inputs are already bound"):
+        compile_packet(template, packet)
+
+
+def test_partitions_execute_and_their_real_outcomes_drive_the_store(tmp_path):
+    """A partition commit is now an execution, not an asserted state."""
+    from engine.runtime import RunState
+    from partitions import execute_packet
+
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+
+    decision, run_state = execute_packet(
+        store, manifest.collection_id, template, packet,
+        runtime_root=tmp_path / "runtime")
+
+    assert run_state is RunState.SUCCEEDED
+    assert set(decision.committed) == set(packet.logical_task_keys)
+    assert decision.requeued == () and decision.exhausted == ()
+    state = store.state(manifest.collection_id)
+    assert state.committed == len(packet.members)
+    assert state.satisfies(manifest)
+    # Each partition has a durable attempt recording the real outcome.
+    for key in packet.logical_task_keys:
+        assert store.attempts_for(manifest.collection_id, key) == (
+            (1, "COMMITTED"),)
+
+
+def test_a_packet_refuses_a_foreign_template(tmp_path):
+    from partitions import compile_packet
+    from stage7.fixtures import resolve_all_selected
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+
+    other = PartitionTaskTemplate.bind(
+        resolve_all_selected()[0], estimated_cost_units=99)
+    with pytest.raises(ValueError, match="does not belong to this template"):
+        compile_packet(other, packet)

@@ -73,13 +73,17 @@ def resolve_one_selection() -> BoundInvocation:
             f"Stage-7 fixture could not resolve a selection: "
             f"{outcome.status.value}")
     chosen = set(outcome.selection.plan.selected_invocation_ids)
+    # example-pair is genuinely selected by the resolver *and* consumes no
+    # upstream inputs, so a partition of it is executable standalone. That
+    # matters: a template whose inputs are unbound could not be run without
+    # inventing them, which is exactly what this stage must not do.
     roots = [
         item.invocation for item in outcome.hypergraph.invocation_nodes
         if (item.invocation_id in chosen
-            and item.invocation.capability_id == "example-add")]
+            and item.invocation.capability_id == "example-pair")]
     if len(roots) != 1:
         raise RuntimeError(
-            "Stage-7 fixture expected exactly one selected example-add root")
+            "Stage-7 fixture expected exactly one selected example-pair root")
     _SELECTION_CACHE = roots[0]
     return _SELECTION_CACHE
 
