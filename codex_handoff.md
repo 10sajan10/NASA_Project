@@ -1,6 +1,6 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-16 (external audit remediation; MVP review still outstanding)
+Last updated: 2026-08-16 (audit remediation + Stage 9A-Core; MVP review outstanding)
 
 This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
@@ -16,7 +16,7 @@ context only.
    below and never stage them accidentally.
 5. Read `stage6/README.md`, `stage7/README.md`, `stage8/README.md`, and
    the "External audit and what it changed" section below.
-6. Run only the bounded Stage 0-9 tests initially. Do not run WRF-SFIRE, MPI,
+6. Run only the bounded Stage 0-9A tests initially. Do not run WRF-SFIRE, MPI,
    Slurm, real remote providers, or other heavy workloads. The Stage-5
    connectors are in-process; nothing in the suite touches a network.
 7. **Do not trust a stage label without reading its README.** An external
@@ -477,6 +477,43 @@ an observed peak would feed the revision machinery invented numbers.
 
 See `tests/test_stage9_runtime_bridge.py`.
 
+## Stage 9A-Core — conditional SLURM provider (simulated only)
+
+`engine/runtime/slurm.py` implements the queued-provider boundary:
+nonblocking submit, batched reconcile through `squeue` then `sacct`, cancel,
+persisted external handles, and orphan detection.
+
+**It has never talked to a real scheduler.** No `sbatch` was run. This node is
+not a SLURM submit environment, and every behavioural test drives a fake
+scheduler through the provider's command seam. Treat the provider as ready to
+be validated, not validated.
+
+The design centre is the crash window between `sbatch` returning a job ID and
+that ID reaching disk. Identity does not depend on our bookkeeping surviving:
+each job carries its attempt token in its SLURM job name
+(`nasa-attempt-<token>`), and submission asks the cluster whether that attempt
+already has a job before running `sbatch`. A finished job has left `squeue` but
+remains in `sacct`, so both are consulted.
+
+When **neither** `squeue` nor `sacct` can answer, the provider raises rather
+than submitting, and an unknown job ID reconciles to `SUBMISSION_UNKNOWN`
+rather than `FAILED`. Absence of evidence is not evidence the attempt never
+ran, and a duplicate submission on a scheduler can mean two multi-hour jobs and
+two conflicting artifacts. `sbatch` reporting failure is likewise not treated
+as proof the job did not land: a dropped client connection looks identical to a
+rejection, so the provider re-queries before concluding.
+
+Also held: placement never enters identity (node lists are operator metadata);
+`COMPLETED` without a published `result.json` is a failure, because exit zero
+is the scheduler's opinion rather than the worker's; reconciliation is batched
+so a shared scheduler is polled once per batch; unmapped states resolve to
+`SUBMISSION_UNKNOWN` rather than optimistic success.
+
+Not built: controller integration (the runtime still uses the local subprocess
+provider), job-script generation from a `TaskTemplate`, the MPI gang task, all
+of 9A-Scale arrays, and the cluster control-state deployment decision that
+opens the 9A-Core build list. See `stage9a/README.md`.
+
 ## Why the global resolver looks this way
 
 Do not replace Stage 3 with independent per-requirement greedy or local top-k
@@ -508,7 +545,7 @@ million-candidate discovery is solved.
 The **entire** repository suite passes after the audit remediation:
 
 ```text
-718 passed, 1 skipped, 7 xfailed
+744 passed, 1 skipped, 7 xfailed
 ```
 
 Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`,
@@ -678,8 +715,11 @@ Additional evidence:
   producer.
 - SQLite durability is same-node controller/process recovery only. It is not
   node-loss durability and must not be placed on unverified NFS/Lustre storage.
-- Slurm remains a future conditional provider. The development machine is a
-  private CHPC node, not a Slurm test environment.
+- **Stage 9A is simulated only.** The SLURM provider exists and is tested
+  against a fake scheduler; it has never submitted a job. This node is not a
+  SLURM submit environment, so real-cluster behaviour -- accounting lag,
+  `sacct` purge windows, QOS rejection, federation job-ID suffixes -- is
+  entirely unverified.
 - **Stage-6 planning latency misses the Section 9.5 target by roughly 5x** on a
   representative graph. This is the largest known gap at the MVP boundary.
 - Stage-6 evidence is **synthetic fixture data**. Real wind evidence remains
@@ -977,7 +1017,7 @@ in there, and push `v2`.
 Read codex_handoff.md completely. Verify branch v2 and Stage-8 commit 538eb65.
 Inspect git status and preserve the listed user-owned dirty files. Read
 stage6/README.md, stage7/README.md, and stage8/README.md. Run the full test
-suite (expect 718 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
+suite (expect 744 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
 or any real remote provider.
 
 Do not assume the Composition MVP review happened -- it was deferred when the

@@ -176,7 +176,8 @@ runnable, and no stage may claim capability it has not demonstrated.
 | [6](stage6/) | Dataset-versus-model slice, evidence gating, `CHOICE_REQUIRED` | prototype |
 | [7](stage7/) | Lazy partitions, bounded atomic admission, durable retry | control plane |
 | [8](stage8/) | Resource-aware scheduling policy, now driving the controller | policy + bridge |
-| 9A–9B | Conditional SLURM provider, then WRF integration behind it | |
+| [9A](stage9a/) | Conditional SLURM provider: token recovery, batched reconcile | simulated only |
+| 9B | WRF integration behind a certified provider | |
 
 Stages 5–8 are deliberately labelled below "done". An external audit found
 several claims running ahead of the implementation; those defects are fixed and
@@ -192,10 +193,12 @@ the labels now match what is demonstrated. The honest reading:
 - **Stage 8** is a scheduling policy plus a real bridge into the durable
   controller: concurrent attempts under a reservation ledger, measured on real
   subprocesses. Its three-policy makespan comparison remains a simulation.
+- **Stage 9A** has never talked to a real scheduler. No `sbatch` has been run;
+  every test drives a fake SLURM. It is ready to be validated, not validated.
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-# 718 passed, 1 skipped, 7 xfailed
+# 744 passed, 1 skipped, 7 xfailed
 ```
 
 The seven xfails are deliberate and **strict**: four frozen legacy-runtime
