@@ -600,7 +600,42 @@ state. Three arrays, one subgrid, three answers — which is precisely why an
 array's extent cannot establish its grid. Block-reducing the full 2140 folds
 ten columns of padded fuel into the result silently.
 
-Not done: nothing resamples; `cube/store.py` is not wired to the preflight (its
+### What a declared regrid would have to guarantee
+
+`transformations/resampling.py` closes the other half of the sentence
+"placement requires a declared transformation" by saying, per variable, what
+that transformation must preserve. The declarations come from WRF-SFIRE's own
+`Registry/registry.fire`, not from variable names: `TIGN_G` is "ignition time
+on ground" (s) so `arrival_s` takes the **earliest** value in a block;
+`FIRE_AREA` is "fraction of cell area on fire" (units 1) and `FUEL_FRAC` is
+"fuel remaining" (1), so both are areal fractions; `ROS` feeds `ros_max`, which
+is already an extremum; `NFUEL_CAT` is categorical.
+
+This does **not** overturn `models/wrf_sfire_adapter.py`, which already uses
+`min` for `arrival_s` and `mean` for the fractions, and whose `[:H, :W]`
+truncation does correctly drop the padding block. What it adds is the
+precondition those choices silently depend on:
+
+> A plain mean of per-cell fractions equals the area-weighted mean **only when
+> the cells in a block are equal-area.** That holds for an aligned integer
+> refinement inside one CRS, and stops holding across a reprojection, because
+> Lambert Conformal preserves angles rather than areas.
+
+An order statistic or a mode is indifferent to cell area; a mean is not. So
+under `REQUIRES_DECLARED_RESAMPLING` every target is refused — nothing is
+declared yet — but for two *different* reasons, each naming what would settle
+it: an area-weighted regrid for `fire_area`/`fuel_consumed`/`fire_intensity`,
+an order-preserving regrid for `arrival_s`/`ros_max`, nearest-or-majority for
+`nfuel_cat`. Integer *coarsening* is refused outright everywhere: it is
+replication, not aggregation, and would claim every 90 m subcell ignited at the
+same instant.
+
+Not done: nothing resamples and nothing aggregates — this layer decides
+admissibility only, and the arithmetic stays in the runtime operation layer.
+Building the actual Stage-4 reprojection means adding a `TransformationKind`, a
+runtime operation, and a binder; **both registries hash their own source file,
+so that invalidates every existing digest** and is a deliberate reviewable
+change rather than a side effect. `cube/store.py` is not wired to the preflight (its
 write-time check remains the last line of defence); the reader is not wired to
 `models/wrf_sfire_adapter.py`, which is user-owned and untouched, so nothing in
 the running pipeline consumes the declaration yet; and **no Stage-4
@@ -640,13 +675,13 @@ million-candidate discovery is solved.
 The **entire** repository suite passes:
 
 ```text
-794 passed, 1 skipped, 7 xfailed
+811 passed, 1 skipped, 7 xfailed
 ```
 
 Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`,
 Stage 7 `662/1/7`, Stage 8 `691/1/7`, audit remediation `718/1/7`,
 Stage 9A-Core `744/1/7`, placement contract `772/1/7`,
-WRF georeference reader `794/1/7`.
+WRF georeference reader `794/1/7`, declared resampling rules `811/1/7`.
 
 **The seventh xfail is new and is not a quarantine.** It is the strict-xfail
 Section 9.5 latency gate: a real, measured miss (see the Stage-6 exit evidence
@@ -1139,7 +1174,7 @@ in there, and push `v2`.
 Read codex_handoff.md completely. Verify branch v2 and its head commit.
 Inspect git status and preserve the listed user-owned dirty files. Read
 stage6/README.md, stage7/README.md, stage8/README.md, stage9a/README.md, and
-stage9b/README.md. Run the full test suite (expect 794 passed, 1 skipped,
+stage9b/README.md. Run the full test suite (expect 811 passed, 1 skipped,
 7 xfailed) without WRF-SFIRE, MPI, Slurm, or any real remote provider.
 
 Do not attempt Stage 9B. Its gates fail: no R1 golden fixture is promoted, no
@@ -1147,7 +1182,8 @@ R2/R2A lane exists, and no provider is certified (Stage 9A has never submitted
 a job). The 253/1001 placement blocker is typed and tested, but its producer
 half is now readable via models/wrf_georeference.py, and it shows the real
 answer is CRS_MISMATCH: WRF writes Lambert Conformal on a sphere, the cube is
-UTM. The declared Stage-4 reprojection that would resolve that does not exist,
+UTM. transformations/resampling.py states what a regrid must preserve per
+variable, but the declared Stage-4 reprojection itself does not exist,
 and wiring the reader into user-owned models/wrf_sfire_adapter.py needs the
 user's say-so. Ask before touching that file.
 

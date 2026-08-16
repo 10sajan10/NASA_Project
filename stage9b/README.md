@@ -147,6 +147,45 @@ fire mesh places onto a 900 m cube as an exact, aligned, whole-blocked 10×
 `INTEGER_REFINEMENT`. The fire mesh always could have been published; what was
 missing was a declared reprojection.
 
+## What a declared regrid would have to guarantee
+
+Placement says a transformation is *required*. `transformations/resampling.py`
+says what that transformation has to preserve, per variable, because the five
+`outputs.targets` do not share an aggregation. The declarations are read off
+WRF-SFIRE's own `Registry/registry.fire`, not inferred from names:
+
+| cube variable | source | registry description | aggregation |
+|---|---|---|---|
+| `arrival_s` | `TIGN_G` | "ignition time on ground" (s) | earliest — `MIN` |
+| `fire_area` | `FIRE_AREA` | "fraction of cell area on fire" (1) | areal-fraction mean |
+| `fuel_consumed` | `FUEL_FRAC` | "fuel remaining" (1) | areal-fraction mean |
+| `fire_intensity` | `FGRNHFX` | ground heat flux (W/m²) | area-weighted mean |
+| `ros_max` | `ROS` | rate of spread (m/s) | `MAX` |
+| `nfuel_cat` | `NFUEL_CAT` | fuel data (categorical) | majority |
+
+This does not overturn `models/wrf_sfire_adapter.py`, which already uses `min`
+for `arrival_s` and `mean` for the fractions, and whose `[:H, :W]` truncation
+does correctly drop the padding block. What the registry adds is the
+*precondition* those choices depend on, which was never stated:
+
+**A plain mean of per-cell fractions equals the area-weighted mean only when
+the cells in a block are equal-area.** That holds for an aligned integer
+refinement inside one CRS. It stops holding across a reprojection, because
+WRF's Lambert Conformal preserves angles, not areas — so cell areas vary across
+the domain. An order statistic (`MIN`, `MAX`) and a mode are indifferent to
+cell area; a mean is not.
+
+So under `REQUIRES_DECLARED_RESAMPLING` every target is refused — no
+transformation is declared — but they are refused for two *different* reasons,
+and each refusal names what would settle it: an area-weighted regrid for the
+three means, an order-preserving regrid for `arrival_s` and `ros_max`, and
+nearest/majority for `nfuel_cat`. A refusal that only says "no" moves the
+guessing rather than removing it.
+
+Integer *coarsening* is refused outright for every variable: it is replication,
+not aggregation, and would claim that every 90 m subcell ignited at the same
+instant.
+
 ## Test coverage
 
 - `tests/test_placement_contract.py` — 18 tests. Every grid is built from the
@@ -157,8 +196,10 @@ missing was a declared reprojection.
   what was read off the files and skips when they are absent (they are
   gitignored, 131 MB each); the synthetic lane covers every refusal path and
   runs everywhere.
+- `tests/test_resampling_rules.py` — 17 tests over the declared aggregations
+  and their preconditions.
 
-Suite: 794 passed, 1 skipped, 7 xfailed.
+Suite: 811 passed, 1 skipped, 7 xfailed.
 
 ## What this does not do
 
@@ -174,8 +215,13 @@ Suite: 794 passed, 1 skipped, 7 xfailed.
   two — and deciding the reprojection WRF→cube that `CRS_MISMATCH` demands — is
   the remaining work.
 - **No reprojection is declared.** Knowing that WRF's Lambert and the cube's
-  UTM disagree is not the same as having a costed, evidence-bearing Stage-4
-  transformation between them. That transformation is not written.
+  UTM disagree, and knowing what a regrid between them would have to preserve,
+  is still not a costed, evidence-bearing Stage-4 transformation. Building one
+  means adding a `TransformationKind`, a runtime operation, and a binder — and
+  both registries hash their own source file, so that invalidates every
+  existing digest. It is a deliberate, reviewable change, not a side effect.
+- **No aggregation is executed.** `transformations/resampling.py` decides
+  admissibility only; the arithmetic stays in the runtime operation layer.
 - **Only the 12:00 files were read.** The georeference is time-invariant, so
   this is sound for grid geometry, but no time series was inspected.
 - **It does not unblock Stage 9B.** R1 still has no promoted golden fixture and
