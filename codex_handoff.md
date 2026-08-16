@@ -1,6 +1,6 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-15 (Stage 7 complete; MVP review still outstanding)
+Last updated: 2026-08-15 (Stage 8 complete; MVP review still outstanding)
 
 This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
@@ -10,20 +10,25 @@ context only.
 
 1. Read this file completely.
 2. Work in `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project`.
-3. Verify branch `v2` and Stage-7 commit `59ffc8f` before changing anything.
+3. Verify branch `v2` and Stage-8 commit `538eb65` before changing anything.
 4. Inspect `git status` before edits. Preserve the user-owned dirty files listed
    below and never stage them accidentally.
-5. Read `stage5/README.md`, `stage6/README.md`, and `stage7/README.md`.
-6. Run only the bounded Stage 0-7 tests initially. Do not run WRF-SFIRE, MPI,
+5. Read `stage6/README.md`, `stage7/README.md`, and `stage8/README.md`.
+6. Run only the bounded Stage 0-8 tests initially. Do not run WRF-SFIRE, MPI,
    Slurm, real remote providers, or other heavy workloads. The Stage-5
    connectors are in-process; nothing in the suite touches a network.
 7. **The Composition MVP review is still outstanding.** Stage 6 reached that
-   boundary and the user directed that Stage 7 proceed anyway, so the review
-   was deferred rather than performed. Three findings are queued for it: the
-   Section 9.5 planning-latency gate is measured and **missed**, no real
-   reference observations exist for an evidence pack, and Stage-7 partitions
-   are not yet executed through the Stage-1 runtime. Ask the user before
-   assuming any of them is resolved.
+   boundary and the user directed that Stages 7 and 8 proceed anyway, so the
+   review was deferred rather than performed. Four findings are queued for it:
+   the Section 9.5 planning-latency gate is measured and **missed**; no real
+   reference observations exist for an evidence pack; Stage-7 partitions are
+   not executed through the Stage-1 runtime; and the Stage-8 scheduling policy
+   is not wired into that runtime either. Ask the user before assuming any of
+   them is resolved.
+
+   Note the shape of the last two: Stages 7 and 8 both built layers *around* a
+   Stage-1 controller that is still deliberately serial (`max_inflight=1`).
+   Bridging them into it is the single largest piece of unfinished work.
 
 ## User's actual objective
 
@@ -62,6 +67,7 @@ and source-versus-model choice. It is not special-cased by the resolver.
 - Stage-5 implementation commit: `a6e4a5c`
 - Stage-6 implementation commit: `bf4e360`
 - Stage-7 implementation commit: `59ffc8f`
+- Stage-8 implementation commit: `538eb65`
 - External roadmap:
   `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/nasa_project_docs/scientific_workflow_composition_plan.md`
 - Original poster:
@@ -346,6 +352,38 @@ See `objectives/`, `stage6/`, and `stage6/README.md`.
 
 See `partitions/`, `stage7/`, and `stage7/README.md`.
 
+### Stage 8 — resource-aware local scheduling
+
+- Added `scheduling/`. Ready work is ranked by remaining **critical path**
+  (computed once in reverse topological order, O(V+E)) combined with **aging**,
+  so the task unblocking the longest tail runs first but nothing starves.
+  Aging is capped by `starvation_ceiling_s`; without a ceiling a long-waiting
+  trivial task eventually outranks everything and the policy degenerates to
+  FIFO with extra steps.
+- On the imbalanced fixture — six short tasks that sort *before* a three-link
+  chain, two cores — the layer runner and FIFO both take 39.0 s and
+  event-driven takes **30.0 s**, which is the critical-path lower bound, so no
+  ordering could do better. The chain runs back-to-back with no gaps, which is
+  the roadmap's stated demonstration.
+- `ReservationLedger` tracks CPU, memory, GPU, and scratch and refuses any
+  reservation exceeding capacity on any dimension, **naming the dimension that
+  blocked**. A refused reservation leaves nothing behind. The simulator routes
+  every start through the same ledger, so `oversubscribed` is measured rather
+  than assumed.
+- Placement is best fit with environment affinity and deterministic tie-break.
+- `detect_capacity()` prefers the cgroup quota and affinity mask over
+  `os.cpu_count()`; `thread_environment()` caps `OMP_NUM_THREADS` and four
+  siblings to reserved cores, without which the ledger's arithmetic is fiction.
+- `ObservationHistory` returns the **declared** estimate until it has enough
+  successful samples, and every `Estimate` carries its `source`, so a guess is
+  never mistaken for a measurement. Median duration, worst-case memory, failed
+  attempts excluded from duration but counted in failure rate.
+- An underestimate produces a `DeploymentRevision` — an identified record with
+  declared value, observed peak, proposal, and reason. It is a **proposal**;
+  the declared envelope is never mutated, and a test asserts that.
+
+See `scheduling/`, `stage8/`, and `stage8/README.md`.
+
 ## Why the global resolver looks this way
 
 Do not replace Stage 3 with independent per-requirement greedy or local top-k
@@ -377,12 +415,12 @@ million-candidate discovery is solved.
 The **entire** repository suite passed with Stage 6 in the working tree:
 
 ```text
-662 passed, 1 skipped, 7 xfailed
+691 passed, 1 skipped, 7 xfailed
 ```
 
 Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`,
-Stage 7 `662/1/7`. Stage 7 added 45 tests and changed no existing
-expectation at all — it is additive on top of the composition stack.
+Stage 7 `662/1/7`, Stage 8 `691/1/7`. Stages 7 and 8 each added tests and
+changed no existing expectation at all — both are additive layers.
 
 **The seventh xfail is new and is not a quarantine.** It is the strict-xfail
 Section 9.5 latency gate: a real, measured miss (see the Stage-6 exit evidence
@@ -458,7 +496,22 @@ The executable Stage-7 proof completed:
   retry (0 when the template is not retry-safe)
 - a partially committed collection did **not** satisfy the `ALL` policy
 
-Run any of them only with a fresh node-local temporary directory:
+The executable Stage-8 proof completed:
+
+- layer runner 39.0 s, FIFO 39.0 s, **event-driven 30.0 s** on the imbalanced
+  graph — a 23.1% improvement that also equals the critical-path lower bound
+- the chain ran back-to-back (0→10→20→30) with no wait on unrelated work
+- peak usage 2 of 2 cores; never oversubscribed under any policy
+- a starving task started at 40.0 s without aging and 10.0 s with it, at
+  identical makespan
+- a reservation was refused naming `cpu_cores`; affinity routed work to the
+  `gdal` site; thread caps matched reserved cores
+- estimates went DECLARED → DECLARED → OBSERVED as samples accumulated, and an
+  underestimate produced a recorded proposal with the declared envelope intact
+
+Stage 8's demo needs no runtime root: `.venv/bin/python scripts/run_stage8_demo.py`.
+
+Run any of the others only with a fresh node-local temporary directory:
 
 ```bash
 runtime_root=$(mktemp -d /tmp/nasa-stage3-demo.XXXXXX)
@@ -552,6 +605,21 @@ Additional evidence:
   concept per decision report is supported.
 - `quality_under_budget`, `minimum_dependency_latency`, and user-defined
   lexicographic policies from Section 6.4 remain deferred.
+- **The Stage-8 scheduling policy is not wired into the Stage-1 controller.**
+  That controller still enforces `max_inflight=1` and is deliberately serial.
+  Stage 8 delivers the policy, tested in isolation; making it the runtime's
+  scheduler is unfinished.
+- **Stage-8 makespans come from a discrete-event simulation**, not wall-clock
+  runs of real subprocesses. Durations are declared or measured; the simulator
+  answers whether a policy orders work better, not how long a real run takes.
+  Resource feasibility inside it is real — every start goes through the ledger.
+- **Nothing collects Stage-8 observations from real attempts.** `peak_memory_mb`
+  is never measured; the revision machinery is correct but is driven by
+  caller-supplied numbers.
+- **Stage-5 acquisition throttling and network-site feasibility are not
+  integrated** into Stage-8 admission, though the Build section asks for it.
+  `ExecutionSite` filters on network classes, but the per-provider quota ledger
+  stays separate. GPUs are counted, not pinned to IDs.
 - **Stage-7 partitions are not executed through the Stage-1 runtime.** The
   demo drives all 10,000 through admission, packetisation, and commit, but the
   outcomes are *recorded* rather than produced by running 10,000 subprocess
@@ -720,31 +788,63 @@ scale, not 10^4 scientific executions. Bridging `WorkPacket` members to
 and it is also what would make the Section 8.7 five-percent fusion-overhead
 target measurable.
 
-## Next: the deferred Composition MVP review
+## Stage-8 exit evidence (met, with one scope boundary)
+
+All four Stage-8 exit criteria are met at the policy level, each asserted by a
+test rather than only shown in the demo:
+
+- **CPU and memory are not oversubscribed.** The ledger refuses on any
+  dimension and names the one that blocked; the simulator routes every start
+  through it, so `oversubscribed` is measured. Peak usage was 2 of 2 cores.
+- **Low-priority work cannot starve.** A task nothing depends on started at
+  40.0 s without aging and 10.0 s with it, at identical makespan. Aging is
+  capped so it cannot invert the graph permanently.
+- **Event-driven execution improves makespan over the layer runner.** 39.0 s →
+  30.0 s on the imbalanced graph, a 23.1% improvement that also equals the
+  critical-path lower bound, with the chain running back-to-back.
+- **Resource underestimation is never an unrecorded mutation.** It produces an
+  identified `DeploymentRevision` carrying declared value, observed peak,
+  proposal, and reason; the declared envelope is left untouched.
+
+**The scope boundary:** the policy is **not wired into the live Stage-1
+controller**, which still enforces `max_inflight=1` and is deliberately serial.
+Makespans come from a deterministic discrete-event simulation over declared or
+measured durations, not from wall-clock runs of real subprocesses — the
+simulator answers whether a policy orders work better, not how long a real run
+takes. Resource feasibility inside it is real. Nothing yet instruments the
+Stage-1 worker to produce observations, so `peak_memory_mb` is never actually
+measured.
+
+## Next: the deferred Composition MVP review, or the runtime bridge
 
 Stage 6 reached the roadmap's Composition MVP release boundary. The user
-directed that Stage 7 proceed anyway, so **the review was deferred, not
-performed**. It is still the right next step, and three findings are queued for
-it:
+directed that Stages 7 and 8 proceed anyway, so **the review was deferred, not
+performed**. Four findings are queued for it:
 
-1. **Planning latency misses its Section 9.5 target by roughly 5x** on a
-   representative graph (23.3 s p95 against 5 s, MILP-dominated). Solver
-   strategy, not graph size — the benchmark asserts a floor on graph size so
-   the gate cannot be gamed.
-2. **No real reference observations exist.** Stage-6 evidence is synthetic
-   fixture data and `stage2/wind_evidence_pack_v1.json` is still frozen at
-   `status: UNAVAILABLE`. This is a data-acquisition and review task.
-3. **Stage-7 partitions do not execute.** See the scope boundary above.
+1. **Planning latency misses its Section 9.5 target by roughly 5x** (23.3 s p95
+   against 5 s, MILP-dominated). Solver strategy, not graph size — the
+   benchmark asserts a floor on graph size so the gate cannot be gamed.
+2. **No real reference observations exist.** Stage-6 evidence is synthetic and
+   `stage2/wind_evidence_pack_v1.json` is still `status: UNAVAILABLE`.
+3. **Stage-7 partitions do not execute** through the Stage-1 runtime.
+4. **The Stage-8 policy is not the runtime's scheduler.**
 
-If the user instead wants to continue building, Stage 8 is resource-aware local
-scheduling: critical-path plus aging priority, real CPU/memory/GPU/scratch
-reservations, best-fit placement, capped nested BLAS/OpenMP threads, and
-observed-duration history replacing declared estimates. Note that Stage 8's
-observation history is also what Stage 7's fusion needs to stop guessing.
+Findings 3 and 4 share one root cause and one fix. Stages 7 and 8 both built
+layers *around* a Stage-1 controller that is deliberately serial. The single
+highest-value piece of work available is the **runtime bridge**: lift
+`max_inflight=1`, drive admission from `BoundedAdmissionController`, order
+ready work with the Stage-8 policy, reserve through the ledger, and instrument
+the worker to emit `TaskObservation` values. That would make Stages 7 and 8
+real rather than adjacent, and would let the fusion-overhead and makespan
+claims be measured on wall-clock rather than simulated.
+
+If instead the user wants to keep moving down the roadmap, Stage 9A is the
+conditional SLURM provider — but note it is explicitly gated on an eligible
+workload or site requiring it, and this development machine is a private CHPC
+node, not a Slurm test environment.
 
 ## Later stages, briefly
 
-- **Stage 8:** resource-aware local/fixed-allocation scheduling and placement.
 - **Stage 9A:** conditional nonblocking Slurm provider, only when an eligible
   workload/site requires it.
 - **Stage 9B:** WRF integration through a proven execution provider, using
@@ -782,19 +882,27 @@ in there, and push `v2`.
 ## Suggested first prompt on the new machine
 
 ```text
-Read codex_handoff.md completely. Verify branch v2 and Stage-7 commit 59ffc8f.
+Read codex_handoff.md completely. Verify branch v2 and Stage-8 commit 538eb65.
 Inspect git status and preserve the listed user-owned dirty files. Read
-stage5/README.md, stage6/README.md, and stage7/README.md. Run the full test
-suite (expect 662 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
+stage6/README.md, stage7/README.md, and stage8/README.md. Run the full test
+suite (expect 691 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
 or any real remote provider.
 
 Do not assume the Composition MVP review happened -- it was deferred when the
-user chose to continue past the Stage-6 boundary. Three findings are queued for
+user chose to continue past the Stage-6 boundary. Four findings are queued for
 it: planning latency misses its Section 9.5 target by ~5x and is MILP-dominated
 (treat solver strategy as the target, not graph shrinking -- the benchmark
 asserts a floor on graph size so the gate cannot be gamed); no real held-out
-reference observations exist for an evidence pack; and Stage-7 partitions are
-admitted and committed but never executed through the Stage-1 runtime. Ask the
-user which of those to take on, or whether to proceed to Stage 8 resource-aware
-scheduling, before writing any code.
+reference observations exist for an evidence pack; Stage-7 partitions are
+admitted and committed but never executed through the Stage-1 runtime; and the
+Stage-8 scheduling policy is not wired into that runtime either.
+
+The last two share a root cause: both stages built layers around a Stage-1
+controller that is still deliberately serial (max_inflight=1). The runtime
+bridge -- lifting that guard, driving admission from BoundedAdmissionController,
+ordering with the Stage-8 policy, reserving through the ledger, and
+instrumenting the worker to emit TaskObservation values -- is the highest-value
+work available, and would let the fusion-overhead and makespan claims be
+measured on wall-clock rather than simulated. Ask the user which to take on
+before writing any code.
 ```
