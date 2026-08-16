@@ -11,6 +11,7 @@ from .observations import (
     Estimate,
     EstimateSource,
     ObservationHistory,
+    ObservationKind,
     TaskObservation,
 )
 from .priority import (
@@ -47,6 +48,7 @@ __all__ = [
     "EstimateSource",
     "ExecutionSite",
     "ObservationHistory",
+    "ObservationKind",
     "OversubscriptionError",
     "PriorityPolicy",
     "Reservation",

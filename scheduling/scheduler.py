@@ -21,6 +21,7 @@ same :class:`ReservationLedger` that refuses to oversubscribe.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Mapping
@@ -68,8 +69,10 @@ class SchedulableTask:
             raise ValueError("a task needs at least one core and some memory")
         if (isinstance(self.declared_duration_s, bool)
                 or not isinstance(self.declared_duration_s, (int, float))
+                or not math.isfinite(float(self.declared_duration_s))
                 or self.declared_duration_s < 0):
-            raise ValueError("declared duration must be non-negative")
+            raise ValueError(
+                "declared duration must be a finite non-negative number")
         for values, label in ((self.dependencies, "dependencies"),
                               (self.required_environments, "environments"),
                               (self.required_networks, "networks")):

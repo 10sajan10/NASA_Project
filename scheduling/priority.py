@@ -15,6 +15,7 @@ template's rank rather than each computing their own.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
@@ -33,8 +34,12 @@ class ScheduledNode:
         _required_text(self.task_key, "scheduled node task_key")
         if (isinstance(self.duration_estimate_s, bool)
                 or not isinstance(self.duration_estimate_s, (int, float))
+                or not math.isfinite(float(self.duration_estimate_s))
                 or self.duration_estimate_s < 0):
-            raise ValueError("duration estimate must be non-negative")
+            # NaN compares false against every bound, so a bare "< 0" test
+            # lets it through and then poisons every min/max in the simulator.
+            raise ValueError(
+                "duration estimate must be a finite non-negative number")
         if (not isinstance(self.dependencies, tuple)
                 or any(not isinstance(item, str) or not item
                        for item in self.dependencies)):
@@ -109,8 +114,9 @@ class PriorityPolicy:
         for name in ("aging_weight_per_s", "starvation_ceiling_s"):
             value = getattr(self, name)
             if (isinstance(value, bool)
-                    or not isinstance(value, (int, float)) or value < 0):
-                raise ValueError(f"{name} must be non-negative")
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or value < 0):
+                raise ValueError(f"{name} must be a finite non-negative number")
 
     def score(self, critical_path_rank: float, waiting_s: float) -> float:
         """Higher wins. Aging is capped so it cannot invert the graph forever.

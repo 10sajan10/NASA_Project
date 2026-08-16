@@ -120,11 +120,11 @@ def _observations() -> dict[str, Any]:
 
     first = history.duration_estimate(key, fx.CHAIN_DURATION_S)
     history.record_all([
-        TaskObservation(key, duration_s=4.0, peak_memory_mb=300),
-        TaskObservation(key, duration_s=4.5, peak_memory_mb=310),
+        TaskObservation.completed(key, 4.0, memory_mb=300),
+        TaskObservation.completed(key, 4.5, memory_mb=310),
     ])
     still_declared = history.duration_estimate(key, fx.CHAIN_DURATION_S)
-    history.record(TaskObservation(key, duration_s=4.2, peak_memory_mb=320))
+    history.record(TaskObservation.completed(key, 4.2, memory_mb=320))
     measured = history.duration_estimate(key, fx.CHAIN_DURATION_S)
     revision = history.review_envelope(key, declared)
 
@@ -143,11 +143,32 @@ def _observations() -> dict[str, Any]:
             and measured.measured),
         "underestimate_recorded": revision is not None,
         "revision": revision.to_dict() if revision else None,
+        "oom_evidence_is_not_discarded": _oom_revision(),
         "revision_is_a_proposal_not_a_mutation": (
             revision is not None
             and revision.declared.memory_mb == declared.memory_mb
             and revision.proposed.memory_mb > declared.memory_mb),
         "makespan_with_measured_history_s": with_history.makespan_s,
+    }
+
+
+def _oom_revision() -> dict[str, Any]:
+    """An attempt killed by a memory limit must still drive a revision.
+
+    The audit found failed attempts excluded wholesale, so the single most
+    informative signal -- the OOM -- produced nothing at all.
+    """
+    history = ObservationHistory(minimum_samples=1)
+    history.record(TaskObservation.resource_exhausted(
+        "z-chain-1", 1.0, dimension="memory_mb", memory_mb=900))
+    revision = history.review_envelope(
+        "z-chain-1", ResourceEnvelopeSpec(cpu_cores=1, memory_mb=256))
+    return {
+        "revision_emitted": revision is not None,
+        "dimensions": list(revision.dimensions) if revision else [],
+        "from_censored_evidence": (
+            revision.from_censored_evidence if revision else None),
+        "proposed_memory_mb": revision.proposed.memory_mb if revision else None,
     }
 
 

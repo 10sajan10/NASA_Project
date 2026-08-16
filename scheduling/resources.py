@@ -105,9 +105,21 @@ class ExecutionSite:
     capacity: ResourceEnvelopeSpec
     environment_classes: tuple[str, ...] = ()
     network_classes: tuple[str, ...] = ()
+    host_id: str | None = None
+    host_capacity: ResourceEnvelopeSpec | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.site_id, "site_id")
+        # Logical sites can share physical hardware.  Without a host the
+        # ledger can only promise that each *logical* site is within its own
+        # declared capacity, which says nothing about the machine.
+        if self.host_id is not None:
+            _required_text(self.host_id, "host_id")
+            if not isinstance(self.host_capacity, ResourceEnvelopeSpec):
+                raise TypeError(
+                    "a site naming a host must declare that host's capacity")
+        elif self.host_capacity is not None:
+            raise ValueError("host capacity requires a host_id")
         if not isinstance(self.capacity, ResourceEnvelopeSpec):
             raise TypeError("site capacity must be a ResourceEnvelopeSpec")
         for values, label in ((self.environment_classes, "environment classes"),
@@ -125,6 +137,9 @@ class ExecutionSite:
             "capacity": self.capacity.to_dict(),
             "environment_classes": list(self.environment_classes),
             "network_classes": list(self.network_classes),
+            "host_id": self.host_id,
+            "host_capacity": (self.host_capacity.to_dict()
+                              if self.host_capacity is not None else None),
         }
 
 
@@ -186,6 +201,25 @@ class ReservationLedger:
         if not self._sites:
             raise ValueError("a ledger needs at least one execution site")
         self._live: dict[str, Reservation] = {}
+        self._host_capacity: dict[str, ResourceEnvelopeSpec] = {}
+        for site in self._sites.values():
+            if site.host_id is None:
+                continue
+            assert site.host_capacity is not None
+            known = self._host_capacity.setdefault(
+                site.host_id, site.host_capacity)
+            if known != site.host_capacity:
+                raise ValueError(
+                    f"sites disagree about the capacity of host "
+                    f"{site.host_id!r}")
+
+    def host_used(self, host_id: str) -> ResourceEnvelopeSpec:
+        total = ResourceEnvelopeSpec.zero()
+        for reservation in self._live.values():
+            site = self._sites[reservation.site_id]
+            if site.host_id == host_id:
+                total = total.plus(reservation.envelope)
+        return total
 
     @property
     def sites(self) -> tuple[ExecutionSite, ...]:
@@ -235,6 +269,17 @@ class ReservationLedger:
             if requested > getattr(free, dimension):
                 raise OversubscriptionError(
                     site_id, dimension, requested, getattr(free, dimension))
+        # Two logical sites can map onto the same physical CPUs; a per-site
+        # check alone would let them jointly overrun the machine.
+        if site.host_id is not None:
+            assert site.host_capacity is not None
+            host_free = site.host_capacity.minus(self.host_used(site.host_id))
+            for dimension in dimensions:
+                requested = getattr(envelope, dimension)
+                if requested > getattr(host_free, dimension):
+                    raise OversubscriptionError(
+                        site.host_id, dimension, requested,
+                        getattr(host_free, dimension))
         reservation = Reservation.bind(task_key, site_id, envelope)
         self._live[task_key] = reservation
         return reservation
@@ -250,9 +295,13 @@ class ReservationLedger:
         return tuple(sorted(self._live))
 
     def invariant_holds(self) -> bool:
-        """Every site's live usage is within its declared capacity."""
-        return all(self.used(site.site_id).fits_within(site.capacity)
-                   for site in self.sites)
+        """Live usage is within every declared site *and host* capacity."""
+        if not all(self.used(site.site_id).fits_within(site.capacity)
+                   for site in self.sites):
+            return False
+        return all(
+            self.host_used(host_id).fits_within(capacity)
+            for host_id, capacity in self._host_capacity.items())
 
 
 def best_fit_site(ledger: ReservationLedger, envelope: ResourceEnvelopeSpec, *,
@@ -274,13 +323,20 @@ def best_fit_site(ledger: ReservationLedger, envelope: ResourceEnvelopeSpec, *,
         if not ledger.can_fit(site.site_id, envelope):
             continue
         free = ledger.available(site.site_id)
+        # Scarce accelerators and scratch dominate: consuming the only GPU
+        # node for CPU-only work is how a feasible schedule becomes a bad one.
+        # Sites are ranked on the resources the task does *not* need first, so
+        # scarce capacity is preserved for work that does need it.
+        scarcity = (free.gpus - envelope.gpus,
+                    free.scratch_mb - envelope.scratch_mb)
         slack = (free.cpu_cores - envelope.cpu_cores,
                  free.memory_mb - envelope.memory_mb)
         affinity = 0 if required_environments else len(site.environment_classes)
-        candidates.append((slack[0], slack[1], affinity, site.site_id))
+        candidates.append((scarcity[0], scarcity[1], slack[0], slack[1],
+                           affinity, site.site_id))
     if not candidates:
         return None
-    return min(candidates)[3]
+    return min(candidates)[-1]
 
 
 def thread_environment(envelope: ResourceEnvelopeSpec,
