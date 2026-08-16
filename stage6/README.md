@@ -2,7 +2,7 @@
 
 Status: **prototype** — implemented and acceptance-tested on 2026-08-15,
 revised 2026-08-16 after an external audit. Two exit gates do not hold: the
-Section 9.5 planning-latency budget is **measured and missed** by roughly 5x
+Section 9.5 planning-latency budget is **measured and missed** by roughly 3x
 (see "The latency gate fails"), and the evidence driving the whole
 dataset-versus-model contest is **synthetic fixture data** — no real held-out
 reference observations exist. What the stage demonstrates is the decision
@@ -142,7 +142,7 @@ Stage 3. Measured on the frozen representative graph
 | | Value |
 |---|---|
 | invocations / arcs / levels | 126 / 250 / 6 — **all within caps** |
-| p95 total (30 warm runs) | **23.3 s** |
+| p95 total (30 warm runs) | **15.1 s** |
 | budget | 5 s |
 | within budget | **no** |
 
@@ -153,12 +153,20 @@ at 83% of planning time and scaling sharply:
 |---|---|---|---|
 | 30 | 1.1 s | 0.7 s | 3 |
 | 64 | 5.5 s | 4.6 s | 7 |
-| 126 | 23.3 s | — | — |
+| 126 | 15.1 s | — | — |
 
-Enabling HiGHS presolve helps materially (4.6 s → 3.1 s solve at 64
-invocations) but nowhere near enough, and presolve is disabled by default for a
-documented correctness reason: Stage 3 found this HiGHS build returning a false
-infeasibility on a valid regression.
+Presolve is now **enabled** by default. It was disabled because this HiGHS
+build returns a false infeasibility on a valid formulation, but the solver path
+already re-confirms any presolved infeasibility on the unpresolved model, so
+presolve cannot turn a feasible problem into UNSAT — the guard was the fix, and
+disabling presolve on top of it was paying twice. That bought 23.3 s → 15.1 s,
+a 37% reduction at identical cost and proven optimality.
+
+It is not enough. The remaining cost is structural: solver calls scale with
+graph width because deterministic tie-breaking freezes producer bits in
+30-bit lexicographic chunks, so a 126-invocation graph needs 11 solves rather
+than one. Closing the gate means changing that formulation or accepting a
+larger budget — both are decisions for the MVP review, not silent edits.
 
 **This result is recorded, not engineered around.** Shrinking the graph until
 the number looked good would have produced a passing gate that meant nothing,

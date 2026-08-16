@@ -28,7 +28,7 @@ context only.
 
 8. **The Composition MVP review is still outstanding.** Three findings remain
    queued for it: the Section 9.5 planning-latency gate is measured and
-   **missed** by roughly 5x; no real held-out reference observations exist for
+   **missed** by roughly 3x; no real held-out reference observations exist for
    an evidence pack, so Stage-6 evidence is synthetic; and Stage-7 partitions
    still do not execute per-partition science through the Stage-1 runtime.
    Ask the user before assuming any of them is resolved.

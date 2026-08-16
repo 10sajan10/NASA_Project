@@ -93,9 +93,11 @@ def test_the_frozen_profile_is_a_real_graph_not_a_toy(frozen):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Section 9.5 p95 <= 5 s is NOT met on this node: the two-phase MILP "
-        "dominates planning and exceeds the budget at ~126 invocations, well "
-        "inside the 1,000-node cap. Recorded as a real miss. If this starts "
+        "Section 9.5 p95 <= 5 s is NOT met on this node: 15.1 s at ~126 "
+        "invocations, well inside the 1,000-node cap. Enabling presolve took "
+        "it from 23.3 s; the rest is structural, because deterministic "
+        "tie-breaking freezes producer bits in 30-bit chunks so solver calls "
+        "scale with graph width. Recorded as a real miss. If this starts "
         "passing, re-freeze the profile and update stage6/README.md and the "
         "roadmap rather than deleting this marker."))
 def test_section_9_5_latency_budget_is_met(frozen):
