@@ -1,6 +1,6 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-15 (Stage 8 complete; MVP review still outstanding)
+Last updated: 2026-08-16 (external audit remediation; MVP review still outstanding)
 
 This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
@@ -10,25 +10,28 @@ context only.
 
 1. Read this file completely.
 2. Work in `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project`.
-3. Verify branch `v2` and Stage-8 commit `538eb65` before changing anything.
+3. Verify branch `v2` and the audit-remediation commits before changing
+   anything (see "Repository and roadmap" below).
 4. Inspect `git status` before edits. Preserve the user-owned dirty files listed
    below and never stage them accidentally.
-5. Read `stage6/README.md`, `stage7/README.md`, and `stage8/README.md`.
-6. Run only the bounded Stage 0-8 tests initially. Do not run WRF-SFIRE, MPI,
+5. Read `stage6/README.md`, `stage7/README.md`, `stage8/README.md`, and
+   the "External audit and what it changed" section below.
+6. Run only the bounded Stage 0-9 tests initially. Do not run WRF-SFIRE, MPI,
    Slurm, real remote providers, or other heavy workloads. The Stage-5
    connectors are in-process; nothing in the suite touches a network.
-7. **The Composition MVP review is still outstanding.** Stage 6 reached that
-   boundary and the user directed that Stages 7 and 8 proceed anyway, so the
-   review was deferred rather than performed. Four findings are queued for it:
-   the Section 9.5 planning-latency gate is measured and **missed**; no real
-   reference observations exist for an evidence pack; Stage-7 partitions are
-   not executed through the Stage-1 runtime; and the Stage-8 scheduling policy
-   is not wired into that runtime either. Ask the user before assuming any of
-   them is resolved.
+7. **Do not trust a stage label without reading its README.** An external
+   audit in August 2026 found several claims running ahead of the
+   implementation. Those defects are fixed and the labels were downgraded to
+   match what is demonstrated: Stage 5 and Stage 6 are **prototypes**, Stage 7
+   is a **control-plane prototype**, Stage 8 is a **policy plus a working
+   runtime bridge**. See the audit section below.
 
-   Note the shape of the last two: Stages 7 and 8 both built layers *around* a
-   Stage-1 controller that is still deliberately serial (`max_inflight=1`).
-   Bridging them into it is the single largest piece of unfinished work.
+8. **The Composition MVP review is still outstanding.** Three findings remain
+   queued for it: the Section 9.5 planning-latency gate is measured and
+   **missed** by roughly 5x; no real held-out reference observations exist for
+   an evidence pack, so Stage-6 evidence is synthetic; and Stage-7 partitions
+   still do not execute per-partition science through the Stage-1 runtime.
+   Ask the user before assuming any of them is resolved.
 
 ## User's actual objective
 
@@ -384,6 +387,96 @@ See `partitions/`, `stage7/`, and `stage7/README.md`.
 
 See `scheduling/`, `stage8/`, and `stage8/README.md`.
 
+## External audit and what it changed
+
+An independent audit in August 2026 reviewed Stages 4-8 and found that several
+claims ran ahead of the implementation. Its verdict on status was accepted:
+Stage 6 was a synthetic prototype, Stage 7 a control plane rather than
+partition execution, and Stage 8 a policy simulator rather than the runtime
+scheduler. Every finding below was independently reproduced before being fixed,
+and each fix carries a regression test.
+
+**Defects in the unsafe direction** (a wrong answer, not a missing feature):
+
+- *Stage 6 could falsely declare evidence separation.* Interval separation
+  asked whether all intervals shared one common intersection, which is not the
+  question. With A=[0,2], B=[1,3], C=[4,5] it reported separation while A and B
+  plainly overlap. Now a pairwise sweep, with touching endpoints counted as
+  overlapping.
+- *Stage 6 ignored the evidence snapshot it was given*, trusting a
+  caller-supplied profile dictionary instead; an empty unrelated snapshot still
+  produced two comparable alternatives. Readings are now resolved by deriving
+  each producer's evidence subject and matching it against the frozen snapshot.
+  The dictionary was deleted, not deprecated. The snapshot is part of report
+  identity.
+- *Stage 7 did not reuse the resolved operation.* The fixture resolved
+  `example-add`/`synthetic.add.v1` and then built the template from
+  `synthetic.constant.v1` with unrelated inputs, so "one scientific selection
+  reused by 10,000 partitions" reused only the invocation hash. The template now
+  carries a verified `BoundInvocation`. The old test passed because it checked
+  the label rather than the operation -- worth remembering.
+- *Stage 7 admission accepted a foreign spec or template* while advancing the
+  cursor, so the wrong task became permanent. The collection's registered
+  definitions are now authoritative.
+- *Stage 5 coverage was assessed as independent spatial and temporal
+  projections*, so two assets whose projections looked complete could hide a
+  hole in their Cartesian product. Now assessed over the product, with a
+  `SPATIOTEMPORAL_GAP` code, and a requested halo is mandatory input coverage
+  rather than a selection hint.
+- *Stage 5 binding did not freeze its query payload*, so a caller could mutate
+  it after binding and relabel the same manifest root as another concept.
+- *Stage 8 accepted non-finite durations.* NaN compares false against every
+  bound, so a bare `< 0` check let it through and then poisoned the simulator.
+- *Stage 8 could not see physical oversubscription.* Two eight-core logical
+  sites on one eight-core host accepted two eight-core tasks. Sites may now
+  declare a host and the ledger enforces its budget too.
+
+**Claimed-but-absent behaviour:**
+
+- *Stage 7 retry was impossible.* Failed members were marked FAILED while packet
+  generation selected only ADMITTED rows, and there was no requeue API at all.
+  `record_packet_result` now performs the transition and writes a durable
+  `partition_attempts` row; the ceiling and non-retry-safe cases are terminal.
+- *Stage 8 discarded its most informative evidence.* An OOM-like failed attempt
+  produced no revision because all failures were excluded. Observations are now
+  typed, a resource-exhausted attempt is a censored lower bound, and revisions
+  cover all four dimensions rather than memory alone.
+- *`PacketAttempt` mixed identity with outcome*, so a serialized FAILED could be
+  edited to COMMITTED and still deserialize. Attempt identity is now minted
+  before submission from packet, number, and fence token; `PacketResult` is
+  separately identified over its outcomes and verifies that on load.
+
+**Overstated claims, corrected in words rather than code:**
+
+- "Low-priority work cannot starve" is only true for a rank gap within
+  `ceiling x weight`. The cap is still wanted -- without it the policy
+  degenerates to FIFO -- so the honest property is *bounded delay*, and a test
+  now pins both sides.
+- Stage-8 makespans of 39/39/30 remain a **simulation**. The wall-clock
+  numbers are the bridge ones below.
+
+## The runtime bridge (built)
+
+Stages 7 and 8 had built layers *around* a deliberately serial controller. That
+is now connected. `max_inflight` above 1 is permitted **only** against a
+`ReservationLedger` -- raising it alone would be the oversubscription the policy
+exists to prevent. The dispatch loop orders ready work with the Stage-8
+critical-path and aging policy, reserves capacity before dispatch, skips a task
+that does not fit rather than blocking behind it, and releases when a task
+leaves an active state rather than on process exit. Fencing, leases, and the
+atomic commit path are untouched: concurrency is across distinct tasks, each
+keeping its own fence. The default is still 1, so every prior Stage-1 guarantee
+holds unless a caller opts in.
+
+Measured on real subprocesses: eight 0.4s tasks take about **6.9s serially and
+1.9s four-wide**, each committing exactly one attempt. A two-core ledger caps
+real concurrency at two even when eight are permitted. Observations now come
+from real attempts; peak usage records the *reserved envelope* rather than a
+measurement, because nothing samples memory yet and reporting a reservation as
+an observed peak would feed the revision machinery invented numbers.
+
+See `tests/test_stage9_runtime_bridge.py`.
+
 ## Why the global resolver looks this way
 
 Do not replace Stage 3 with independent per-requirement greedy or local top-k
@@ -412,15 +505,14 @@ million-candidate discovery is solved.
 
 ## Verification evidence at handoff
 
-The **entire** repository suite passed with Stage 6 in the working tree:
+The **entire** repository suite passes after the audit remediation:
 
 ```text
-691 passed, 1 skipped, 7 xfailed
+718 passed, 1 skipped, 7 xfailed
 ```
 
 Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`,
-Stage 7 `662/1/7`, Stage 8 `691/1/7`. Stages 7 and 8 each added tests and
-changed no existing expectation at all — both are additive layers.
+Stage 7 `662/1/7`, Stage 8 `691/1/7`, audit remediation `718/1/7`.
 
 **The seventh xfail is new and is not a quarantine.** It is the strict-xfail
 Section 9.5 latency gate: a real, measured miss (see the Stage-6 exit evidence
@@ -885,7 +977,7 @@ in there, and push `v2`.
 Read codex_handoff.md completely. Verify branch v2 and Stage-8 commit 538eb65.
 Inspect git status and preserve the listed user-owned dirty files. Read
 stage6/README.md, stage7/README.md, and stage8/README.md. Run the full test
-suite (expect 691 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
+suite (expect 718 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
 or any real remote provider.
 
 Do not assume the Composition MVP review happened -- it was deferred when the

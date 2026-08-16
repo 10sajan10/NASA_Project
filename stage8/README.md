@@ -1,9 +1,30 @@
 # Stage 8 — Resource-aware local scheduling
 
-Status: **scheduling policy implemented and acceptance-tested** on 2026-08-15.
-One scope boundary is explicit and important: the policy is **not wired into
-the live Stage-1 controller**, which remains deliberately serial. See "What
-this does not do". No WRF-SFIRE, MPI, Slurm, or real remote provider was run.
+Status: **policy plus a working runtime bridge** — implemented and
+acceptance-tested on 2026-08-15, revised 2026-08-16 after an external audit.
+The policy now drives the durable Stage-1 controller: concurrent attempts run
+under a reservation ledger, measured on real subprocesses. The three-policy
+makespan comparison below is still a **simulation**. No WRF-SFIRE, MPI, Slurm,
+or real remote provider was run.
+
+**Audit corrections (2026-08-16).** Logical sites could share physical hardware
+undetected, so two eight-core sites on one eight-core host accepted two
+eight-core tasks and reported no oversubscription; sites may now declare a host
+and the ledger enforces its budget too. Best-fit weighed only CPU and memory, so
+CPU-only work could consume the single GPU node; scarce GPU and scratch capacity
+now rank first. Non-finite durations were accepted everywhere because NaN
+compares false against every bound. Resource observations are now typed: an
+attempt killed by a limit is `RESOURCE_EXHAUSTED` and its peak is a censored
+lower bound rather than a measurement, and such attempts drive revisions instead
+of being discarded with ordinary failures. Revisions cover all four dimensions.
+The "low-priority work cannot starve" claim was too strong for a capped aging
+bonus and is now stated as bounded delay.
+
+**The runtime bridge (2026-08-16).** `max_inflight` above 1 is allowed against a
+`ReservationLedger`; the controller orders ready work with this policy, reserves
+before dispatch, releases when a task leaves an active state, and emits
+observations from real attempts. Eight 0.4s tasks take about 6.9s serially and
+about 1.9s four-wide, each committing exactly one attempt.
 
 Stage 8 is where the runtime stops running work in the order it happened to
 arrive.
@@ -104,15 +125,25 @@ its `source` so nobody mistakes a guess for a measurement:
 ```
 
 Median rather than mean, so one pathological run does not move the estimate
-far. Failed attempts are excluded from duration history — a task that failed
-fast is not fast — but they do count toward `failure_rate`. Memory estimates
-take the worst observed case rather than the typical one.
+far. Failed attempts are excluded from *duration* history — a task that failed
+fast is not fast — but they count toward `failure_rate`, and a
+resource-exhausted attempt still counts toward envelope review. Memory
+estimates take the worst observed case rather than the typical one.
 
 ## An underestimate is a record, not a silent widening
 
-When observed peak memory exceeds the declared envelope, `review_envelope()`
-emits a `DeploymentRevision`: an identified record naming the declared value,
-the observed peak, a proposed envelope, and the reason.
+When observed usage exceeds the declared envelope on *any* dimension,
+`review_envelope()` emits a `DeploymentRevision`: an identified record naming
+the declared value, the observed peak, the dimensions exceeded, a proposed
+envelope, and the reason.
+
+Attempts killed by a resource limit are the most informative evidence here and
+are included rather than discarded with ordinary failures. Their peak is a
+**censored lower bound** — the attempt was stopped, so the real requirement may
+be higher — and the revision says so via `from_censored_evidence`.
+
+Headroom applies only to the continuous dimensions. Cores and GPUs are discrete
+counts: a task that used two GPUs is proposed two, not padded to three.
 
 It is a **proposal**. This layer never mutates the declared envelope, because
 quietly enlarging it would make the original plan unreproducible and hide a

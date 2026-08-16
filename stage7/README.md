@@ -1,10 +1,26 @@
 # Stage 7 — Lazy partitions, bounded admission, and collection completeness
 
-Status: **partition control plane implemented and acceptance-tested** on
-2026-08-15 for 10^4 partitions. One gap is explicit and important: partitions
-are admitted, packetised, and committed through their full lifecycle, but each
-partition is **not yet executed through the Stage-1 runtime**. See "What this
-does not do" below. No WRF-SFIRE, MPI, Slurm, or real remote provider was run.
+Status: **control-plane prototype** — implemented and acceptance-tested on
+2026-08-15 for 10^4 partitions, revised 2026-08-16 after an external audit.
+The gap that matters: partitions are admitted, packetised, retried, and
+committed through their full lifecycle, but those commits are durable *state
+transitions*; per-partition scientific execution through the Stage-1 runtime is
+still unbuilt. See "What this does not do". No WRF-SFIRE, MPI, Slurm, or real
+remote provider was run.
+
+**Audit corrections (2026-08-16).** The template restated an operation as loose
+strings: the fixture resolved `example-add`/`synthetic.add.v1` and then built
+the template from `synthetic.constant.v1` with unrelated inputs, so "one
+scientific selection reused by 10,000 partitions" reused only the invocation
+hash. `PartitionTaskTemplate` now carries a verified `BoundInvocation`, so
+operation, parameters, implementation digest, and output contract travel
+together. Retry was claimed but impossible — failed members were marked FAILED
+while packet generation selected only ADMITTED rows — and is now a real
+transition backed by a durable `partition_attempts` table. Admission accepted a
+foreign partition set or template while advancing the cursor; the collection's
+registered definitions are now authoritative. `PacketAttempt` is split from
+`PacketResult` so attempt identity is minted before submission and a serialized
+outcome cannot be relabelled.
 
 Stage 7 is where "resolve once, execute many" stops being a slogan. One
 scientific selection drives 10,000 partitions, and the controller never holds
@@ -120,17 +136,21 @@ large enough is not bundled at all.
 
 What fusion must never do is merge identity. A packet owns one provider handle
 and an **ordered set of members**; each member keeps its own logical task key;
-and `PacketAttempt` reports every member independently. On partial failure:
+and a `PacketResult` reports every member independently. On partial failure:
 
 ```python
-attempt.committed_keys()                  # kept, never recomputed
-attempt.retryable_keys(retry_safe=True)   # only the uncommitted ones
-attempt.retryable_keys(retry_safe=False)  # () — a human decides
+result.committed_keys()                  # kept, never recomputed
+result.retryable_keys(retry_safe=True)   # only the uncommitted ones
+result.retryable_keys(retry_safe=False)  # () — a human decides
 ```
 
-A committed partition is never un-committed: `record_outcome` will not move a
-`COMMITTED` row to `FAILED`, so a duplicate or late packet result cannot
-destroy work that already landed.
+Those retryable keys are now *actionable*. `record_packet_result` writes a
+durable attempt row and returns a retry-safe failure below the attempt ceiling
+to `ADMITTED`, which is what makes it eligible for a new packet. Reaching the
+ceiling, or a template that is not retry-safe, is terminal.
+
+A committed partition is never un-committed, so a duplicate or late packet
+result cannot destroy work that already landed.
 
 ## A partial result is not a whole one
 

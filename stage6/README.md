@@ -1,9 +1,22 @@
 # Stage 6 — Dataset-versus-model slice, evidence gating, and the latency gate
 
-Status: **core implemented and acceptance-tested** on 2026-08-15, with **one
-exit gate measured and missed**. The Section 9.5 planning-latency budget does
-not hold on this node; see "The latency gate fails" below. Everything else in
-the stage passes. No WRF-SFIRE, MPI, Slurm, or real remote provider was run.
+Status: **prototype** — implemented and acceptance-tested on 2026-08-15,
+revised 2026-08-16 after an external audit. Two exit gates do not hold: the
+Section 9.5 planning-latency budget is **measured and missed** by roughly 5x
+(see "The latency gate fails"), and the evidence driving the whole
+dataset-versus-model contest is **synthetic fixture data** — no real held-out
+reference observations exist. What the stage demonstrates is the decision
+machinery, not a scientific result. No WRF-SFIRE, MPI, Slurm, or real remote
+provider was run.
+
+**Audit corrections (2026-08-16).** Interval separation was decided by asking
+whether all intervals shared one common intersection, which is not the same as
+asking whether any pair overlaps; with A=[0,2], B=[1,3], C=[4,5] it reported
+separation while A and B plainly overlap. It is now a pairwise sweep. The
+decision report also accepted an evidence snapshot and then ignored it, trusting
+a caller-supplied profile dictionary; readings are now resolved by deriving each
+producer's evidence subject and matching it against the frozen snapshot, and the
+snapshot is part of report identity.
 
 Stage 6 is where a model competes with data on the record rather than on
 vibes, and where the system is asked to rank scientific quality — and refuses.

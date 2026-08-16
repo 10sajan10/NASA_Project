@@ -172,19 +172,37 @@ runnable, and no stage may claim capability it has not demonstrated.
 | [2](stage2/) | Scientific contracts, multi-producer catalog, exhaustive oracle | done |
 | [3](stage3/) | Recursive discovery, exact global MILP selection, validator | done |
 | [4](stage4/) | Explicit semantic transformations + finite closure | done |
-| 5 | Progressive acquisition: remote connectors, coverage, asset manifests | next |
-| 6 | Reduced scientific slice with honest evidence-based alternatives | |
-| 7–8 | Lazy partitions, bounded admission, resource-aware scheduling | |
+| [5](stage5/) | Progressive acquisition: in-process connectors, coverage, asset manifests | prototype |
+| [6](stage6/) | Dataset-versus-model slice, evidence gating, `CHOICE_REQUIRED` | prototype |
+| [7](stage7/) | Lazy partitions, bounded atomic admission, durable retry | control plane |
+| [8](stage8/) | Resource-aware scheduling policy, now driving the controller | policy + bridge |
 | 9A–9B | Conditional SLURM provider, then WRF integration behind it | |
+
+Stages 5–8 are deliberately labelled below "done". An external audit found
+several claims running ahead of the implementation; those defects are fixed and
+the labels now match what is demonstrated. The honest reading:
+
+- **Stage 5** contacts no real network provider; both connectors run in process.
+- **Stage 6** competes a model against data on synthetic evidence. No real
+  held-out reference observations exist, and its Section 9.5 planning-latency
+  gate is **measured and missed** by roughly 5x.
+- **Stage 7** drives 10^4 partitions through admission, packetisation, retry,
+  and commit. Those commits are durable state transitions; per-partition
+  scientific execution through the Stage-1 runtime is still unbuilt.
+- **Stage 8** is a scheduling policy plus a real bridge into the durable
+  controller: concurrent attempts under a reservation ledger, measured on real
+  subprocesses. Its three-policy makespan comparison remains a simulation.
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-# 501 passed, 1 skipped, 6 xfailed
+# 718 passed, 1 skipped, 7 xfailed
 ```
 
-The six xfails are deliberate and **strict**: four frozen legacy-runtime defects
-and two quarantined WRF configuration decisions. If one starts passing, the
-suite fails and forces a decision instead of silently absorbing the change.
+The seven xfails are deliberate and **strict**: four frozen legacy-runtime
+defects, two quarantined WRF configuration decisions, and the Section 9.5
+planning-latency gate, which is a real measured miss rather than a quarantine.
+If one starts passing, the suite fails and forces a decision instead of
+silently absorbing the change.
 
 ---
 
