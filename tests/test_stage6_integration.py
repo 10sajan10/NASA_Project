@@ -157,6 +157,42 @@ def test_different_references_make_alternatives_incomparable():
     assert len(report.admissible) == 2
 
 
+def test_evidence_comes_from_the_frozen_snapshot_not_the_caller():
+    """An unrelated snapshot must yield no usable evidence.
+
+    The audit found the report trusting a caller-supplied profile dictionary
+    while ignoring the snapshot it was handed, so an empty unrelated snapshot
+    still produced two admissible, comparable alternatives. Readings are now
+    resolved by deriving each producer's evidence subject and matching it
+    against the frozen snapshot.
+    """
+    from contracts import EvidenceProfile, EvidenceSnapshot, EvidenceSubject
+    from objectives import build_choice_report
+
+    fixture = fx.make_stage6_fixture()
+    baseline = _resolve(fixture)
+
+    unrelated = EvidenceSnapshot(
+        "2026-08-15T00:00:00Z", fx.evaluator(),
+        (EvidenceProfile(
+            "ExampleEvidence-v1",
+            EvidenceSubject("nobody", "0.0", "unrelated", "result"), ()),))
+    report = build_choice_report(
+        baseline, lambda constraints: _resolve(fixture, constraints),
+        concept_id=fx.FLOW_CONCEPT, requirement_use=fixture.flow_use,
+        metric_definition_id=fx.METRIC_ID,
+        evidence_snapshot=unrelated)
+
+    assert not report.comparability.comparable
+    assert not report.comparability.separation_established
+    assert all(item.reading is not None and not item.reading.known
+               for item in report.alternatives)
+    # The snapshot is part of report identity, so a choice made against the
+    # real evidence cannot be replayed against this one.
+    assert report.evidence_snapshot_id == unrelated.snapshot_id
+    assert report.report_id != quality_request(fixture).report.report_id
+
+
 def test_a_recorded_choice_drives_a_constrained_re_solve():
     fixture = fx.make_stage6_fixture()
     report = quality_request(fixture).report
@@ -198,7 +234,7 @@ def test_a_stale_choice_is_refused_rather_than_applied():
             concept_id=fx.FLOW_CONCEPT, requirement_use=fixture.flow_use,
             metric_definition_id=fx.METRIC_ID,
             evidence_snapshot=fixture.evidence_snapshot,
-            evidence_by_capability=fixture.evidence_by_capability)
+            )
 
 
 def test_a_minimum_cost_request_resolves_without_a_decision():
@@ -212,7 +248,7 @@ def test_a_minimum_cost_request_resolves_without_a_decision():
         concept_id=fx.FLOW_CONCEPT, requirement_use=fixture.flow_use,
         metric_definition_id=fx.METRIC_ID,
         evidence_snapshot=fixture.evidence_snapshot,
-        evidence_by_capability=fixture.evidence_by_capability)
+        )
     assert outcome.status is ObjectiveStatus.RESOLVED
     assert outcome.decision_id is None and outcome.snapshot_ref is None
 

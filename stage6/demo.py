@@ -146,7 +146,7 @@ def quality_request(fixture: fx.Stage6Fixture) -> ObjectiveOutcome:
         concept_id=fx.FLOW_CONCEPT, requirement_use=fixture.flow_use,
         metric_definition_id=fx.METRIC_ID,
         evidence_snapshot=fixture.evidence_snapshot,
-        evidence_by_capability=fixture.evidence_by_capability)
+        )
 
 
 def apply_choice(fixture: fx.Stage6Fixture, report: ChoiceRequiredReport,
@@ -168,7 +168,7 @@ def apply_choice(fixture: fx.Stage6Fixture, report: ChoiceRequiredReport,
         concept_id=fx.FLOW_CONCEPT, requirement_use=fixture.flow_use,
         metric_definition_id=fx.METRIC_ID,
         evidence_snapshot=fixture.evidence_snapshot,
-        evidence_by_capability=fixture.evidence_by_capability)
+        )
 
 
 def run_demo(runtime_root: Path | str) -> dict[str, Any]:

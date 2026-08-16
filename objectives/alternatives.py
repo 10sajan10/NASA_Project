@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 from capabilities.implementation import _required_text
+from capabilities import artifact_evidence_subject, invocation_evidence_subject
 from contracts import EvidenceProfile, EvidenceSnapshot, RequirementUse
 from engine.runtime.identity import require_object_fields
 from plans import ProducerKind
@@ -107,6 +108,42 @@ def candidate_producers_for_concept(
     return tuple(sorted(found, key=lambda item: (item[1], item[0].producer_id)))
 
 
+def resolve_profile_from_snapshot(
+    graph: FeasibleDerivationHypergraph,
+    snapshot: EvidenceSnapshot | None,
+    producer: ProducerSelectionRef,
+    concept_id: str,
+) -> EvidenceProfile | None:
+    """Find the evidence profile the *frozen snapshot* binds to this producer.
+
+    The evidence subject is derived from the producer itself and then matched
+    against the snapshot, exactly as ``direct_match`` does it.  Nothing is
+    taken on trust from a caller-supplied mapping: a profile that is not in the
+    frozen snapshot, or whose subject this producer could not have produced,
+    simply does not exist as far as the decision report is concerned.
+    """
+    if snapshot is None:
+        return None
+    if producer.producer_kind is ProducerKind.INVOCATION:
+        node = next((item for item in graph.invocation_nodes
+                     if item.invocation_id == producer.producer_id), None)
+        if node is None:
+            return None
+        port = next((item for item in node.invocation.outputs
+                     if item.descriptor.concept_id == concept_id), None)
+        if port is None:
+            return None
+        subject = invocation_evidence_subject(node.invocation, port.port_id)
+    else:
+        node = next((item for item in graph.artifact_nodes
+                     if item.leaf_id == producer.producer_id), None)
+        if node is None:
+            return None
+        subject = artifact_evidence_subject(node.leaf)
+    return next((item for item in snapshot.profiles
+                 if item.subject == subject), None)
+
+
 def enumerate_source_alternatives(
     baseline: ResolutionOutcome,
     resolve: Callable[[SelectionConstraints], ResolutionOutcome],
@@ -115,22 +152,22 @@ def enumerate_source_alternatives(
     requirement_use: RequirementUse,
     metric_definition_id: str,
     evidence_snapshot: EvidenceSnapshot | None = None,
-    evidence_by_capability: dict[str, EvidenceProfile] | None = None,
 ) -> tuple[SourceAlternative, ...]:
     """Re-solve once per candidate producer and collect the real alternatives.
 
     ``resolve`` must apply the supplied constraints to the *same* frozen graph
     inputs the baseline used; otherwise the alternatives would not be
-    comparable as plans, let alone as science.
+    comparable as plans, let alone as science.  Evidence is resolved from the
+    frozen snapshot rather than accepted from the caller.
     """
-    profiles = evidence_by_capability or {}
     alternatives: list[SourceAlternative] = []
     for producer, label in candidate_producers_for_concept(
             baseline.hypergraph, concept_id):
         constrained = resolve(SelectionConstraints.bind(include=(producer,)))
         admissible = (constrained.status is ResolutionStatus.READY
                       and constrained.selection.plan is not None)
-        profile = profiles.get(label)
+        profile = resolve_profile_from_snapshot(
+            baseline.hypergraph, evidence_snapshot, producer, concept_id)
         reading = read_metric(
             label, profile, metric_definition_id, requirement_use.requirement)
         if admissible:
@@ -160,6 +197,7 @@ def admissible_alternatives(
 
 __all__ = [
     "SourceAlternative",
+    "resolve_profile_from_snapshot",
     "admissible_alternatives",
     "candidate_producers_for_concept",
     "enumerate_source_alternatives",

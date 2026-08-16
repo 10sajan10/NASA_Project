@@ -69,6 +69,42 @@ def test_overlapping_intervals_do_not_establish_separation():
     assert not verdict.separation_established
 
 
+def test_a_pair_may_overlap_even_with_no_common_intersection():
+    """The audit's counterexample: A=[0,2], B=[1,3], C=[4,5].
+
+    No point is shared by all three, but A and B cannot be told apart. The
+    earlier implementation asked whether one common intersection existed and
+    so reported separation here -- a false scientific claim in the unsafe
+    direction, from the module whose whole job is refusing to make one.
+    """
+    verdict = assess_comparability(
+        (_reading("a", "1.0", uncertainty_lower="0", uncertainty_upper="2"),
+         _reading("b", "2.0", uncertainty_lower="1", uncertainty_upper="3"),
+         _reading("c", "4.5", uncertainty_lower="4", uncertainty_upper="5")),
+        METRIC)
+    assert verdict.comparable
+    assert verdict.intervals_overlap is True
+    assert not verdict.separation_established
+
+
+def test_three_mutually_disjoint_intervals_do_separate():
+    verdict = assess_comparability(
+        (_reading("a", "0.5", uncertainty_lower="0", uncertainty_upper="1"),
+         _reading("b", "2.5", uncertainty_lower="2", uncertainty_upper="3"),
+         _reading("c", "4.5", uncertainty_lower="4", uncertainty_upper="5")),
+        METRIC)
+    assert verdict.intervals_overlap is False
+    assert verdict.separation_established
+
+
+def test_touching_endpoints_count_as_overlapping():
+    verdict = assess_comparability(
+        (_reading("a", "1.0", uncertainty_lower="0", uncertainty_upper="2"),
+         _reading("b", "2.5", uncertainty_lower="2", uncertainty_upper="3")),
+        METRIC)
+    assert verdict.intervals_overlap is True
+
+
 def test_missing_intervals_are_treated_as_unresolved():
     verdict = assess_comparability(
         (_reading("a", uncertainty_status=UncertaintyStatus.UNKNOWN,

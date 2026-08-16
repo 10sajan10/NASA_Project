@@ -225,6 +225,31 @@ class ComparabilityVerdict:
         return strict_hash(self.to_dict())
 
 
+def _any_pair_overlaps(intervals: list[tuple[Decimal, Decimal]]) -> bool:
+    """True when *any two* confidence intervals overlap.
+
+    This must be a pairwise question, not a question about a single common
+    intersection shared by all of them.  With A=[0,2], B=[1,3], C=[4,5] there
+    is no point common to all three, but A and B plainly overlap and cannot be
+    told apart — reporting "separated" there would be a false scientific claim,
+    which is the one failure mode this module exists to prevent.
+
+    A sweep in sorted order answers it in O(n log n): once sorted by lower
+    bound, an interval overlaps something earlier exactly when its lower bound
+    is at or below the furthest upper bound seen so far.  Touching endpoints
+    count as overlapping, which is the conservative reading.
+    """
+    if len(intervals) < 2:
+        return False
+    ordered = sorted(intervals)
+    reach = ordered[0][1]
+    for lower, upper in ordered[1:]:
+        if lower <= reach:
+            return True
+        reach = max(reach, upper)
+    return False
+
+
 def assess_comparability(readings: Iterable[MetricReading],
                          metric_definition_id: str) -> ComparabilityVerdict:
     """Decide, conservatively, whether these readings can be compared.
@@ -287,9 +312,8 @@ def assess_comparability(readings: Iterable[MetricReading],
         # difference is resolved.  Treat that as "overlapping" — the safe side.
         overlap = True
     else:
-        lowest_upper = min(item[1] for item in intervals)  # type: ignore[index]
-        highest_lower = max(item[0] for item in intervals)  # type: ignore[index]
-        overlap = highest_lower <= lowest_upper
+        overlap = _any_pair_overlaps(
+            [item for item in intervals if item is not None])
     return ComparabilityVerdict(
         True, metric_definition_id, (),
         "", known[0].reference_manifest_id, known[0].evaluator_id, overlap)

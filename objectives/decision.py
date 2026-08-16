@@ -53,6 +53,7 @@ class ChoiceRequiredReport:
     metric_definition_id: str
     alternatives: tuple[SourceAlternative, ...]
     comparability: ComparabilityVerdict
+    evidence_snapshot_id: str | None = None
 
     def __post_init__(self) -> None:
         _digest(self.report_id, "choice report_id")
@@ -88,18 +89,24 @@ class ChoiceRequiredReport:
     def expected_id(self) -> str:
         return strict_hash(self._payload(
             self.concept_id, self.metric_definition_id, self.alternatives,
-            self.comparability))
+            self.comparability, self.evidence_snapshot_id))
 
     @staticmethod
     def _payload(concept_id: str, metric_definition_id: str,
                  alternatives: tuple[SourceAlternative, ...],
-                 comparability: ComparabilityVerdict) -> dict[str, Any]:
+                 comparability: ComparabilityVerdict,
+                 evidence_snapshot_id: str | None) -> dict[str, Any]:
         return {
-            "schema": "stage6-choice-required-report-v1",
+            "schema": "stage6-choice-required-report-v2",
             "concept_id": concept_id,
             "metric_definition_id": metric_definition_id,
             "alternatives": [item.to_dict() for item in alternatives],
             "comparability": comparability.to_dict(),
+            # A choice is only meaningful against the evidence it was shown.
+            # Binding the snapshot here means a report built from different
+            # evidence is a different report, and a choice made against the
+            # old one is refused as stale rather than silently reapplied.
+            "evidence_snapshot_id": evidence_snapshot_id,
             "ranking_complete": False,
             "nondominance_claimed": False,
         }
@@ -107,16 +114,20 @@ class ChoiceRequiredReport:
     @classmethod
     def bind(cls, *, concept_id: str, metric_definition_id: str,
              alternatives: tuple[SourceAlternative, ...],
-             comparability: ComparabilityVerdict) -> "ChoiceRequiredReport":
+             comparability: ComparabilityVerdict,
+             evidence_snapshot_id: str | None = None
+             ) -> "ChoiceRequiredReport":
         return cls(
             strict_hash(cls._payload(
-                concept_id, metric_definition_id, alternatives, comparability)),
-            concept_id, metric_definition_id, alternatives, comparability)
+                concept_id, metric_definition_id, alternatives, comparability,
+                evidence_snapshot_id)),
+            concept_id, metric_definition_id, alternatives, comparability,
+            evidence_snapshot_id)
 
     def to_dict(self) -> dict[str, Any]:
         payload = self._payload(
             self.concept_id, self.metric_definition_id, self.alternatives,
-            self.comparability)
+            self.comparability, self.evidence_snapshot_id)
         payload["report_id"] = self.report_id
         return payload
 
@@ -125,13 +136,13 @@ class ChoiceRequiredReport:
         raw = require_object_fields(
             value,
             {"schema", "report_id", "concept_id", "metric_definition_id",
-             "alternatives", "comparability", "ranking_complete",
-             "nondominance_claimed"},
+             "alternatives", "comparability", "evidence_snapshot_id",
+             "ranking_complete", "nondominance_claimed"},
             "ChoiceRequiredReport")
-        if raw.pop("schema") != "stage6-choice-required-report-v1":
+        if raw.pop("schema") != "stage6-choice-required-report-v2":
             raise ValueError(
                 "ChoiceRequiredReport schema is not "
-                "stage6-choice-required-report-v1")
+                "stage6-choice-required-report-v2")
         if raw.pop("ranking_complete") or raw.pop("nondominance_claimed"):
             raise ValueError(
                 "an MVP report cannot claim a complete ranking or non-dominance")
@@ -208,21 +219,22 @@ def build_choice_report(
     requirement_use: RequirementUse,
     metric_definition_id: str,
     evidence_snapshot: EvidenceSnapshot | None = None,
-    evidence_by_capability: dict[str, EvidenceProfile] | None = None,
 ) -> ChoiceRequiredReport:
     """Enumerate real alternatives and judge whether they can be compared."""
     alternatives = enumerate_source_alternatives(
         baseline, resolve, concept_id=concept_id,
         requirement_use=requirement_use,
         metric_definition_id=metric_definition_id,
-        evidence_snapshot=evidence_snapshot,
-        evidence_by_capability=evidence_by_capability)
+        evidence_snapshot=evidence_snapshot)
     readings = [item.reading for item in admissible_alternatives(alternatives)
                 if item.reading is not None]
     comparability = assess_comparability(readings, metric_definition_id)
     return ChoiceRequiredReport.bind(
         concept_id=concept_id, metric_definition_id=metric_definition_id,
-        alternatives=alternatives, comparability=comparability)
+        alternatives=alternatives, comparability=comparability,
+        evidence_snapshot_id=(
+            evidence_snapshot.snapshot_id
+            if evidence_snapshot is not None else None))
 
 
 def resolve_with_objective(
@@ -233,7 +245,6 @@ def resolve_with_objective(
     requirement_use: RequirementUse,
     metric_definition_id: str,
     evidence_snapshot: EvidenceSnapshot | None = None,
-    evidence_by_capability: dict[str, EvidenceProfile] | None = None,
 ) -> ObjectiveOutcome:
     """Apply a named selection policy to one planning request."""
     if not isinstance(request, ObjectiveRequest):
@@ -249,8 +260,7 @@ def resolve_with_objective(
         baseline, resolve, concept_id=concept_id,
         requirement_use=requirement_use,
         metric_definition_id=metric_definition_id,
-        evidence_snapshot=evidence_snapshot,
-        evidence_by_capability=evidence_by_capability)
+        evidence_snapshot=evidence_snapshot)
 
     decision = request.decision
     if decision is None:

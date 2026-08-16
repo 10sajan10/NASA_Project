@@ -139,7 +139,6 @@ class Stage6Fixture:
     catalog: CapabilityCatalog
     deployment_snapshot: DeploymentCapabilitySnapshot
     evidence_snapshot: EvidenceSnapshot
-    evidence_by_capability: dict[str, EvidenceProfile]
     root_uses: tuple[RequirementUse, ...]
     flow_use: RequirementUse
     expected_cost_units: int
@@ -407,10 +406,6 @@ def make_stage6_fixture(
         catalog=catalog,
         deployment_snapshot=deployment,
         evidence_snapshot=snapshot,
-        evidence_by_capability={
-            "example-flow-direct": direct_profile,
-            "example-flow-model": model_profile,
-        },
         root_uses=(RequirementUse("stage6-root", "result", root_requirement()),),
         flow_use=RequirementUse("stage6-flow", "flow", flow_req),
         expected_cost_units=MINIMUM_COST_TOTAL,
