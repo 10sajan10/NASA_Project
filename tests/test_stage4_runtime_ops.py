@@ -71,8 +71,16 @@ def test_all_stage4_operations_have_closed_exact_binders() -> None:
         "transform.vector_uv_to_speed_direction.v1": (
             "transform.vector_uv_to_speed_direction.bind.v1", ("source",),
             ("speed", "direction"), ()),
+        "transform.spatial_block_aggregate.v1": (
+            "transform.spatial_block_aggregate.bind.v1", ("source",),
+            ("result",), ("aggregation", "block_x", "block_y")),
     }
     assert set(expected).issubset(operation_keys())
+    # The binder registry is pinned to an exact tuple, so adding one is a
+    # visible change. Pin the transform half of the operation registry the
+    # same way: a subset check lets a new operation land unreviewed.
+    assert {key for key in operation_keys()
+            if key.startswith("transform.")} == set(expected)
     assert {value[0] for value in expected.values()}.issubset(binder_keys())
     for operation_key, (binder_key, inputs, outputs, parameters) in expected.items():
         rule = binder_rule(binder_key)

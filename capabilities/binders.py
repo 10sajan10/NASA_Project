@@ -92,6 +92,12 @@ _BINDER_RULES: dict[str, BinderRule] = {
         output_ports=("result",),
         parameter_names=("count", "start_index", "step"),
     ),
+    "transform.spatial_block_aggregate.bind.v1": BinderRule(
+        operation_key="transform.spatial_block_aggregate.v1",
+        input_ports=("source",),
+        output_ports=("result",),
+        parameter_names=("aggregation", "block_x", "block_y"),
+    ),
     "transform.regrid_bilinear.bind.v1": BinderRule(
         operation_key="transform.regrid_bilinear.v1",
         input_ports=("source",),

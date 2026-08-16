@@ -186,6 +186,40 @@ Integer *coarsening* is refused outright for every variable: it is replication,
 not aggregation, and would claim that every 90 m subcell ignited at the same
 instant.
 
+## The transformation that now exists
+
+`ValueSemantics`' own docstring named the gap: *"Categorical and extensive
+fields are outside the bilinear MVP instead of being silently interpolated."*
+The bilinear regrid and reproject kinds admit only
+`SCALAR_CONTINUOUS_INTENSIVE`. So of the six declared variables, exactly one
+(`fire_intensity`) had any admissible transformation at all — an arrival time,
+an extremum, an areal fraction and a category label are none of them
+interpolatable.
+
+They are, however, exactly **aggregatable** over a block partition.
+`TransformationKind.SPATIAL_BLOCK_AGGREGATE` admits that case, with the
+operation `transform.spatial_block_aggregate.v1` and binder
+`transform.spatial_block_aggregate.bind.v1`. Four `ValueSemantics` members were
+added to type the fields the docstring excluded: `FIRST_OCCURRENCE_TIME`,
+`SCALAR_EXTREMUM`, `AREAL_FRACTION`, `CATEGORICAL_LABEL`.
+
+The value class determines the aggregation — a bijection, not a parameter. The
+`aggregation` parameter may only restate what the declared semantics already
+imply, which is what stops a mean being applied to an arrival time by writing a
+different string in the parameters. Undeclared classes (`UNSPECIFIED`, the
+vector classes) admit nothing.
+
+It refuses: a CRS change (aggregation is an index operation, not a
+reprojection), a partial trailing block, cell sizes that disagree with the
+block factors, and an offset lattice. Category majorities resolve ties to the
+smallest label so a result never depends on iteration order.
+
+**This does not solve WRF→cube.** It is same-CRS only, so it makes the 90 m
+fire mesh → 900 m cube reduction legal *once the projection question is
+settled* — either by a declared reprojection, which still does not exist, or by
+defining the cube on WRF's own grid, which is a design decision rather than a
+missing component.
+
 ## Test coverage
 
 - `tests/test_placement_contract.py` — 18 tests. Every grid is built from the
@@ -198,8 +232,22 @@ instant.
   runs everywhere.
 - `tests/test_resampling_rules.py` — 17 tests over the declared aggregations
   and their preconditions.
+- `tests/test_stage4_block_aggregate.py` — 18 tests over the new
+  transformation: its declaration, its four refusals, and the execution
+  semantics of each aggregation.
 
-Suite: 811 passed, 1 skipped, 7 xfailed.
+Suite: 829 passed, 1 skipped, 7 xfailed.
+
+Adding the operation and binder cost **one** test change — the pinned binder
+tuple in `tests/test_stage2_capabilities.py`, which is exactly what that test
+exists to catch. An earlier note in this file warned it would invalidate every
+digest; that was wrong. Digests are computed from source at call time and no
+fixture persists one, so nothing went stale.
+
+It did expose a real asymmetry: the binder registry is pinned to an exact
+tuple, but the operation registry was only `issubset`-checked, so the new
+operation landed without any test noticing. `tests/test_stage4_runtime_ops.py`
+now pins the `transform.*` operations exactly as well.
 
 ## What this does not do
 
@@ -214,14 +262,15 @@ Suite: 811 passed, 1 skipped, 7 xfailed.
   untouched, so nothing in the running pipeline consumes it yet. Connecting the
   two — and deciding the reprojection WRF→cube that `CRS_MISMATCH` demands — is
   the remaining work.
-- **No reprojection is declared.** Knowing that WRF's Lambert and the cube's
-  UTM disagree, and knowing what a regrid between them would have to preserve,
-  is still not a costed, evidence-bearing Stage-4 transformation. Building one
-  means adding a `TransformationKind`, a runtime operation, and a binder — and
-  both registries hash their own source file, so that invalidates every
-  existing digest. It is a deliberate, reviewable change, not a side effect.
-- **No aggregation is executed.** `transformations/resampling.py` decides
-  admissibility only; the arithmetic stays in the runtime operation layer.
+- **No reprojection is declared.** `SPATIAL_BLOCK_AGGREGATE` is same-CRS by
+  construction and refuses to change CRS. The WRF-Lambert→UTM transformation
+  still does not exist, so WRF output still cannot be published to a UTM cube.
+- **No area-weighted regrid exists.** The plain mean is exact only because the
+  block cover is same-CRS and equal-area. Across a reprojection it is not, and
+  nothing here implements the area-weighted version that case needs.
+- **Nothing is wired end to end.** The transformation can be declared and
+  executed on a `field-json-v1` value, but no capability in the catalog emits
+  one, and the WRF adapter does not produce `field-json-v1`.
 - **Only the 12:00 files were read.** The georeference is time-invariant, so
   this is sound for grid geometry, but no time series was inspected.
 - **It does not unblock Stage 9B.** R1 still has no promoted golden fixture and

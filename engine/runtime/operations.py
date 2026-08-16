@@ -375,6 +375,81 @@ def _bilinear_tensor(tensor: list[list[list[float]]],
     return result
 
 
+def _aggregate_block(values: list[float], aggregation: str) -> float:
+    """Reduce one block. Deterministic, and never invents an absent value."""
+    if aggregation == "FIRST_OCCURRENCE_MIN":
+        return min(values)
+    if aggregation == "EXTREMUM_MAX":
+        return max(values)
+    if aggregation in ("AREAL_FRACTION_MEAN",
+                       "INTENSIVE_AREA_WEIGHTED_MEAN"):
+        # The block cover is exact and same-CRS, so every contributing cell has
+        # the same area and the area-weighted mean reduces to a plain mean.
+        # Stage 4 refuses this kind across a reprojection precisely because
+        # that equality stops holding.
+        return math.fsum(values) / len(values)
+    if aggregation == "CATEGORICAL_MAJORITY":
+        counts: dict[float, int] = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        best = max(counts.values())
+        # Ties resolve to the smallest label so the result never depends on
+        # iteration order.
+        return min(label for label, count in counts.items() if count == best)
+    raise ValueError(f"unknown block aggregation {aggregation!r}")
+
+
+def _spatial_block_aggregate(parameters: dict[str, Any],
+                             inputs: dict[str, Any]) -> dict[str, Any]:
+    """Execute an already-authorized exact block reduction.
+
+    ``aggregation`` is an execution value, not scientific authority: Stage 4
+    admits it only when it matches the aggregation the source's declared value
+    class requires.
+    """
+    _exact_keys(parameters, {"block_x", "block_y", "aggregation"},
+                "block-aggregate parameters")
+    _exact_keys(inputs, {"source"}, "block-aggregate inputs")
+    field = _validate_field(inputs["source"], "block-aggregate source")
+    block_x = _integer(parameters["block_x"], "block_x", minimum=1)
+    block_y = _integer(parameters["block_y"], "block_y", minimum=1)
+    aggregation = parameters["aggregation"]
+    if not isinstance(aggregation, str):
+        raise TypeError("aggregation must be a string")
+    width, height = len(field["x"]), len(field["y"])
+    if width % block_x or height % block_y:
+        raise ValueError(
+            "block factors do not exactly cover the source field; a partial "
+            "trailing block is not an aggregation")
+
+    components = {}
+    for name, tensor in field["components"].items():
+        planes = []
+        for plane in tensor:
+            rows = []
+            for out_y in range(height // block_y):
+                row = []
+                for out_x in range(width // block_x):
+                    block = [plane[out_y * block_y + dy][out_x * block_x + dx]
+                             for dy in range(block_y)
+                             for dx in range(block_x)]
+                    row.append(_aggregate_block(block, aggregation))
+                rows.append(row)
+            planes.append(rows)
+        components[name] = planes
+
+    def _centres(axis: list[float], block: int) -> list[float]:
+        return [math.fsum(axis[index * block:(index + 1) * block]) / block
+                for index in range(len(axis) // block)]
+
+    return {"result": _field_with(
+        field,
+        x=_centres(field["x"], block_x),
+        y=_centres(field["y"], block_y),
+        components=components,
+    )}
+
+
 def _regrid_bilinear(parameters: dict[str, Any],
                      inputs: dict[str, Any]) -> dict[str, Any]:
     _exact_keys(parameters, {"target_x", "target_y"},
@@ -728,6 +803,8 @@ _OPERATIONS: dict[str, tuple[str, Operation, bool]] = {
     "transform.spatial_subset.v1": ("1.0.0", _spatial_subset, True),
     "transform.temporal_subset.v1": ("1.0.0", _temporal_subset, True),
     "transform.temporal_align.v1": ("1.0.0", _temporal_align, True),
+    "transform.spatial_block_aggregate.v1": (
+        "1.0.0", _spatial_block_aggregate, True),
     "transform.regrid_bilinear.v1": ("1.0.0", _regrid_bilinear, True),
     "transform.reproject_bilinear.v1": (
         "1.0.0", _reproject_bilinear, True),

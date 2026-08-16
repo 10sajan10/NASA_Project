@@ -630,12 +630,46 @@ an order-preserving regrid for `arrival_s`/`ros_max`, nearest-or-majority for
 replication, not aggregation, and would claim every 90 m subcell ignited at the
 same instant.
 
-Not done: nothing resamples and nothing aggregates — this layer decides
-admissibility only, and the arithmetic stays in the runtime operation layer.
-Building the actual Stage-4 reprojection means adding a `TransformationKind`, a
-runtime operation, and a binder; **both registries hash their own source file,
-so that invalidates every existing digest** and is a deliberate reviewable
-change rather than a side effect. `cube/store.py` is not wired to the preflight (its
+### The transformation that now exists
+
+`ValueSemantics`' own docstring named the gap: *"Categorical and extensive
+fields are outside the bilinear MVP instead of being silently interpolated."*
+The bilinear kinds admit only `SCALAR_CONTINUOUS_INTENSIVE`, so of the six
+declared variables exactly one (`fire_intensity`) had any admissible
+transformation. An arrival time, an extremum, an areal fraction and a category
+label are none of them interpolatable — but all four are exactly *aggregatable*
+over a block partition.
+
+`TransformationKind.SPATIAL_BLOCK_AGGREGATE` admits that case, with operation
+`transform.spatial_block_aggregate.v1` and binder
+`transform.spatial_block_aggregate.bind.v1`. Four `ValueSemantics` members were
+added for the classes the docstring excluded: `FIRST_OCCURRENCE_TIME`,
+`SCALAR_EXTREMUM`, `AREAL_FRACTION`, `CATEGORICAL_LABEL`.
+
+The value class determines the aggregation as a bijection; the `aggregation`
+parameter may only restate what the semantics already imply. That is what stops
+a mean being applied to an arrival time by writing a different string in the
+parameters. It refuses a CRS change, a partial trailing block, cell sizes that
+disagree with the block factors, and an offset lattice.
+
+**Correction to the previous note in this file.** Adding the operation and
+binder was predicted to invalidate every existing digest. That was wrong: the
+digests are computed from source at call time and no fixture persists one, so
+the whole change cost exactly one test edit — the pinned binder tuple in
+`tests/test_stage2_capabilities.py`, which is what that test exists to catch.
+
+It did expose a real asymmetry. The binder registry is pinned to an exact
+tuple, but the operation registry was only `issubset`-checked, so the new
+operation landed without any test noticing. `tests/test_stage4_runtime_ops.py`
+now pins the `transform.*` operations exactly as well.
+
+Not done: `SPATIAL_BLOCK_AGGREGATE` is same-CRS by construction, so the
+WRF-Lambert→UTM transformation still does not exist and WRF output still cannot
+be published to a UTM cube. No area-weighted regrid exists — the plain mean is
+exact only because the block cover is same-CRS and equal-area. Nothing is wired
+end to end: no capability in the catalog emits one of these transformations,
+and the WRF adapter does not produce `field-json-v1`.
+`cube/store.py` is not wired to the preflight (its
 write-time check remains the last line of defence); the reader is not wired to
 `models/wrf_sfire_adapter.py`, which is user-owned and untouched, so nothing in
 the running pipeline consumes the declaration yet; and **no Stage-4
@@ -675,13 +709,14 @@ million-candidate discovery is solved.
 The **entire** repository suite passes:
 
 ```text
-811 passed, 1 skipped, 7 xfailed
+829 passed, 1 skipped, 7 xfailed
 ```
 
 Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`,
 Stage 7 `662/1/7`, Stage 8 `691/1/7`, audit remediation `718/1/7`,
 Stage 9A-Core `744/1/7`, placement contract `772/1/7`,
-WRF georeference reader `794/1/7`, declared resampling rules `811/1/7`.
+WRF georeference reader `794/1/7`, declared resampling rules `811/1/7`,
+block-aggregate transformation `829/1/7`.
 
 **The seventh xfail is new and is not a quarantine.** It is the strict-xfail
 Section 9.5 latency gate: a real, measured miss (see the Stage-6 exit evidence
@@ -1174,7 +1209,7 @@ in there, and push `v2`.
 Read codex_handoff.md completely. Verify branch v2 and its head commit.
 Inspect git status and preserve the listed user-owned dirty files. Read
 stage6/README.md, stage7/README.md, stage8/README.md, stage9a/README.md, and
-stage9b/README.md. Run the full test suite (expect 811 passed, 1 skipped,
+stage9b/README.md. Run the full test suite (expect 829 passed, 1 skipped,
 7 xfailed) without WRF-SFIRE, MPI, Slurm, or any real remote provider.
 
 Do not attempt Stage 9B. Its gates fail: no R1 golden fixture is promoted, no

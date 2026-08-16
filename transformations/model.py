@@ -48,6 +48,7 @@ from contracts.identity import (
     decimal_value,
     timestamp_value,
 )
+from .resampling import AggregationKind
 from engine.runtime.identity import (
     freeze_json,
     require_object_fields,
@@ -63,6 +64,7 @@ class TransformationKind(str, Enum):
     TEMPORAL_ALIGN = "TEMPORAL_ALIGN"
     REGRID_BILINEAR = "REGRID_BILINEAR"
     REPROJECT_BILINEAR = "REPROJECT_BILINEAR"
+    SPATIAL_BLOCK_AGGREGATE = "SPATIAL_BLOCK_AGGREGATE"
     VECTOR_ROTATE = "VECTOR_ROTATE"
     VECTOR_UV_TO_SPEED_DIRECTION = "VECTOR_UV_TO_SPEED_DIRECTION"
 
@@ -80,6 +82,36 @@ class ValueSemantics(str, Enum):
     SCALAR_CONTINUOUS_INTENSIVE = "SCALAR_CONTINUOUS_INTENSIVE"
     CANONICAL_UV_VECTOR = "CANONICAL_UV_VECTOR"
     CIRCULAR_DIRECTION = "CIRCULAR_DIRECTION"
+    # The four classes the paragraph above excludes from bilinear.  They are
+    # not interpolatable, but they *are* exactly aggregatable over a block
+    # partition, which is what SPATIAL_BLOCK_AGGREGATE admits them for.
+    FIRST_OCCURRENCE_TIME = "FIRST_OCCURRENCE_TIME"
+    SCALAR_EXTREMUM = "SCALAR_EXTREMUM"
+    AREAL_FRACTION = "AREAL_FRACTION"
+    CATEGORICAL_LABEL = "CATEGORICAL_LABEL"
+
+
+#: The one aggregation each value class may be reduced with over a block
+#: partition.  A bijection on purpose: if a field's semantics are declared,
+#: the aggregation follows, and if they are not, no aggregation is admitted.
+_BLOCK_AGGREGATIONS = MappingProxyType({
+    ValueSemantics.FIRST_OCCURRENCE_TIME: AggregationKind.FIRST_OCCURRENCE_MIN,
+    ValueSemantics.SCALAR_EXTREMUM: AggregationKind.EXTREMUM_MAX,
+    ValueSemantics.AREAL_FRACTION: AggregationKind.AREAL_FRACTION_MEAN,
+    ValueSemantics.SCALAR_CONTINUOUS_INTENSIVE:
+        AggregationKind.INTENSIVE_AREA_WEIGHTED_MEAN,
+    ValueSemantics.CATEGORICAL_LABEL: AggregationKind.CATEGORICAL_MAJORITY,
+})
+
+
+def block_aggregation_for(semantics: ValueSemantics) -> AggregationKind:
+    """The admissible aggregation for a value class, or a refusal."""
+    try:
+        return _BLOCK_AGGREGATIONS[semantics]
+    except KeyError:
+        raise ValueError(
+            f"{semantics.value} has no admissible block aggregation; a field "
+            "whose value class is undeclared cannot be reduced") from None
 
 
 @dataclass(frozen=True)
@@ -139,6 +171,18 @@ _KIND_RULES = MappingProxyType({
         ),
         "semantic:rectilinear-bilinear-reprojection-v1",
         ("quantity:continuous-intensive-v1",),
+    ),
+    TransformationKind.SPATIAL_BLOCK_AGGREGATE: _KindRule(
+        "transform.spatial_block_aggregate.v1",
+        "transform.spatial_block_aggregate.bind.v1",
+        ("source",), ("result",),
+        (
+            ("block_x", ParameterKind.INTEGER),
+            ("block_y", ParameterKind.INTEGER),
+            ("aggregation", ParameterKind.STRING),
+        ),
+        "semantic:block-aggregation-registry-v1",
+        ("partition:exact-integer-block-cover-v1",),
     ),
     TransformationKind.VECTOR_ROTATE: _KindRule(
         "transform.vector_rotate.v1", "transform.vector_rotate.bind.v1",
@@ -576,6 +620,29 @@ def _ports(spec: TransformationSpec) -> tuple[dict[str, ArtifactDescriptor],
     )
 
 
+def _validate_block_cell_sizes(source, result, block_x: int,
+                               block_y: int) -> None:
+    """Each result cell must be exactly `block_x` x `block_y` source cells.
+
+    Shapes agreeing is not enough: two grids can have the right cell counts and
+    still describe different ground, so the cell sizes and the origin are
+    checked too.
+    """
+    source_x, source_y = (decimal_value(source.affine[0]),
+                          decimal_value(source.affine[4]))
+    result_x, result_y = (decimal_value(result.affine[0]),
+                          decimal_value(result.affine[4]))
+    if (source_x * block_x != result_x) or (source_y * block_y != result_y):
+        raise ValueError(
+            "block factors disagree with the declared cell sizes")
+    if (decimal_value(source.affine[2]) != decimal_value(result.affine[2])
+            or decimal_value(source.affine[5])
+            != decimal_value(result.affine[5])):
+        raise ValueError(
+            "block aggregation requires a shared origin; an offset lattice is "
+            "a resampling, not a reduction")
+
+
 def _validate_semantics(spec: TransformationSpec) -> None:
     inputs, outputs = _ports(spec)
     input_semantics = {
@@ -670,6 +737,43 @@ def _validate_semantics(spec: TransformationSpec) -> None:
                 raise ValueError("reprojection CRS parameters disagree with descriptors")
             if source.grid.crs == result.grid.crs:
                 raise ValueError("same-CRS interpolation is regrid, not reprojection")
+        return
+
+    if spec.kind is TransformationKind.SPATIAL_BLOCK_AGGREGATE:
+        result = outputs["result"]
+        semantics = input_semantics["source"]
+        if semantics is not output_semantics["result"]:
+            raise ValueError(
+                "block aggregation must preserve the declared value class")
+        # The declared value class picks the aggregation; the parameter may
+        # only restate it.  This is what stops a mean being applied to an
+        # arrival time by writing a different string in the parameters.
+        expected = block_aggregation_for(semantics)
+        if spec.parameters["aggregation"] != expected.value:
+            raise ValueError(
+                f"{semantics.value} admits only {expected.value}, not "
+                f"{spec.parameters['aggregation']!r}")
+        if not _descriptor_fields_equal(
+                source, result, _SPATIAL_PRESERVED_FIELDS):
+            raise ValueError(
+                "block aggregation falsely changes non-spatial metadata")
+        if source.grid is None or result.grid is None:
+            raise ValueError("block aggregation requires declared grids")
+        if source.grid.crs != result.grid.crs:
+            raise ValueError(
+                "block aggregation cannot change CRS; it is an index "
+                "operation, not a reprojection")
+        block_x = spec.parameters["block_x"]
+        block_y = spec.parameters["block_y"]
+        if block_x < 1 or block_y < 1:
+            raise ValueError("block factors must be positive")
+        # Exact cover: no partial trailing block, in either axis.
+        if source.grid.shape != (result.grid.shape[0] * block_y,
+                                 result.grid.shape[1] * block_x):
+            raise ValueError(
+                "block factors do not exactly cover the source grid; a "
+                "partial trailing block is not an aggregation")
+        _validate_block_cell_sizes(source.grid, result.grid, block_x, block_y)
         return
 
     if spec.kind is TransformationKind.VECTOR_ROTATE:

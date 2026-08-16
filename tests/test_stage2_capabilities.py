@@ -174,6 +174,7 @@ def test_binder_registry_is_closed_and_stale_refs_are_rejected():
         "synthetic.pair.bind.v1",
         "transform.regrid_bilinear.bind.v1",
         "transform.reproject_bilinear.bind.v1",
+        "transform.spatial_block_aggregate.bind.v1",
         "transform.spatial_subset.bind.v1",
         "transform.temporal_align.bind.v1",
         "transform.temporal_subset.bind.v1",
