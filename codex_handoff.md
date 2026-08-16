@@ -1,6 +1,6 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-15 (Stage 6 complete; Composition MVP boundary reached)
+Last updated: 2026-08-15 (Stage 7 complete; MVP review still outstanding)
 
 This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
@@ -10,20 +10,20 @@ context only.
 
 1. Read this file completely.
 2. Work in `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project`.
-3. Verify branch `v2` and Stage-6 commit `bf4e360` before changing anything.
+3. Verify branch `v2` and Stage-7 commit `59ffc8f` before changing anything.
 4. Inspect `git status` before edits. Preserve the user-owned dirty files listed
    below and never stage them accidentally.
-5. Read `stage4/README.md`, `stage5/README.md`, and `stage6/README.md`, plus
-   the Composition MVP boundary note in the external roadmap.
-6. Run only the bounded Stage 0-6 tests initially. Do not run WRF-SFIRE, MPI,
+5. Read `stage5/README.md`, `stage6/README.md`, and `stage7/README.md`.
+6. Run only the bounded Stage 0-7 tests initially. Do not run WRF-SFIRE, MPI,
    Slurm, real remote providers, or other heavy workloads. The Stage-5
    connectors are in-process; nothing in the suite touches a network.
-7. **Do not start Stage 7.** Stage 6 reached the Composition MVP release
-   boundary, where the roadmap requires a user/scientist review before any
-   scale feature is added. Two findings should lead that review: the Section
-   9.5 planning-latency gate is measured and **missed**, and no real reference
-   observations exist for an evidence pack. Ask the user how they want to
-   handle both before writing code.
+7. **The Composition MVP review is still outstanding.** Stage 6 reached that
+   boundary and the user directed that Stage 7 proceed anyway, so the review
+   was deferred rather than performed. Three findings are queued for it: the
+   Section 9.5 planning-latency gate is measured and **missed**, no real
+   reference observations exist for an evidence pack, and Stage-7 partitions
+   are not yet executed through the Stage-1 runtime. Ask the user before
+   assuming any of them is resolved.
 
 ## User's actual objective
 
@@ -61,6 +61,7 @@ and source-versus-model choice. It is not special-cased by the resolver.
 - Stage-4 implementation commit: `e8b4bfd` (post-rewrite; was `faf19cd`)
 - Stage-5 implementation commit: `a6e4a5c`
 - Stage-6 implementation commit: `bf4e360`
+- Stage-7 implementation commit: `59ffc8f`
 - External roadmap:
   `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/nasa_project_docs/scientific_workflow_composition_plan.md`
 - Original poster:
@@ -305,6 +306,46 @@ See `acquisition/`, `stage5/`, `stage5/README.md`, and `resolution/upstream.py`.
 
 See `objectives/`, `stage6/`, and `stage6/README.md`.
 
+### Stage 7 — lazy partitions, bounded admission, and collection completeness
+
+- Added `partitions/`. `PartitionSetSpec` is the ordered Cartesian product of
+  declared axes represented as a **mixed-radix number system**: partition *n* is
+  decoded from its index, `total` is computed by multiplication, and there is
+  deliberately no method that returns every key. `iter_keys` takes an offset and
+  a limit, so a caller cannot ask for all of them.
+- `PartitionTaskTemplate` holds the *single* resolved invocation. Every
+  partition derives its logical task key from it, so partitions cannot drift
+  onto different producers. The demo takes that invocation from a real Stage-3
+  resolution rather than inventing one.
+- Logical task identity is Section 8.7's: invocation hash + operation + ordered
+  prospective input **slot** IDs + template ID + partition key. Deployment
+  binding and attempt number are excluded, so revising one task's resources
+  does not rename every unaffected logical task.
+- **Admission is one transaction**, which is the whole correctness story. The
+  idempotent `INSERT OR IGNORE` upserts and the guarded cursor advance share a
+  single `BEGIN IMMEDIATE`, with `UNIQUE(collection, partition_index)` as a
+  third defence so even a key collision cannot multiply a partition. A `fault`
+  seam fires at three named points *inside* the transaction; tests crash at all
+  of them, repeatedly, while draining the space, and assert nothing is skipped
+  and nothing is multiplied.
+- Added batched state writes (`record_outcomes`). One fsync per partition made
+  a 10^4 collection commit-bound; batching cut a 1,600-partition drain to about
+  0.1 s with identical semantics.
+- Bounded memory is measured, not asserted. Holding tiles fixed and growing the
+  temporal axis: 1,000 partitions peak at ~440 KB and 10,000 at ~617 KB, so
+  **10x the partitions costs 1.4x the memory**. The 100 -> 1,000 step is window
+  saturation and is documented as not an apples-to-apples comparison.
+- Fusion bundles adjacent partitions into a `WorkPacket` bounded by member count
+  *and* target cost, without merging identity: each member keeps its logical
+  key, `PacketAttempt` reports members independently, committed members are
+  never recomputed because a sibling failed, and a non-retry-safe template
+  retries nothing automatically.
+- A committed partition is never un-committed, so a duplicate or late packet
+  result cannot destroy landed work. `CompletionPolicy.ALL` requires every
+  partition committed *and zero failures*; `FRACTION` rounds its requirement up.
+
+See `partitions/`, `stage7/`, and `stage7/README.md`.
+
 ## Why the global resolver looks this way
 
 Do not replace Stage 3 with independent per-requirement greedy or local top-k
@@ -336,12 +377,12 @@ million-candidate discovery is solved.
 The **entire** repository suite passed with Stage 6 in the working tree:
 
 ```text
-617 passed, 1 skipped, 7 xfailed
+662 passed, 1 skipped, 7 xfailed
 ```
 
-Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`. Stage 6
-added 43 tests and changed no existing expectation except the closed
-binder-key list.
+Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`,
+Stage 7 `662/1/7`. Stage 7 added 45 tests and changed no existing
+expectation at all — it is additive on top of the composition stack.
 
 **The seventh xfail is new and is not a quarantine.** It is the strict-xfail
 Section 9.5 latency gate: a real, measured miss (see the Stage-6 exit evidence
@@ -405,6 +446,18 @@ The executable Stage-6 proof completed:
 - a recorded human choice re-solved to the direct source and changed the bound
   plan identity
 
+The executable Stage-7 proof completed:
+
+- 10,000 partitions admitted, packetised, and committed in 625 packets, with
+  peak in-flight exactly at the 512 high watermark
+- 10x the partitions cost 1.4x peak memory (saturated comparison)
+- a restart resumed at persisted cursor 512 and re-admitted nothing
+- a crash injected inside admission left the cursor unchanged, with no
+  duplicated and no skipped partitions
+- a partial 8-member packet kept its 4 committed members and offered 4 for
+  retry (0 when the template is not retry-safe)
+- a partially committed collection did **not** satisfy the `ALL` policy
+
 Run any of them only with a fresh node-local temporary directory:
 
 ```bash
@@ -419,6 +472,9 @@ runtime_root=$(mktemp -d /tmp/nasa-stage5-demo.XXXXXX)
 
 runtime_root=$(mktemp -d /tmp/nasa-stage6-demo.XXXXXX)
 .venv/bin/python scripts/run_stage6_demo.py --runtime-root "$runtime_root"
+
+runtime_root=$(mktemp -d /tmp/nasa-stage7-demo.XXXXXX)
+.venv/bin/python scripts/run_stage7_demo.py --runtime-root "$runtime_root"
 ```
 
 Additional evidence:
@@ -496,6 +552,22 @@ Additional evidence:
   concept per decision report is supported.
 - `quality_under_budget`, `minimum_dependency_latency`, and user-defined
   lexicographic policies from Section 6.4 remain deferred.
+- **Stage-7 partitions are not executed through the Stage-1 runtime.** The
+  demo drives all 10,000 through admission, packetisation, and commit, but the
+  outcomes are *recorded* rather than produced by running 10,000 subprocess
+  tasks. Bridging `WorkPacket` members to `BoundExecutionGraph` tasks is the
+  top Stage-7 follow-up; until it exists this is the partition **control
+  plane**, not partitioned science.
+- `PacketAttempt` is a record, not a provider submission. No external handle,
+  no provider-boundary fencing of duplicate packet results beyond the
+  per-member dedup in `record_outcome`.
+- Stage-7 fusion overhead is **not** measured against Section 8.7's 5% target,
+  because there is no representative useful work to measure it against yet.
+- The legacy eager `list(tile_iter)` in `engine/tiled.py` is untouched. The new
+  scalable path is lazy by construction and nothing in Stage 7 routes through
+  the frozen Stage-0 baseline.
+- The largest partition space exercised is 10^4. Million-partition scale
+  remains a Stage-10 question.
 - WRF-SFIRE is not a current test workload.
 
 ## Stage-4 exit evidence (met)
@@ -616,34 +688,62 @@ One design decision worth not re-litigating: the decision record binds into
 identity. The roadmap says "candidate-plan identity"; the bound plan is what
 executes, and reaching it this way avoided changing Stage-2 core identity.
 
-## Next: the Composition MVP release boundary -- not Stage 7
+## Stage-7 exit evidence (met, with one scope boundary)
 
-The roadmap stops here deliberately: *"stop here, run a user/scientist review,
-and repair correctness or usefulness problems before adding scale features. The
-remaining stages are separately justified post-MVP work, not prerequisites for
-the first usable system."*
+All six Stage-7 exit criteria are met at the partition control-plane level, and
+each is asserted by a test rather than only shown in the demo:
 
-**Do not begin Stage 7 without the user's direction.** Bring these two findings
-to the review first:
+- **One scientific selection is reused by all compatible partitions.** The
+  template carries a single resolved invocation taken from a real Stage-3
+  resolution; 10,000 distinct logical keys derive from that one invocation.
+- **Controller restart resumes the persisted partition cursor.** A fresh store
+  object over the same file resumed at index 512 and re-admitted nothing.
+- **Cursor advancement and task insertion are atomic.** A crash injected at any
+  of three points inside the transaction rolls back both halves. Draining the
+  whole space while crashing once per window yields exactly `range(total)` —
+  nothing skipped, nothing multiplied.
+- **Partial partitions cannot satisfy a complete collection.** `ALL` requires
+  every partition committed *and* zero failures; `FRACTION` rounds up.
+- **A partially failed packet preserves committed members** and offers only the
+  uncommitted retry-safe ones; a committed partition is never un-committed by a
+  duplicate or late result.
+- **Memory stays bounded by the window, not the partition count.** Peak
+  allocation grows 1.4x for a 10x larger space once the window is saturated.
 
-1. **Planning latency misses its target by roughly 5x** on a representative
-   graph. This is a solver-strategy problem, not a graph-size problem. Options
-   worth costing: re-examining the two-phase cost/tie-break formulation and its
-   solver-call count, the disabled presolve (which needs the Stage-3 HiGHS
-   false-infeasibility bug re-checked against a current build), warm starts,
-   CP-SAT as an alternative backend, or accepting a larger budget and saying so
-   in Section 9.5.
-2. **There is still no real reference observation dataset.**
-   `stage2/wind_evidence_pack_v1.json` remains frozen at `status: UNAVAILABLE`
-   with `NO_REVIEWED_IMMUTABLE_HELD_OUT_REFERENCE`. Stage 6's evidence is
-   synthetic fixture data and is labelled as such everywhere. Populating a real
-   pack needs held-out observations with a reviewed licence and QC policy --
-   a data-acquisition and review task, not a coding task.
+**The scope boundary to be honest about:** partitions are admitted,
+packetised, and committed, but they are **not executed through the Stage-1
+runtime**. The demo records outcomes rather than running 10,000 subprocess
+tasks. The roadmap's demonstration line says "execute at least 10^4
+partitions"; what is demonstrated is the full partition lifecycle at that
+scale, not 10^4 scientific executions. Bridging `WorkPacket` members to
+`BoundExecutionGraph` tasks is the first thing to do if Stage 7 is revisited,
+and it is also what would make the Section 8.7 five-percent fusion-overhead
+target measurable.
+
+## Next: the deferred Composition MVP review
+
+Stage 6 reached the roadmap's Composition MVP release boundary. The user
+directed that Stage 7 proceed anyway, so **the review was deferred, not
+performed**. It is still the right next step, and three findings are queued for
+it:
+
+1. **Planning latency misses its Section 9.5 target by roughly 5x** on a
+   representative graph (23.3 s p95 against 5 s, MILP-dominated). Solver
+   strategy, not graph size — the benchmark asserts a floor on graph size so
+   the gate cannot be gamed.
+2. **No real reference observations exist.** Stage-6 evidence is synthetic
+   fixture data and `stage2/wind_evidence_pack_v1.json` is still frozen at
+   `status: UNAVAILABLE`. This is a data-acquisition and review task.
+3. **Stage-7 partitions do not execute.** See the scope boundary above.
+
+If the user instead wants to continue building, Stage 8 is resource-aware local
+scheduling: critical-path plus aging priority, real CPU/memory/GPU/scratch
+reservations, best-fit placement, capped nested BLAS/OpenMP threads, and
+observed-duration history replacing declared estimates. Note that Stage 8's
+observation history is also what Stage 7's fusion needs to stop guessing.
 
 ## Later stages, briefly
 
-- **Stage 7:** lazy partition/collection runtime with bounded admission and
-  `10^4`-partition correctness.
 - **Stage 8:** resource-aware local/fixed-allocation scheduling and placement.
 - **Stage 9A:** conditional nonblocking Slurm provider, only when an eligible
   workload/site requires it.
@@ -682,19 +782,19 @@ in there, and push `v2`.
 ## Suggested first prompt on the new machine
 
 ```text
-Read codex_handoff.md completely. Verify branch v2 and Stage-6 commit bf4e360.
+Read codex_handoff.md completely. Verify branch v2 and Stage-7 commit 59ffc8f.
 Inspect git status and preserve the listed user-owned dirty files. Read
-stage4/README.md, stage5/README.md, and stage6/README.md. Run the full test
-suite (expect 617 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
+stage5/README.md, stage6/README.md, and stage7/README.md. Run the full test
+suite (expect 662 passed, 1 skipped, 7 xfailed) without WRF-SFIRE, MPI, Slurm,
 or any real remote provider.
 
-Do NOT start Stage 7. Stage 6 reached the Composition MVP release boundary,
-where the roadmap requires a user/scientist review first. Two findings should
-lead that review: the Section 9.5 planning-latency gate is measured and missed
-(the MILP solve dominates and blows the 5 s p95 budget at ~126 invocations,
-well inside the 1,000-node cap), and no real reference observations exist to
-populate an evidence pack. Ask the user how they want to handle both before
-writing any code. If they direct you to work on latency, treat solver strategy
-as the target, not graph shrinking -- the benchmark deliberately asserts a
-floor on graph size so the gate cannot be gamed.
+Do not assume the Composition MVP review happened -- it was deferred when the
+user chose to continue past the Stage-6 boundary. Three findings are queued for
+it: planning latency misses its Section 9.5 target by ~5x and is MILP-dominated
+(treat solver strategy as the target, not graph shrinking -- the benchmark
+asserts a floor on graph size so the gate cannot be gamed); no real held-out
+reference observations exist for an evidence pack; and Stage-7 partitions are
+admitted and committed but never executed through the Stage-1 runtime. Ask the
+user which of those to take on, or whether to proceed to Stage 8 resource-aware
+scheduling, before writing any code.
 ```
