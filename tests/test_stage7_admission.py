@@ -337,3 +337,159 @@ def test_one_selection_is_reused_by_every_partition():
     keys = {fixture.template.logical_task_key(fixture.spec.key_at(index))
             for index in range(fixture.spec.total)}
     assert len(keys) == fixture.spec.total == 400
+
+
+# -- foreign definitions and durable retry (audit findings) ---------------
+
+
+def test_admission_refuses_a_foreign_partition_set_or_template(tmp_path):
+    """The collection's registered definitions are authoritative.
+
+    The audit registered one collection, admitted with a different template,
+    and watched the cursor advance while the wrong task was stored permanently.
+    """
+    from stage7.fixtures import resolve_all_selected
+    spec, template = _spec(), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    store.open_collection(manifest, spec, template)
+
+    foreign_template = PartitionTaskTemplate.bind(
+        resolve_all_selected()[0], estimated_cost_units=7)
+    assert foreign_template.template_id != template.template_id
+    with pytest.raises(ValueError, match="registered against template"):
+        store.admit_window(manifest.collection_id, spec, foreign_template, 4)
+
+    foreign_spec = _spec(3, 3)
+    with pytest.raises(ValueError, match="registered against partition set"):
+        store.admit_window(manifest.collection_id, foreign_spec, template, 4)
+
+    # Nothing was admitted and the cursor never moved.
+    assert store.cursor(manifest.collection_id).next_index == 0
+    assert store.partition_indices(manifest.collection_id) == ()
+
+
+def _one_packet(store, controller):
+    controller.top_up()
+    return controller.next_packets(limit=4)[0]
+
+
+def test_a_failed_retry_safe_member_comes_back_for_another_attempt(tmp_path):
+    from partitions import PacketAttempt, PacketResult
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    failing = packet.logical_task_keys[0]
+
+    attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
+    result = PacketResult.bind(attempt, packet, tuple(
+        (key, MemberOutcome.FAILED if key == failing else
+         MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
+    decision = store.record_packet_result(
+        manifest.collection_id, packet, attempt, result,
+        retry_safe=True, max_attempts=3)
+
+    assert decision.requeued == (failing,)
+    assert decision.exhausted == ()
+    # The retry claim is now actionable: it really is offered again.
+    offered = [member.logical_task_key
+               for item in controller.next_packets(limit=4)
+               for member in item.members]
+    assert failing in offered
+    assert store.attempts_for(manifest.collection_id, failing) == (
+        (1, "FAILED"),)
+
+
+def test_retries_stop_at_the_attempt_ceiling(tmp_path):
+    from partitions import PacketAttempt, PacketResult
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    failing = packet.logical_task_keys[0]
+
+    decision = None
+    for number in (1, 2, 3):
+        attempt = PacketAttempt.bind(packet, number,
+                                     fence_token=f"fence-{number}")
+        result = PacketResult.bind(attempt, packet, tuple(
+            (key, MemberOutcome.FAILED if key == failing else
+             MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
+        decision = store.record_packet_result(
+            manifest.collection_id, packet, attempt, result,
+            retry_safe=True, max_attempts=3)
+
+    assert decision.exhausted == (failing,)
+    assert store.attempt_count(manifest.collection_id, failing) == 3
+    assert store.attempts_for(manifest.collection_id, failing) == (
+        (1, "FAILED"), (2, "FAILED"), (3, "FAILED"))
+    offered = [member.logical_task_key
+               for item in controller.next_packets(limit=4)
+               for member in item.members]
+    assert failing not in offered
+
+
+def test_a_non_retry_safe_failure_is_terminal_immediately(tmp_path):
+    from partitions import PacketAttempt, PacketResult
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    failing = packet.logical_task_keys[0]
+
+    attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
+    result = PacketResult.bind(attempt, packet, tuple(
+        (key, MemberOutcome.FAILED if key == failing else
+         MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
+    decision = store.record_packet_result(
+        manifest.collection_id, packet, attempt, result,
+        retry_safe=False, max_attempts=3)
+
+    # Re-running a non-idempotent operation is a human decision, not a default.
+    assert decision.requeued == ()
+    assert decision.exhausted == (failing,)
+
+
+def test_a_committed_member_survives_a_late_duplicate_result(tmp_path):
+    from partitions import PacketAttempt, PacketResult
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+
+    first = PacketAttempt.bind(packet, 1, fence_token="fence-1")
+    store.record_packet_result(
+        manifest.collection_id, packet, first,
+        PacketResult.bind(first, packet, tuple(
+            (key, MemberOutcome.COMMITTED)
+            for key in packet.logical_task_keys)),
+        retry_safe=True, max_attempts=3)
+    committed = store.state(manifest.collection_id).committed
+
+    late = PacketAttempt.bind(packet, 2, fence_token="stale-fence")
+    decision = store.record_packet_result(
+        manifest.collection_id, packet, late,
+        PacketResult.bind(late, packet, tuple(
+            (key, MemberOutcome.FAILED)
+            for key in packet.logical_task_keys)),
+        retry_safe=True, max_attempts=3)
+
+    assert decision.committed == () and decision.requeued == ()
+    assert store.state(manifest.collection_id).committed == committed

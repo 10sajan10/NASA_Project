@@ -24,6 +24,7 @@ from .packet import (
 from .space import AxisKind, PartitionAxis, PartitionKey, PartitionSetSpec
 from .store import (
     AdmissionResult,
+    RetryDecision,
     CursorConflictError,
     CursorState,
     PartitionStore,
@@ -49,6 +50,7 @@ __all__ = [
     "PartitionSetSpec",
     "PartitionStore",
     "PartitionTaskTemplate",
+    "RetryDecision",
     "TopUpResult",
     "WorkPacket",
     "fuse_members",

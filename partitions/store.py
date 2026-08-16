@@ -28,7 +28,7 @@ from capabilities.implementation import _required_text
 from engine.runtime.identity import strict_canonical_json
 
 from .manifest import CollectionManifest, CollectionState
-from .packet import MemberOutcome
+from .packet import MemberOutcome, PacketAttempt, PacketResult, WorkPacket
 from .space import PartitionSetSpec
 from .template import PartitionTaskTemplate
 
@@ -52,9 +52,22 @@ CREATE TABLE IF NOT EXISTS logical_tasks (
   partition_index INTEGER NOT NULL CHECK(partition_index >= 0),
   state TEXT NOT NULL CHECK(state IN
     ('ADMITTED','COMMITTED','FAILED')),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
   updated_at REAL NOT NULL,
   PRIMARY KEY(collection_id, logical_task_key),
   UNIQUE(collection_id, partition_index)
+) STRICT;
+CREATE TABLE IF NOT EXISTS partition_attempts (
+  collection_id TEXT NOT NULL REFERENCES collections(collection_id),
+  logical_task_key TEXT NOT NULL,
+  attempt_number INTEGER NOT NULL CHECK(attempt_number >= 1),
+  attempt_id TEXT NOT NULL,
+  packet_id TEXT NOT NULL,
+  fence_token TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK(outcome IN
+    ('COMMITTED','FAILED','NOT_ATTEMPTED')),
+  created_at REAL NOT NULL,
+  PRIMARY KEY(collection_id, logical_task_key, attempt_number)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS logical_task_state_idx
   ON logical_tasks(collection_id, state, partition_index);
@@ -69,6 +82,26 @@ class CursorConflictError(RuntimeError):
 class CursorState:
     next_index: int
     version: int
+
+
+@dataclass(frozen=True)
+class RetryDecision:
+    """What one packet result did to each of its members."""
+
+    committed: tuple[str, ...]
+    requeued: tuple[str, ...]
+    exhausted: tuple[str, ...]
+
+    @property
+    def retried(self) -> int:
+        return len(self.requeued)
+
+    def to_dict(self) -> dict[str, list[str]]:
+        return {
+            "committed": list(self.committed),
+            "requeued": list(self.requeued),
+            "exhausted": list(self.exhausted),
+        }
 
 
 @dataclass(frozen=True)
@@ -194,6 +227,26 @@ class PartitionStore:
         stamp = time.time() if now is None else now
 
         with self.connect() as connection:
+            # The collection's own definitions are authoritative.  Admitting
+            # with a different spec or template would advance the cursor while
+            # storing tasks for work nobody registered, and the wrong task
+            # would then be permanent.
+            registered = connection.execute(
+                "SELECT json_extract(spec_json, '$.set_id'),"
+                "       json_extract(template_json, '$.template_id') "
+                "FROM collections WHERE collection_id=?",
+                (collection_id,)).fetchone()
+            if registered is None:
+                raise KeyError(f"unknown collection {collection_id!r}")
+            if registered[0] != spec.set_id:
+                raise ValueError(
+                    f"collection {collection_id!r} is registered against "
+                    f"partition set {registered[0][:12]}, not {spec.set_id[:12]}")
+            if registered[1] != template.template_id:
+                raise ValueError(
+                    f"collection {collection_id!r} is registered against "
+                    f"template {registered[1][:12]}, not "
+                    f"{template.template_id[:12]}")
             row = connection.execute(
                 "SELECT next_index, version FROM cursors WHERE collection_id=?",
                 (collection_id,)).fetchone()
@@ -287,6 +340,104 @@ class PartitionStore:
                     (state, stamp, collection_id, logical_task_key)).rowcount
         return changed
 
+    def record_packet_result(
+        self,
+        collection_id: str,
+        packet: "WorkPacket",
+        attempt: "PacketAttempt",
+        result: "PacketResult",
+        *,
+        retry_safe: bool,
+        max_attempts: int = 3,
+        now: float | None = None,
+    ) -> "RetryDecision":
+        """Durably record one packet attempt and decide each member's fate.
+
+        This is the transition the audit found missing.  Previously a failed
+        member was marked FAILED while packet generation only ever selected
+        ADMITTED rows, so ``retryable_keys`` reported work that could never
+        come back.  Now a retry-safe failure below the attempt ceiling is
+        returned to ADMITTED -- which is what makes it eligible for a new
+        packet -- and everything is written in one transaction alongside a
+        durable per-partition attempt record.
+
+        Committed is final: a late or duplicate result cannot un-commit work.
+        """
+        if result.attempt_id != attempt.attempt_id:
+            raise ValueError("result does not belong to this attempt")
+        if attempt.packet_id != packet.packet_id:
+            raise ValueError("attempt does not belong to this packet")
+        if (isinstance(max_attempts, bool) or not isinstance(max_attempts, int)
+                or max_attempts < 1):
+            raise ValueError("max_attempts must be a positive integer")
+        stamp = time.time() if now is None else now
+        committed: list[str] = []
+        requeued: list[str] = []
+        exhausted: list[str] = []
+
+        with self.connect() as connection:
+            for key, outcome in result.outcomes:
+                row = connection.execute(
+                    "SELECT state, attempt_count FROM logical_tasks "
+                    "WHERE collection_id=? AND logical_task_key=?",
+                    (collection_id, key)).fetchone()
+                if row is None:
+                    raise KeyError(
+                        f"{key!r} is not an admitted partition of "
+                        f"{collection_id!r}")
+                state, attempts = row[0], int(row[1])
+                if state == "COMMITTED":
+                    continue          # already landed; nothing can undo it
+                attempts += 1
+                connection.execute(
+                    "INSERT OR IGNORE INTO partition_attempts"
+                    "(collection_id, logical_task_key, attempt_number,"
+                    " attempt_id, packet_id, fence_token, outcome, created_at)"
+                    " VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (collection_id, key, attempts, attempt.attempt_id,
+                     packet.packet_id, attempt.fence_token, outcome.value,
+                     stamp))
+                if outcome is MemberOutcome.COMMITTED:
+                    next_state = "COMMITTED"
+                    committed.append(key)
+                elif retry_safe and attempts < max_attempts:
+                    # Back to ADMITTED so the next packet picks it up again.
+                    next_state = "ADMITTED"
+                    requeued.append(key)
+                else:
+                    next_state = "FAILED"
+                    exhausted.append(key)
+                connection.execute(
+                    "UPDATE logical_tasks SET state=?, attempt_count=?,"
+                    " updated_at=? WHERE collection_id=? AND logical_task_key=?",
+                    (next_state, attempts, stamp, collection_id, key))
+        return RetryDecision(
+            committed=tuple(sorted(committed)),
+            requeued=tuple(sorted(requeued)),
+            exhausted=tuple(sorted(exhausted)))
+
+    def attempts_for(self, collection_id: str,
+                     logical_task_key: str) -> tuple[tuple[int, str], ...]:
+        """Every durable attempt for one partition, as (number, outcome)."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT attempt_number, outcome FROM partition_attempts "
+                "WHERE collection_id=? AND logical_task_key=? "
+                "ORDER BY attempt_number",
+                (collection_id, logical_task_key)).fetchall()
+        return tuple((int(row[0]), row[1]) for row in rows)
+
+    def attempt_count(self, collection_id: str,
+                      logical_task_key: str) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT attempt_count FROM logical_tasks "
+                "WHERE collection_id=? AND logical_task_key=?",
+                (collection_id, logical_task_key)).fetchone()
+        if row is None:
+            raise KeyError(logical_task_key)
+        return int(row[0])
+
     def state(self, collection_id: str) -> CollectionState:
         with self.connect() as connection:
             manifest_row = connection.execute(
@@ -342,6 +493,7 @@ class PartitionStore:
 
 __all__ = [
     "AdmissionResult",
+    "RetryDecision",
     "CursorConflictError",
     "CursorState",
     "PartitionStore",
