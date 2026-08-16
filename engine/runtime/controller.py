@@ -45,11 +45,22 @@ class WorkflowController:
                  poll_interval_s: float = 0.02,
                  max_inflight: int = 1,
                  artifact_failpoint: Callable[[str], None] | None = None,
-                 provider: LocalSubprocessProvider | None = None) -> None:
+                 provider: LocalSubprocessProvider | None = None,
+                 ledger: "ReservationLedger | None" = None,
+                 site_id: str | None = None,
+                 priority_policy: "PriorityPolicy | None" = None,
+                 observations: "ObservationHistory | None" = None) -> None:
         root, fs_type = validate_runtime_root(Path(runtime_root))
-        if max_inflight != 1:
+        if (isinstance(max_inflight, bool) or not isinstance(max_inflight, int)
+                or max_inflight < 1):
+            raise ValueError("max_inflight must be a positive integer")
+        if max_inflight > 1 and ledger is None:
+            # Concurrency without a reservation ledger is exactly the
+            # oversubscription the Stage-8 policy exists to prevent: the
+            # controller would start N tasks knowing nothing about the node.
             raise ValueError(
-                "Stage 1 requires max_inflight=1; resource packing is deferred")
+                "max_inflight above 1 requires a ReservationLedger so "
+                "concurrent attempts cannot oversubscribe the node")
         if poll_interval_s <= 0:
             raise ValueError("poll interval must be positive")
         self.runtime_root = root
@@ -57,6 +68,13 @@ class WorkflowController:
         self.site = site or current_private_site()
         self.poll_interval_s = poll_interval_s
         self.max_inflight = max_inflight
+        self.ledger = ledger
+        self.scheduling_site_id = site_id
+        self.priority_policy = priority_policy
+        self.observations = observations
+        # task_id -> (envelope, started_at) for live reservations we own.
+        self._reserved: dict[str, tuple[object, float]] = {}
+        self._ready_since: dict[str, float] = {}
         self.controller_id = uuid.uuid4().hex
         self._closed = False
         self._lock = ControllerLock(root / "control" / "controller.lock")
@@ -119,10 +137,21 @@ class WorkflowController:
                 self._stop_cancelled_attempt(
                     cancelled, error="attempt deadline exceeded")
 
-        if self._global_active_attempt_count() < self.max_inflight:
+        self._release_finished_reservations(run_id)
+        active = self._global_active_attempt_count()
+        if active < self.max_inflight:
             ready = self.store.ready_tasks(run_id)
-            if ready:
-                self._dispatch(run_id, ready[0])
+            for task in self._order_ready(ready):
+                if active >= self.max_inflight:
+                    break
+                if not self._reserve_for(task):
+                    continue      # no capacity for this one yet; try the next
+                before = self._global_active_attempt_count()
+                self._dispatch(run_id, task)
+                if self._global_active_attempt_count() > before:
+                    active += 1
+                else:
+                    self._release_reservation(task.task_id)
 
         return self.store.finalize_run_state(run_id)
 
@@ -370,6 +399,116 @@ class WorkflowController:
             )]
         for attempt_id in attempt_ids:
             self._reconcile_record(self.store.attempt_record(attempt_id))
+
+    # -- Stage-8 policy bridge --------------------------------------------
+
+    def _order_ready(self, ready: "list[BoundTask]") -> "list[BoundTask]":
+        """Order ready work by the Stage-8 policy when one was supplied.
+
+        With no policy this is the Stage-1 order the store already returned,
+        so existing behaviour is untouched.
+        """
+        if self.priority_policy is None or len(ready) < 2:
+            return ready
+        from scheduling import (ScheduledNode, critical_path_ranks,
+                                order_ready_tasks)
+        nodes = []
+        for task in ready:
+            declared = float(getattr(task.resources, "walltime_s", 1.0) or 1.0)
+            estimate = declared
+            if self.observations is not None:
+                estimate = self.observations.duration_estimate(
+                    task.key, declared).value
+            nodes.append(ScheduledNode(task.task_id, estimate))
+        ranks = critical_path_ranks(nodes)
+        now = time.monotonic()
+        waiting = {task.task_id: max(now - self._ready_since.get(
+            task.task_id, now), 0.0) for task in ready}
+        by_id = {task.task_id: task for task in ready}
+        for task in ready:
+            self._ready_since.setdefault(task.task_id, now)
+        return [by_id[key] for key in order_ready_tasks(
+            [task.task_id for task in ready], ranks, waiting,
+            self.priority_policy)]
+
+    def _envelope_for(self, task: "BoundTask"):
+        from scheduling import ResourceEnvelopeSpec
+        request = task.resources
+        return ResourceEnvelopeSpec(
+            cpu_cores=max(1, int(getattr(request, "cpu_cores", 1))),
+            memory_mb=max(1, int(getattr(request, "memory_mb", 1))),
+            gpus=max(0, int(getattr(request, "gpus", 0))),
+            scratch_mb=0)
+
+    def _reserve_for(self, task: "BoundTask") -> bool:
+        """Claim capacity before dispatch, or decline to start this task."""
+        if self.ledger is None:
+            return True
+        if task.task_id in self._reserved:
+            return True
+        from scheduling import OversubscriptionError, best_fit_site
+        envelope = self._envelope_for(task)
+        site_id = self.scheduling_site_id or best_fit_site(
+            self.ledger, envelope)
+        if site_id is None:
+            return False
+        try:
+            self.ledger.reserve(task.task_id, site_id, envelope)
+        except OversubscriptionError:
+            return False
+        self._reserved[task.task_id] = (envelope, time.monotonic())
+        return True
+
+    def _release_reservation(self, task_id: str) -> None:
+        if self.ledger is None or task_id not in self._reserved:
+            return
+        self._reserved.pop(task_id, None)
+        try:
+            self.ledger.release(task_id)
+        except KeyError:
+            pass
+
+    def _release_finished_reservations(self, run_id: str) -> None:
+        """Return capacity for tasks that are no longer running.
+
+        Reservations are released on the *task* leaving an active state, not
+        on process exit, so a task still validating or committing keeps its
+        resources until it is genuinely done.
+        """
+        if self.ledger is None or not self._reserved:
+            return
+        live = {"READY", "RUNNING", "VALIDATING", "COMMITTING"}
+        active = {row["task_id"] for row in self.store.task_rows(run_id)
+                  if row["state"] in live}
+        for task_id in list(self._reserved):
+            if task_id in active:
+                continue
+            envelope, started = self._reserved[task_id]
+            self._release_reservation(task_id)
+            self._record_observation(run_id, task_id, envelope, started)
+
+    def _record_observation(self, run_id: str, task_id: str, envelope,
+                            started: float) -> None:
+        """Emit a measured observation for a finished task, if asked to.
+
+        Duration is wall clock from reservation to release.  Peak memory is
+        *not* sampled by this controller, so the observation records the
+        reserved envelope rather than a measurement; overstating that as a
+        measured peak would feed the revision machinery invented numbers.
+        """
+        if self.observations is None:
+            return
+        from scheduling import ObservationKind, TaskObservation
+        row = next((item for item in self.store.task_rows(run_id)
+                    if item["task_id"] == task_id), None)
+        if row is None:
+            return
+        kind = (ObservationKind.COMPLETED if row["state"] == "SUCCEEDED"
+                else ObservationKind.FAILED)
+        self.observations.record(TaskObservation(
+            task_key=row["task_key"],
+            duration_s=max(time.monotonic() - started, 0.0),
+            peak=envelope, kind=kind))
 
     def _global_active_attempt_count(self) -> int:
         active = tuple(state.value for state in (

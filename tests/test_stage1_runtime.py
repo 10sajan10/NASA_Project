@@ -273,13 +273,21 @@ def test_runtime_root_rejects_remote_filesystem(monkeypatch, tmp_path):
         validate_runtime_root(tmp_path / "remote-runtime")
 
 
-def test_one_controller_writer_and_serial_admission(tmp_path):
+def test_one_controller_writer_and_guarded_admission(tmp_path):
+    """One writer, and concurrency only against a reservation ledger.
+
+    Stage 8 lifted the hard max_inflight=1 rule, but running N attempts while
+    knowing nothing about node capacity is precisely the oversubscription the
+    reservation ledger exists to prevent, so concurrency requires one.
+    """
     first = WorkflowController(tmp_path)
     try:
         with pytest.raises(RuntimeError, match="another WorkflowController"):
             WorkflowController(tmp_path)
-        with pytest.raises(ValueError, match="max_inflight=1"):
+        with pytest.raises(ValueError, match="requires a ReservationLedger"):
             WorkflowController(tmp_path / "other", max_inflight=2)
+        with pytest.raises(ValueError, match="positive integer"):
+            WorkflowController(tmp_path / "other", max_inflight=0)
     finally:
         first.close()
 
