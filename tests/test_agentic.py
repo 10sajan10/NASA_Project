@@ -21,7 +21,7 @@ from cube.catalog import Catalog, TileRecord
 # ====================================================================
 def test_catalog_v2_provenance_roundtrip(tmp_path):
     cat = Catalog(tmp_path / "c.duckdb")
-    assert cat.schema_version() == 2
+    assert cat.schema_version() == 3
     cat.register_variable("dem", "static", units="m",
                           standard_name="dem", domain="terrain")
     cat.add_tile(TileRecord(variable="dem", t=None, source="usgs",
@@ -54,13 +54,21 @@ def test_catalog_v1_migrates_in_place(tmp_path):
     con.close()
 
     cat = Catalog(path)                       # migration happens here
-    assert cat.schema_version() == 2
+    assert cat.schema_version() == 3
     v = cat.get_variable("dem")
     assert v["producer"] == "dem_driver" and v["standard_name"] == ""
     assert cat.list_tiles("dem")[0]["source_url"] == ""
     # v2 writes work against the migrated table
     cat.add_tile(TileRecord(variable="dem", t=None, source="usgs",
                             native_res_m=30.0, run_id="r2", version=1))
+    # v3 adds entries/lineage to a database that never had them, without
+    # disturbing the v1 rows above.
+    from cube.entries import CubeEntry
+    entry = cat.commit_entry(CubeEntry.create(
+        concept="dem", kind="static", producer="dem_driver",
+        content_sha256="a" * 64))
+    assert cat.entry(entry.entry_id).concept == "dem"
+    assert cat.get_variable("dem")["producer"] == "dem_driver"
     cat.close()
 
 
@@ -71,7 +79,7 @@ def test_catalog_export_readable(tmp_path):
     out = tmp_path / "catalog.json"
     cat.export_json_catalog(out)
     data = json.loads(out.read_text())
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert data["tiles"][0]["license"] == "public"
     cat.close()
 
