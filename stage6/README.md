@@ -2,7 +2,7 @@
 
 Status: **prototype** — implemented and acceptance-tested on 2026-08-15,
 revised 2026-08-16 after an external audit. Two exit gates do not hold: the
-Section 9.5 planning-latency budget is **measured and missed** by roughly 3x
+Section 9.5 planning-latency budget is **measured and missed** by roughly 1.4x
 (see "The latency gate fails"), and the evidence driving the whole
 dataset-versus-model contest is **synthetic fixture data** — no real held-out
 reference observations exist. What the stage demonstrates is the decision
@@ -142,7 +142,7 @@ Stage 3. Measured on the frozen representative graph
 | | Value |
 |---|---|
 | invocations / arcs / levels | 126 / 250 / 6 — **all within caps** |
-| p95 total (30 warm runs) | **15.1 s** |
+| p95 total (30 warm runs) | **7.06 s** (was 15.1 s before Stage 8R) |
 | budget | 5 s |
 | within budget | **no** |
 
@@ -153,7 +153,7 @@ at 83% of planning time and scaling sharply:
 |---|---|---|---|
 | 30 | 1.1 s | 0.7 s | 3 |
 | 64 | 5.5 s | 4.6 s | 7 |
-| 126 | 15.1 s | — | — |
+| 126 | 7.06 s | — | — |
 
 Presolve is now **enabled** by default. It was disabled because this HiGHS
 build returns a false infeasibility on a valid formulation, but the solver path
@@ -250,3 +250,40 @@ justified post-MVP work, not prerequisites.
 
 The two items that should lead that review are the failed latency gate and the
 absence of any real reference observations to put in an evidence pack.
+
+
+## Re-measured after Stage 8R, and a second limit found
+
+Stage 8R made the discovered hypergraph share producers properly instead of
+instantiating one invocation node per requirement context. Re-frozen on the
+*same* representative graph — 126 invocations, 250 satisfaction arcs, depth 6,
+so the anti-gaming floors in `tests/test_stage6_benchmark.py` still hold — the
+gate improved from **15.12 s to 7.06 s**, from 3.02x over budget to 1.41x.
+
+It is still a miss, and it is still recorded as a strict xfail rather than
+re-scoped until it passes.
+
+Measuring the re-freeze surfaced a **larger limit than latency**. Holding the
+solver's default 30 s interactive `time_limit_s`:
+
+| invocations | arcs | wall | status |
+|---|---|---|---|
+| 30 | 58 | 1.03 s | `READY` |
+| 62 | 122 | 1.90 s | `READY` |
+| 126 | 250 | 7.02 s | `READY` |
+| 254 | 506 | 33.77 s | `FEASIBLE_NOT_PROVEN_OPTIMAL` |
+| 510 | 1018 | 37.53 s | `FEASIBLE_NOT_PROVEN_OPTIMAL` |
+
+Beyond roughly 250 invocations the solve budget expires before optimality is
+proven, so the resolver stops claiming a global optimum. Section 9.5's node cap
+is 1,000, so **exact global selection is unavailable at about a quarter of the
+scale the system declares for itself.**
+
+That is a correctness-scope boundary, not a speed complaint, and it matters more
+than the 1.41x latency miss: latency degrades a service, but an unproven optimum
+degrades the central claim. The system does report it honestly — the status
+becomes `FEASIBLE_NOT_PROVEN_OPTIMAL` rather than silently returning a
+non-optimal plan labelled optimal — so this is a documented limit rather than a
+defect. Raising it needs solver strategy work (the deterministic tie-break
+currently freezes producer bits in 30-bit chunks, so solver calls scale with
+graph width), not a larger time limit.

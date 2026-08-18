@@ -93,13 +93,17 @@ def test_the_frozen_profile_is_a_real_graph_not_a_toy(frozen):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Section 9.5 p95 <= 5 s is NOT met on this node: 15.1 s at ~126 "
-        "invocations, well inside the 1,000-node cap. Enabling presolve took "
-        "it from 23.3 s; the rest is structural, because deterministic "
-        "tie-breaking freezes producer bits in 30-bit chunks so solver calls "
-        "scale with graph width. Recorded as a real miss. If this starts "
-        "passing, re-freeze the profile and update stage6/README.md and the "
-        "roadmap rather than deleting this marker."))
+        "Section 9.5 p95 <= 5 s is NOT met on this node: 7.06 s at 126 "
+        "invocations and 250 arcs, well inside the 1,000-node cap. Stage-8R "
+        "took it from 15.12 s (3.02x over) to 1.41x over; the remainder is "
+        "structural, because deterministic tie-breaking freezes producer bits "
+        "in 30-bit chunks so solver calls scale with graph width. Recorded as "
+        "a real miss. A separate and larger limit sits just beyond this "
+        "graph: at ~254 invocations the 30 s interactive solve limit expires "
+        "before optimality is proven, so the resolver honestly reports "
+        "FEASIBLE_NOT_PROVEN_OPTIMAL rather than claiming a global optimum. "
+        "If this starts passing, re-freeze the profile and update "
+        "stage6/README.md and the roadmap rather than deleting this marker."))
 def test_section_9_5_latency_budget_is_met(frozen):
     report = frozen["section_9_5"]
     assert report["p95_total_s"] <= SECTION_9_5_P95_BUDGET_S

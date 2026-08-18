@@ -52,8 +52,13 @@ The next stage is **Composition MVP release review**, in this order:
 
 1. review the large uncommitted Stage-8R working tree and commit only project
    changes while preserving the user-owned WRF/config files;
-2. decide the missed Stage-6 representative latency/evidence gate rather than
-   relabeling conformance evidence as science;
+2. ~~decide the missed Stage-6 representative latency/evidence gate~~ **DONE.**
+   Re-measured and re-frozen on the same 126-invocation/250-arc graph: the
+   latency gate improved 15.12 s -> 7.06 s (3.02x -> 1.41x over the 5 s
+   budget) and remains a recorded strict-xfail miss. Doing so surfaced a
+   larger limit: past ~254 invocations the 30 s solve budget expires before
+   optimality is proven, so exact global selection is unavailable at about a
+   quarter of Section 9.5's own 1,000-node cap. See `stage6/README.md`;
 3. gather real-site deployment evidence only when a provisioned private/Slurm
    site is available; and
 4. choose R1/R2 reference-science work or authorized provider validation. Do
