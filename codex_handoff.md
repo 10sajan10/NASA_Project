@@ -68,6 +68,18 @@ The next stage is **Composition MVP release review**, in this order:
 4. choose R1/R2 reference-science work or authorized provider validation. Do
    not begin Stage 9B research work first.
 
+   **R1 is started but structurally blocked.** `scripts/run_cascade.py` now
+   refuses at launch when a target cannot be placed onto the cube grid, so the
+   recorded 48.6-hour publication failure becomes an immediate refusal. The
+   blocker beyond that is `SimulationGrid.crs_epsg: int`: WRF's domain-centred
+   Lambert has no EPSG code, so the legacy cube cannot represent WRF's native
+   grid at all. `crs_epsg` has 25 non-test uses, one of them
+   `models/wrf_sfire_adapter.py:783` (`int(grid.crs_epsg)`), which is
+   user-owned. Publishing WRF output on its native grid therefore needs either
+   the user's approval to change that adapter, or publication through the
+   Cube v3 entries path, which already carries a per-entry grid. Ask before
+   touching the adapter.
+
 ## First instructions for the next instance
 
 1. Read this file completely.
@@ -1376,7 +1388,7 @@ Verify branch v2 at 45aaee1, inspect git status, and preserve every listed
 user-owned dirty file. The separate nasa_project_docs repository also has dirty
 README/diagram work; preserve it.
 
-The last independently verified full suite result is 997 passed, 1 skipped,
+The last independently verified full suite result is 1004 passed, 1 skipped,
 7 xfailed (Stage-8R working tree, including the Cube projection-authority
 fix). Initially run only bounded tests; do not run WRF-SFIRE, MPI, a real
 Slurm command, or a real remote provider.

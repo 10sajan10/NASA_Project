@@ -103,6 +103,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Days of ERA5 wind to cache in the cube.")
 
     # targets — what to produce. Drives the whole DAG.
+    p.add_argument("--allow-unplaceable", action="store_true",
+                   help="Launch even when the publication preflight shows a "
+                        "target cannot be placed onto the cube grid.")
     p.add_argument("--targets", default="arrival_s,fire_area",
                    help="Comma-separated cube variables to produce. "
                         "The DAG is built backwards from these.")
@@ -256,6 +259,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Fire mesh: {H * config.fire_mesh_ratio} x "
               f"{W * config.fire_mesh_ratio} @ {config.fire_pixel_m:.0f} m")
 
+        _publication_gate(cube, config, targets,
+                          strict=not args.allow_unplaceable)
+
         from engine import PipelineRunner, make_backend
         backend = make_backend(args.backend)
         runner = PipelineRunner(reg, backend=backend, verbose=True,
@@ -296,6 +302,51 @@ def main(argv: list[str] | None = None) -> int:
 
 
 # ---------------------------------------------------------------- helpers
+def _publication_gate(cube, config, targets, *, strict: bool) -> None:
+    """Refuse a run whose outputs provably cannot be published.
+
+    A cascade's most expensive failure is a publication error: the recorded
+    `arrival_s: array shape (253, 253) != grid (1001, 1001)` cost 48.6 hours
+    before it surfaced, because the only check ran at write time. Placement is
+    a property of two grid descriptors, so it is decidable here, at launch,
+    before any core-hour is spent.
+
+    This asks only what the declared metadata can answer, and it is deliberately
+    model-agnostic: any producer that declares a native grid is checked the same
+    way. Producers that declare nothing are reported, not guessed at.
+    """
+    from cube.preflight import PlannedPublication, preflight_publications
+
+    declared = getattr(config, "producer_native_grids", None) or {}
+    # A producer that declares a native grid emits an array on *that* grid,
+    # not on the cube's.  Assuming the cube's shape here would be the same
+    # unfounded assumption that produced the recorded failure.
+    planned = []
+    for name in targets:
+        native = declared.get(name)
+        shape = tuple(native.shape) if native is not None \
+            else tuple(cube.grid.shape)
+        planned.append(PlannedPublication(name, shape, native))
+    result = preflight_publications(cube.grid, planned)
+    undeclared = [name for name in targets if name not in declared]
+
+    print("\nPublication preflight:")
+    if undeclared:
+        print(f"  {len(undeclared)} of {len(targets)} targets declare no native "
+              f"grid, so placement cannot be established for them: "
+              f"{', '.join(undeclared)}")
+    if result.ok:
+        print("  every declared publication places onto the cube grid")
+        return
+    print("  " + result.report().replace("\n", "\n  "))
+    if strict:
+        raise SystemExit(
+            "refusing to launch: the run cannot publish its targets. "
+            "Re-run with --allow-unplaceable to proceed anyway.")
+    print("  continuing anyway (--allow-unplaceable); publication may fail "
+          "at write time after the science has run")
+
+
 def _build_cube(out: Path, config):
     from cube.grid import SimulationGrid
     from cube.store import Cube
