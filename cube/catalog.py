@@ -13,6 +13,8 @@ Opening a v1 catalog migrates it in place (additive columns only), so
 existing cubes keep working unchanged.
 """
 from __future__ import annotations
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -140,6 +142,11 @@ ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS source_url    TEXT DEFAULT '';
 ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS license       TEXT DEFAULT '';
 ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS checksum      TEXT DEFAULT '';
 ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS run_id        TEXT DEFAULT '';
+-- v3.1: an entry must say WHERE it is and in WHAT format, or it can be
+-- described but never retrieved. Additive, so existing cubes keep working.
+ALTER TABLE entries   ADD COLUMN IF NOT EXISTS location      TEXT DEFAULT '';
+ALTER TABLE entries   ADD COLUMN IF NOT EXISTS media_type    TEXT DEFAULT '';
+ALTER TABLE entries   ADD COLUMN IF NOT EXISTS detail_json   TEXT DEFAULT '';
 """
 
 _VARIABLE_COLS = ["name", "kind", "units", "dtype", "description",
@@ -318,10 +325,12 @@ class Catalog:
         """
         self.con.execute(
             "INSERT INTO entries (entry_id, concept, kind, producer, "
-            "content_sha256, grid_json, depth, run_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "content_sha256, grid_json, depth, run_id, location, media_type, "
+            "detail_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [entry.entry_id, entry.concept, entry.kind, entry.producer,
-             entry.content_sha256, entry.grid_json(), depth, entry.run_id])
+             entry.content_sha256, entry.grid_json(), depth, entry.run_id,
+             entry.location, entry.media_type,
+             json.dumps(entry.detail, sort_keys=True) if entry.detail else ""])
         for edge in entry.inputs:
             self.con.execute(
                 "INSERT INTO entry_inputs (entry_id, port, input_entry_id) "
@@ -351,6 +360,45 @@ class Catalog:
             depth = max(depth, parent.depth + 1)
         self._insert_entry_rows(entry, depth)
         return self.entry(entry.entry_id)
+
+    def register_dataset(self, entry: CubeEntry, path, *,
+                         verify: bool = True) -> CubeEntry:
+        """Catalog a file that already exists, without copying or converting it.
+
+        This is the catalog-of-files path: WRF-SFIRE writes netCDF, a driver
+        downloads GRIB, and the cube records *where* each lives, *what* it
+        holds, and *what produced it* -- so it can be found, its provenance
+        followed, and the bytes read natively. Nothing is reprojected,
+        resampled, or re-encoded, and each entry keeps its own grid.
+
+        Its authority is narrower than a projected artifact's and the
+        difference is deliberate. Projection replays a RuntimeStore commit and
+        proves this system produced the bytes. Registration proves only that a
+        file exists at a path with the recorded digest, which is what a catalog
+        of external outputs can honestly claim.
+        """
+        located = Path(path)
+        if not entry.location:
+            raise ValueError(
+                "a registered dataset must record its location, or it can be "
+                "described but never retrieved")
+        if verify:
+            if not located.is_file():
+                raise FileNotFoundError(f"no dataset at {located}")
+            digest = hashlib.sha256()
+            with located.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != entry.content_sha256:
+                raise ValueError(
+                    f"{located} does not match its recorded content digest; "
+                    "the catalog would point at bytes that changed")
+        return self._commit_entry_for_test_fixture(entry)
+
+    def datasets_for(self, concept: str) -> list[CubeEntry]:
+        """Every catalogued dataset offering a concept, newest lineage first."""
+        return sorted(self.entries_for(concept),
+                      key=lambda item: (-item.depth, item.entry_id))
 
     def _commit_authoritative_projection(self, projection, authority):
         """Apply a verified projection receipt atomically (projector only).
@@ -507,10 +555,13 @@ class Catalog:
             entry_id=row[0], concept=row[1], kind=row[2], producer=row[3],
             content_sha256=row[4], grid=grid_from_json(row[5] or ""),
             depth=int(row[6]), inputs=edges, run_id=row[7] or "",
-            committed_at=row[8])
+            committed_at=row[8], location=row[9] or "",
+            media_type=row[10] or "",
+            detail=json.loads(row[11]) if row[11] else {})
 
     _ENTRY_COLS = ("entry_id, concept, kind, producer, content_sha256, "
-                   "grid_json, depth, run_id, committed_at")
+                   "grid_json, depth, run_id, committed_at, location, "
+                   "media_type, detail_json")
 
     def entry(self, entry_id: str) -> Optional[CubeEntry]:
         row = self.con.execute(

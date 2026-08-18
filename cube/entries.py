@@ -86,6 +86,16 @@ class CubeEntry:
     inputs: tuple[EntryInput, ...]
     run_id: str = ""
     committed_at: datetime | None = None
+    #: Where the bytes are, and how they are encoded. A catalog that cannot
+    #: say where a dataset lives can describe it but never retrieve it.
+    #: Deliberately outside `identity_payload`: moving a file or re-recording
+    #: its format does not change what the value *is*, and an entry whose id
+    #: changed when a file moved would break every lineage edge pointing at it.
+    location: str = ""
+    media_type: str = ""
+    #: Free-form descriptive metadata for discovery -- variables held, their
+    #: dimensions and units, time coverage. Not identity-bearing.
+    detail: dict = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for value, label in ((self.concept, "concept"),
@@ -134,10 +144,13 @@ class CubeEntry:
                content_sha256: str, grid: GridDescriptor | None = None,
                inputs: tuple[EntryInput, ...] = (), depth: int = 0,
                run_id: str = "",
-               committed_at: datetime | None = None) -> "CubeEntry":
+               committed_at: datetime | None = None,
+               location: str = "", media_type: str = "",
+               detail: dict | None = None) -> "CubeEntry":
         """Mint an entry, computing its identity rather than accepting one."""
         draft = cls("", concept, kind, producer, content_sha256, grid, depth,
-                    tuple(inputs), run_id, committed_at)
+                    tuple(inputs), run_id, committed_at, location, media_type,
+                    dict(detail or {}))
         return dataclasses.replace(draft, entry_id=draft.expected_id())
 
     @property
