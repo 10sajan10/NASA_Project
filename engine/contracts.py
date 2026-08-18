@@ -28,6 +28,10 @@ from enum import Enum
 from typing import Any, Optional
 
 
+import hashlib
+from pathlib import Path
+
+
 class MergePolicy(str, Enum):
     """How concurrent / overlapping writes to a variable combine.
 
@@ -188,6 +192,16 @@ class ProducerV2(ABC):
         for spec in self.produces:
             arr = outputs[spec.name]
             policy = spec.merge_policy
+            # Local import: cube.entries reaches the typed contracts package,
+            # which imports back into engine.runtime, so a module-level import
+            # here would be circular.
+            from cube.entries import DatasetRef
+            if isinstance(arr, DatasetRef):
+                # The producer emitted a file, not an array.  Catalog it where
+                # it already lives, on its own grid, rather than resampling it
+                # onto the cube's.
+                versions[spec.name] = self._catalog_dataset(cube, spec, arr)
+                continue
             if spec.kind == "static":
                 if (policy is not MergePolicy.LAST_WRITER
                         and cube.has(spec.name)):
@@ -216,6 +230,26 @@ class ProducerV2(ABC):
                 raise ValueError(f"unknown var kind {spec.kind!r}")
             versions[spec.name] = self._latest_version(cube, spec.name)
         return versions
+
+    def _catalog_dataset(self, cube, spec, ref) -> int:
+        """Record a produced file in the cube catalog, unconverted."""
+        from cube.entries import CubeEntry
+
+        located = Path(ref.path)
+        digest = hashlib.sha256()
+        with located.open("rb") as stream:
+            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+        detail = dict(ref.detail)
+        detail.setdefault("units", spec.units)
+        detail.setdefault("description", spec.description)
+        entry = CubeEntry.create(
+            concept=spec.name, kind=spec.kind, producer=self.name,
+            content_sha256=digest.hexdigest(), grid=ref.grid,
+            location=str(located.resolve()), media_type=ref.media_type,
+            detail=detail, inputs=tuple(ref.inputs))
+        cube.catalog.register_dataset(entry, located)
+        return 0
 
     @staticmethod
     def _latest_version(cube, variable: str) -> int:

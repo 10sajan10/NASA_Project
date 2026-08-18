@@ -192,6 +192,34 @@ def order_key(policy: ResolutionPolicy):
     }[policy]
 
 
+@dataclass(frozen=True)
+class DatasetRef:
+    """A producer's output that is a *file*, not an array.
+
+    WRF-SFIRE writes netCDF; a driver fetches GRIB. Returning one of these
+    from a producer says "the result is this file, on this grid" instead of
+    "here is an array to write onto the cube's grid". The engine then catalogs
+    it where it already lives -- nothing is copied, reprojected, resampled, or
+    re-encoded.
+    """
+
+    path: str
+    media_type: str
+    grid: GridDescriptor | None = None
+    detail: dict = dataclasses.field(default_factory=dict)
+    inputs: tuple[EntryInput, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.path:
+            raise ValueError("a dataset reference must name a path")
+        if not self.media_type:
+            raise ValueError(
+                "a dataset reference must declare its media type, or a "
+                "consumer cannot know how to read it")
+        if self.grid is not None and not isinstance(self.grid, GridDescriptor):
+            raise TypeError("dataset reference grid must be a GridDescriptor")
+
+
 class ProjectionAuthority:
     """Proof that an artifact was verified against the RuntimeStore.
 
@@ -239,6 +267,7 @@ def _mint_projection_authority(run_id: str, artifact_id: str,
 
 __all__ = [
     "CubeEntry",
+    "DatasetRef",
     "EntryInput",
     "EntryNotFound",
     "ProjectionAuthority",
