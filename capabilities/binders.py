@@ -27,13 +27,13 @@ class BinderRule:
 
 _BINDER_RULES: dict[str, BinderRule] = {
     # Stage 5.  Reads only assets that a manifest already bound: the root and
-    # the asset list are scientific parameters, so a plan that reads different
-    # bytes is a different plan.
+    # post-fetch binding is a scientific parameter, so changed bytes, order,
+    # sizes, receipt, schema, or proven coverage produce a different plan.
     "acquisition.materialize.bind.v1": BinderRule(
         operation_key="acquisition.materialize.v1",
         input_ports=(),
         output_ports=("result",),
-        parameter_names=("asset_ids", "manifest_root"),
+        parameter_names=("content_binding",),
     ),
     # Stage 6.  A lightweight model producer and a four-input reduced
     # consequence model; both are ordinary capabilities with declared evidence,
@@ -108,7 +108,9 @@ _BINDER_RULES: dict[str, BinderRule] = {
         operation_key="transform.reproject_bilinear.v1",
         input_ports=("source",),
         output_ports=("result",),
-        parameter_names=("source_crs", "target_crs", "target_x", "target_y"),
+        parameter_names=("pipeline_projjson", "source_axis_order", "source_crs",
+                         "target_axis_order", "target_crs", "target_x",
+                         "target_y"),
     ),
     "transform.vector_rotate.bind.v1": BinderRule(
         operation_key="transform.vector_rotate.v1",

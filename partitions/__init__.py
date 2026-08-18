@@ -18,12 +18,18 @@ from .execution import (
     execute_packet,
 )
 from .manifest import CollectionManifest, CollectionState, CompletionPolicy
+from .inputs import (
+    PartitionArtifactInput,
+    PartitionInputAssignment,
+    PartitionInputManifest,
+)
 from .packet import (
     MemberOutcome,
     PacketAttempt,
     PacketMember,
     PacketResult,
     WorkPacket,
+    expected_deployment_binding_id,
     fuse_members,
 )
 from .space import AxisKind, PartitionAxis, PartitionKey, PartitionSetSpec
@@ -32,9 +38,12 @@ from .store import (
     RetryDecision,
     CursorConflictError,
     CursorState,
+    PacketAttemptAuthorityError,
+    PacketAttemptConflictError,
+    PacketResultConflictError,
     PartitionStore,
 )
-from .template import PartitionTaskTemplate
+from .template import PartitionRetryPolicy, PartitionTaskTemplate
 
 __all__ = [
     "AdmissionPolicy",
@@ -48,18 +57,26 @@ __all__ = [
     "CursorState",
     "MemberOutcome",
     "PacketAttempt",
+    "PacketAttemptAuthorityError",
+    "PacketAttemptConflictError",
     "PacketResult",
+    "PacketResultConflictError",
     "PacketMember",
     "PartitionNotExecutable",
     "PartitionAxis",
+    "PartitionArtifactInput",
+    "PartitionInputAssignment",
+    "PartitionInputManifest",
     "PartitionKey",
     "PartitionSetSpec",
     "PartitionStore",
+    "PartitionRetryPolicy",
     "PartitionTaskTemplate",
     "RetryDecision",
     "TopUpResult",
     "WorkPacket",
     "compile_packet",
     "execute_packet",
+    "expected_deployment_binding_id",
     "fuse_members",
 ]

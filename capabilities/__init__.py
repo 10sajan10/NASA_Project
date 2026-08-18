@@ -13,8 +13,15 @@ from .deployment import (
     SiteClassCapability,
     SiteFeasibility,
 )
+from .discovery import (
+    CatalogDiscoveryProvenance,
+    DiscoveryLayerCertificate,
+    DiscoveryLimitActivation,
+    DiscoveryLimitSetting,
+)
 from .implementation import ImplementationRef
 from .model import (
+    AcquisitionAuthority,
     ArtifactLeaf,
     BindingCandidate,
     BindingEnumeration,
@@ -26,12 +33,14 @@ from .model import (
     CapabilitySpec,
     DescriptorTemplate,
     InputPortTemplate,
+    TransformationAuthority,
     artifact_evidence_subject,
     invocation_evidence_subject,
 )
 from .parameters import ParameterField, ParameterKind, ParameterSchema
 
 __all__ = [
+    "AcquisitionAuthority",
     "ArtifactLeaf",
     "BinderRef",
     "BindingCandidate",
@@ -43,10 +52,14 @@ __all__ = [
     "BoundOutputPort",
     "CapabilityCatalog",
     "CapabilitySpec",
+    "CatalogDiscoveryProvenance",
     "DeploymentCapabilitySnapshot",
     "DeploymentFeasibilityProof",
     "DeploymentRejection",
     "DeploymentRejectionCode",
+    "DiscoveryLayerCertificate",
+    "DiscoveryLimitActivation",
+    "DiscoveryLimitSetting",
     "DescriptorTemplate",
     "ExecutionProfile",
     "ImplementationRef",
@@ -58,6 +71,7 @@ __all__ = [
     "ResourceEnvelope",
     "SiteClassCapability",
     "SiteFeasibility",
+    "TransformationAuthority",
     "binder_keys",
     "binder_rule",
     "artifact_evidence_subject",

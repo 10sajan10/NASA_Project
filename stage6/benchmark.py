@@ -53,6 +53,8 @@ from contracts import (
     ValueConstraint,
 )
 from resolution import (
+    DiscoveryCertificate,
+    DiscoveryUniverseContract,
     MilpSolveOptions,
     PlanningBenchmarkProfile,
     ResolutionOutcome,
@@ -199,6 +201,10 @@ def representative_resolver(
     def resolve() -> ResolutionOutcome:
         return WorkflowResolver(
             graph.catalog, graph.deployment_snapshot,
+            discovery_certificate=DiscoveryCertificate.for_base_catalog(
+                graph.catalog),
+            discovery_universe=DiscoveryUniverseContract.declare(
+                graph.catalog.catalog_id),
         ).resolve(graph.root_uses, solve_options=solve_options)
     return resolve
 

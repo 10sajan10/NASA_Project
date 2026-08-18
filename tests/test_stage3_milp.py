@@ -30,6 +30,7 @@ from resolution.milp import (
     MilpSolveOptions,
     MilpStatus,
     ProducerSelectionRef,
+    SatisfactionArcSelectionRef,
     SelectionConstraints,
     solve_milp,
 )
@@ -257,6 +258,80 @@ def test_include_exclude_and_budget_resolve_requested_alternative() -> None:
     assert excluded.plan.selected_invocation_ids == ("alternate",)
     assert over_budget.status is MilpStatus.UNSATISFIABLE
     assert "COST_BUDGET" in {value.code for value in over_budget.blockers}
+
+
+def test_exact_satisfaction_cannot_be_faked_by_producer_used_elsewhere() -> None:
+    """Producer inclusion is not a source-choice constraint.
+
+    ``candidate`` is necessarily selected for ``other``.  Its output is not
+    shareable, so ``alternate`` must satisfy ``contested``.  A producer-level
+    include therefore succeeds while proving nothing about the contested use;
+    forcing the exact candidate->contested arc correctly makes this graph
+    unsatisfiable.
+    """
+    contested = RequirementUseNode("contested", "flow", "flow")
+    other = RequirementUseNode(
+        "other", "other", "other", shareable=False)
+    candidate = _source("candidate", 5)
+    alternate = _source("alternate", 0)
+    candidate_contested = _arc(
+        contested.use_id, candidate.invocation_id)
+    graph = OracleProblem.bind(
+        "exact-contested-satisfaction",
+        uses=(contested, other),
+        root_use_ids=(contested.use_id, other.use_id),
+        invocations=(candidate, alternate),
+        satisfaction_arcs=(
+            candidate_contested,
+            _arc(contested.use_id, alternate.invocation_id),
+            _arc(other.use_id, candidate.invocation_id),
+        ),
+    )
+    producer = ProducerSelectionRef(
+        ProducerKind.INVOCATION, candidate.invocation_id)
+    satisfaction = SatisfactionArcSelectionRef.from_arc(candidate_contested)
+
+    producer_only_constraints = SelectionConstraints.bind(include=(producer,))
+    producer_only = _solve(graph, constraints=producer_only_constraints)
+    exact_constraints = SelectionConstraints.bind(
+        required_satisfactions=(satisfaction,))
+    exact = _solve(graph, constraints=exact_constraints)
+
+    assert producer_only.status is MilpStatus.OPTIMAL
+    assert producer_only.plan is not None
+    assert candidate.invocation_id in producer_only.plan.selected_invocation_ids
+    contested_binding = next(
+        value for value in producer_only.plan.satisfactions
+        if value.use_id == contested.use_id)
+    assert tuple(output.producer_id for output in contested_binding.outputs) == (
+        alternate.invocation_id,)
+    assert exact.status is MilpStatus.UNSATISFIABLE
+
+    # The exact arc survives strict serialization and changes request identity.
+    assert SelectionConstraints.from_dict(exact_constraints.to_dict()) == (
+        exact_constraints)
+    assert MilpSelectionProblem.bind(
+        graph, constraints=producer_only_constraints).selection_problem_id != (
+            MilpSelectionProblem.bind(
+                graph, constraints=exact_constraints).selection_problem_id)
+
+
+def test_required_satisfaction_must_name_an_arc_in_the_frozen_graph() -> None:
+    root = RequirementUseNode("root", "value", "result")
+    source = _source("source", 1)
+    graph = OracleProblem.bind(
+        "unknown-required-arc", uses=(root,), root_use_ids=(root.use_id,),
+        invocations=(source,), satisfaction_arcs=(
+            _arc(root.use_id, source.invocation_id),))
+    forged = SatisfactionArcSelectionRef(
+        root.use_id, ProducerKind.INVOCATION, source.invocation_id,
+        "not-an-output")
+
+    with pytest.raises(ValueError, match="unknown graph arc"):
+        MilpSelectionProblem.bind(
+            graph,
+            constraints=SelectionConstraints.bind(
+                required_satisfactions=(forged,)))
 
 
 def test_cycles_uncommitted_artifacts_and_missing_sites_are_hard_constraints() -> None:

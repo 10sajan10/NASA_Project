@@ -18,9 +18,12 @@ from objectives import (
     ObjectiveStatus,
     SelectionObjective,
     StaleChoiceError,
+    build_choice_report,
     resolve_with_objective,
 )
 from resolution import (
+    DiscoveryCertificate,
+    DiscoveryUniverseContract,
     ResolutionStatus,
     SelectionConstraints,
     WorkflowResolver,
@@ -37,6 +40,10 @@ from stage6.demo import (
 def _resolve(fixture, constraints=None):
     return WorkflowResolver(
         fixture.catalog, fixture.deployment_snapshot,
+        discovery_certificate=DiscoveryCertificate.for_base_catalog(
+            fixture.catalog),
+        discovery_universe=DiscoveryUniverseContract.declare(
+            fixture.catalog.catalog_id),
         evidence_snapshot=fixture.evidence_snapshot,
     ).resolve(fixture.root_uses, constraints=constraints or SelectionConstraints())
 
@@ -64,6 +71,22 @@ def test_direct_and_model_sources_compete_in_one_global_selection():
     assert outcome.selection.objective_cost_units == fx.MINIMUM_COST_TOTAL
     assert "example-flow-model" in _selected(outcome)
     assert "example-flow-direct" not in _selected(outcome)
+
+
+def test_compiled_stage6_fields_use_semantic_v2_validation():
+    demo = build_demo_plan(fx.make_stage6_fixture())
+    graph = demo.compilation.graph
+    assert graph is not None
+    semantic = [
+        output.validation
+        for task in graph.tasks
+        for output in task.outputs
+        if output.validation.get("kind") == "field_json_v2"
+    ]
+    # Coarse flow, terrain, modelled flow, and consequence output are all
+    # load-bearing field artifacts. Scalar fuel/ignition remain finite JSON.
+    assert len(semantic) == 4
+    assert all(tuple(value["grid_shape"]) == (3, 3) for value in semantic)
 
 
 def test_shared_terrain_input_is_counted_once():
@@ -147,6 +170,71 @@ def test_alternatives_carry_real_costs_from_constrained_re_solves():
     assert by_id["example-flow-model"].plan_id != by_id["example-flow-direct"].plan_id
 
 
+def test_alternatives_force_the_exact_contested_satisfaction_arc():
+    fixture = fx.make_stage6_fixture()
+    baseline = _resolve(fixture)
+    calls = []
+
+    def resolve(constraints):
+        outcome = _resolve(fixture, constraints)
+        calls.append((constraints, outcome))
+        return outcome
+
+    report = build_choice_report(
+        baseline, resolve, concept_id=fx.FLOW_CONCEPT,
+        requirement_use=fixture.flow_use,
+        metric_definition_id=fx.METRIC_ID,
+        evidence_snapshot=fixture.evidence_snapshot)
+    contested_use_id = next(
+        node.use_id for node in baseline.hypergraph.use_nodes
+        if node.requirement_id == fixture.flow_use.requirement.requirement_id
+        and node.port_id == fixture.flow_use.port_id)
+
+    assert len(calls) == len(report.alternatives) == 2
+    for alternative, (constraints, outcome) in zip(report.alternatives, calls):
+        assert constraints.include == ()
+        assert constraints.required_satisfactions == (
+            alternative.satisfaction,)
+        assert alternative.satisfaction.use_id == contested_use_id
+        assert outcome.selection.plan is not None
+        binding = next(
+            item for item in outcome.selection.plan.satisfactions
+            if item.use_id == contested_use_id)
+        assert any(
+            output.producer_kind is alternative.satisfaction.producer_kind
+            and output.producer_id == alternative.satisfaction.producer_id
+            and output.output_port_id
+            == alternative.satisfaction.output_port_id
+            for output in binding.outputs)
+
+
+def test_recorded_choice_reuses_the_presented_exact_arc_constraint():
+    fixture = fx.make_stage6_fixture()
+    report = quality_request(fixture).report
+    alternative = next(
+        item for item in report.alternatives
+        if item.capability_id == "example-flow-direct")
+    choice = ChoiceRecord(
+        report.report_id, alternative.producer, "exact-arc-choice-v1",
+        "exercise the exact contested satisfaction")
+    calls = []
+
+    def resolve(constraints):
+        calls.append(constraints)
+        return _resolve(fixture, constraints)
+
+    outcome = resolve_with_objective(
+        resolve,
+        ObjectiveRequest(SelectionObjective.EMPIRICAL_QUALITY, choice=choice),
+        concept_id=fx.FLOW_CONCEPT, requirement_use=fixture.flow_use,
+        metric_definition_id=fx.METRIC_ID,
+        evidence_snapshot=fixture.evidence_snapshot)
+
+    assert outcome.status is ObjectiveStatus.RESOLVED
+    assert calls[-1].include == ()
+    assert calls[-1].required_satisfactions == (alternative.satisfaction,)
+
+
 def test_different_references_make_alternatives_incomparable():
     fixture = fx.make_stage6_fixture(
         model_reference_manifest_id=fx.OTHER_REFERENCE_MANIFEST_ID)
@@ -177,20 +265,28 @@ def test_evidence_comes_from_the_frozen_snapshot_not_the_caller():
         (EvidenceProfile(
             "ExampleEvidence-v1",
             EvidenceSubject("nobody", "0.0", "unrelated", "result"), ()),))
-    report = build_choice_report(
-        baseline, lambda constraints: _resolve(fixture, constraints),
-        concept_id=fx.FLOW_CONCEPT, requirement_use=fixture.flow_use,
-        metric_definition_id=fx.METRIC_ID,
-        evidence_snapshot=unrelated)
+    with pytest.raises(ValueError, match="evidence snapshot differs"):
+        build_choice_report(
+            baseline, lambda constraints: _resolve(fixture, constraints),
+            concept_id=fx.FLOW_CONCEPT, requirement_use=fixture.flow_use,
+            metric_definition_id=fx.METRIC_ID,
+            evidence_snapshot=unrelated)
 
-    assert not report.comparability.comparable
-    assert not report.comparability.separation_established
-    assert all(item.reading is not None and not item.reading.known
-               for item in report.alternatives)
-    # The snapshot is part of report identity, so a choice made against the
-    # real evidence cannot be replayed against this one.
-    assert report.evidence_snapshot_id == unrelated.snapshot_id
-    assert report.report_id != quality_request(fixture).report.report_id
+
+def test_alternatives_cannot_mix_different_frozen_resolution_universes():
+    from objectives import build_choice_report
+
+    fixture = fx.make_stage6_fixture()
+    changed = fx.make_stage6_fixture(direct_interval=("0.10", "0.20"))
+    baseline = _resolve(fixture)
+
+    with pytest.raises(ValueError, match="another frozen planning universe"):
+        build_choice_report(
+            baseline, lambda constraints: _resolve(changed, constraints),
+            concept_id=fx.FLOW_CONCEPT,
+            requirement_use=fixture.flow_use,
+            metric_definition_id=fx.METRIC_ID,
+            evidence_snapshot=fixture.evidence_snapshot)
 
 
 def test_a_recorded_choice_drives_a_constrained_re_solve():
@@ -203,6 +299,38 @@ def test_a_recorded_choice_drives_a_constrained_re_solve():
     assert "example-flow-direct" in _selected(chosen.resolution)
     # The human overrode minimum cost, and the system honoured it.
     assert chosen.resolution.selection.objective_cost_units == fx.DIRECT_PATH_TOTAL
+
+
+def test_final_choice_re_solve_cannot_switch_frozen_resolution_universe():
+    fixture = fx.make_stage6_fixture()
+    changed = fx.make_stage6_fixture(direct_interval=("0.10", "0.20"))
+    report = quality_request(fixture).report
+    alternative = next(
+        item for item in report.alternatives
+        if item.capability_id == "example-flow-direct")
+    choice = ChoiceRecord(
+        report.report_id, alternative.producer, "context-switch-v1",
+        "attempt to change deployment/evidence context after presentation")
+    calls = 0
+
+    def resolve(constraints):
+        nonlocal calls
+        calls += 1
+        # Baseline and alternative enumeration use the presented universe;
+        # only the final choice re-solve is switched.
+        if calls == 4:
+            return _resolve(changed, constraints)
+        return _resolve(fixture, constraints)
+
+    with pytest.raises(ValueError, match="final objective re-solve"):
+        resolve_with_objective(
+            resolve,
+            ObjectiveRequest(
+                SelectionObjective.EMPIRICAL_QUALITY, choice=choice),
+            concept_id=fx.FLOW_CONCEPT,
+            requirement_use=fixture.flow_use,
+            metric_definition_id=fx.METRIC_ID,
+            evidence_snapshot=fixture.evidence_snapshot)
 
 
 def test_a_choice_changes_the_bound_plan_identity():

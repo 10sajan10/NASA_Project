@@ -23,6 +23,7 @@ from contracts.identity import decimal_value
 from engine.runtime.identity import require_object_fields
 
 from .manifest import AssetRef, bbox_union_covers, temporal_union_covers
+from .schema import AssemblyMode
 
 
 class CoverageStatus(str, Enum):
@@ -32,6 +33,8 @@ class CoverageStatus(str, Enum):
     TEMPORAL_GAP = "TEMPORAL_GAP"
     SPATIOTEMPORAL_GAP = "SPATIOTEMPORAL_GAP"
     CRS_MISMATCH = "CRS_MISMATCH"
+    TEMPORAL_CONTRACT_MISMATCH = "TEMPORAL_CONTRACT_MISMATCH"
+    ASSEMBLY_UNSUPPORTED = "ASSEMBLY_UNSUPPORTED"
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,7 @@ def assess_coverage(
     target_spatial: BBoxSupport,
     target_temporal: TemporalSupport,
     halo: str | Decimal = "0",
+    assembly_mode: AssemblyMode | None = None,
 ) -> CoverageAssessment:
     """Choose the assets that cover a request, or explain the gap.
 
@@ -147,6 +151,9 @@ def assess_coverage(
         raise TypeError("target_spatial must be BBoxSupport")
     if not isinstance(target_temporal, TemporalSupport):
         raise TypeError("target_temporal must be TemporalSupport")
+    if assembly_mode is not None and not isinstance(
+            assembly_mode, AssemblyMode):
+        raise TypeError("assembly_mode must be typed when supplied")
     values = tuple(assets)
     if not values:
         return CoverageAssessment(
@@ -191,6 +198,24 @@ def assess_coverage(
             "spatial and temporal projections are individually complete, "
             "but the assets leave a hole in the requested space-time product")
 
+    temporal_failures = tuple(
+        item.asset_id for item in selected
+        if not _temporal_contract_covers(
+            item.extent.temporal, target_temporal))
+    if temporal_failures:
+        return CoverageAssessment(
+            CoverageStatus.TEMPORAL_CONTRACT_MISMATCH, (), (),
+            "selected assets do not establish the requested cadence, "
+            "alignment, maximum-gap, or sample-semantics contract: "
+            + ", ".join(sorted(temporal_failures)))
+
+    if assembly_mode is not None and not _assembly_is_executable(
+            selected, expanded, target_temporal, assembly_mode):
+        return CoverageAssessment(
+            CoverageStatus.ASSEMBLY_UNSUPPORTED, (), (),
+            f"asset layout is covered but cannot be assembled by the closed "
+            f"runtime mode {assembly_mode.value}")
+
     core = tuple(
         item.asset_id for item in selected
         if _intersects(item.extent.spatial, target_spatial))
@@ -200,6 +225,97 @@ def assess_coverage(
     return CoverageAssessment(
         CoverageStatus.COMPLETE, ordered, halo_only,
         "")
+
+
+def _temporal_contract_covers(
+    offered: TemporalSupport,
+    requested: TemporalSupport,
+) -> bool:
+    """Whether one asset can preserve the requested timeline without work.
+
+    Acquisition has no implicit resampler.  A finer cadence may be useful to a
+    later explicit transform, but it cannot be labelled as the requested
+    cadence by materialisation alone, so cadence is exact here.
+    """
+    if (offered.kind is not requested.kind
+            or offered.sample_semantics is not requested.sample_semantics):
+        return False
+    if requested.kind is TemporalKind.TIME_INVARIANT:
+        return True
+
+    from contracts.identity import timestamp_value
+
+    if (timestamp_value(offered.start) > timestamp_value(requested.start)
+            or timestamp_value(offered.end) < timestamp_value(requested.end)):
+        return False
+    if requested.cadence_s is None or offered.cadence_s is None:
+        # A series whose sampling is unspecified cannot establish an exact
+        # executable timeline.
+        return False
+    cadence = decimal_value(requested.cadence_s)
+    if decimal_value(offered.cadence_s) != cadence:
+        return False
+    requested_anchor = requested.anchor or requested.start
+    offered_anchor = offered.anchor or offered.start
+    delta = Decimal(str((timestamp_value(requested_anchor)
+                         - timestamp_value(offered_anchor)).total_seconds()))
+    if delta % cadence != 0:
+        return False
+    if requested.max_gap_s is not None:
+        if (offered.max_gap_s is None
+                or decimal_value(offered.max_gap_s)
+                > decimal_value(requested.max_gap_s)):
+            return False
+    elif offered.max_gap_s is not None and decimal_value(offered.max_gap_s) > 0:
+        # The derived descriptor would otherwise omit a known gap bound.
+        return False
+    if (requested.reference_time is not None
+            and offered.reference_time != requested.reference_time):
+        return False
+    return True
+
+
+def _assembly_is_executable(
+    assets: Sequence[AssetRef],
+    spatial: BBoxSupport,
+    temporal: TemporalSupport,
+    mode: AssemblyMode,
+) -> bool:
+    """Mirror the layouts implemented by the local materialiser.
+
+    This is intentionally stricter than geometric coverage.  In particular,
+    temporal mosaics are refused: the current runtime concatenates JSON field
+    tiles only along x and requires identical y/time axes.
+    """
+    if mode is AssemblyMode.SINGLE_ASSET:
+        return len(assets) == 1 and bbox_union_covers(assets, spatial) \
+            and _temporal_contract_covers(
+                assets[0].extent.temporal, temporal)
+
+    if mode is not AssemblyMode.FIELD_JSON_X_TILES_V1:
+        return False
+    if not assets:
+        return False
+    reference_time = assets[0].extent.temporal
+    if any(item.extent.temporal != reference_time for item in assets):
+        return False
+    bounds = [tuple(decimal_value(value)
+                    for value in item.extent.spatial.bounds)
+              for item in assets]
+    # Runtime concatenation assumes identical y coordinates and strictly
+    # increasing, non-overlapping x coordinates.
+    if any((item[1], item[3]) != (bounds[0][1], bounds[0][3])
+           for item in bounds):
+        return False
+    ordered = sorted(bounds, key=lambda item: (item[0], item[2]))
+    if any(left[2] != right[0]
+           for left, right in zip(ordered, ordered[1:])):
+        return False
+    target = tuple(decimal_value(value) for value in spatial.bounds)
+    return (ordered[0][0] <= target[0]
+            and ordered[-1][2] >= target[2]
+            and bounds[0][1] <= target[1]
+            and bounds[0][3] >= target[3])
 
 
 def _space_time_product_covers(

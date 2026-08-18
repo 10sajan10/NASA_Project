@@ -145,11 +145,14 @@ def make_vector_decomposition_spec() -> TransformationSpec:
     representation-changing transformation whose outputs carry different units
     and distinct concepts.
     """
-    source = _descriptor(VECTOR_CONCEPT, "m.s-1")
+    source = _descriptor(
+        VECTOR_CONCEPT, "m.s-1", component_names=("u", "v"))
     speed = _descriptor(
-        SPEED_CONCEPT, "m.s-1", origin=OriginClass.DERIVED)
+        SPEED_CONCEPT, "m.s-1", origin=OriginClass.DERIVED,
+        component_names=("speed",))
     direction = _descriptor(
-        DIRECTION_CONCEPT, "degree", origin=OriginClass.DERIVED)
+        DIRECTION_CONCEPT, "degree", origin=OriginClass.DERIVED,
+        component_names=("direction",))
     return TransformationSpec.bind(
         transformation_id="example-flow-uv-to-speed-direction",
         transformation_version="1.0.0",
@@ -198,6 +201,7 @@ def _descriptor(
     units: str,
     *,
     origin: OriginClass = OriginClass.SYNTHETIC,
+    component_names: tuple[str, ...] = (),
 ) -> ArtifactDescriptor:
     return ArtifactDescriptor(
         concept_id=concept_id,
@@ -212,6 +216,7 @@ def _descriptor(
         native_resolution=None,
         origin=origin,
         missingness=Missingness(MissingnessStatus.COMPLETE),
+        component_names=component_names,
     )
 
 

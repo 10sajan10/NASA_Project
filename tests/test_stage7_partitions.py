@@ -21,6 +21,7 @@ from partitions import (
     PartitionAxis,
     PartitionKey,
     PartitionSetSpec,
+    PartitionRetryPolicy,
     PartitionTaskTemplate,
     WorkPacket,
     fuse_members,
@@ -44,6 +45,8 @@ def _invocation(index: int = 0):
 
 def _template(index: int = 0, **overrides) -> PartitionTaskTemplate:
     base = dict(estimated_cost_units=1, retry_safe=True)
+    if "retry_policy" in overrides:
+        base.pop("retry_safe")
     base.update(overrides)
     return PartitionTaskTemplate.bind(_invocation(index), **base)
 
@@ -154,7 +157,40 @@ def test_template_round_trips():
     assert PartitionTaskTemplate.from_dict(template.to_dict()) == template
 
 
+def test_retry_policy_is_typed_and_part_of_collection_identity():
+    spec = _spec()
+    three = _template(
+        retry_policy=PartitionRetryPolicy(True, 3))
+    five = _template(
+        retry_policy=PartitionRetryPolicy(True, 5))
+
+    assert three.retry_policy == PartitionRetryPolicy(True, 3)
+    assert three.template_id != five.template_id
+    first = CollectionManifest.bind(
+        set_id=spec.set_id, template_id=three.template_id,
+        expected=spec.total, policy=CompletionPolicy.ALL)
+    second = CollectionManifest.bind(
+        set_id=spec.set_id, template_id=five.template_id,
+        expected=spec.total, policy=CompletionPolicy.ALL)
+    assert first.collection_id != second.collection_id
+
+
+def test_retry_policy_roundtrip_is_strict_and_tamper_evident():
+    policy = PartitionRetryPolicy(True, 4)
+    assert PartitionRetryPolicy.from_dict(policy.to_dict()) == policy
+    template = _template(retry_policy=policy)
+    forged = template.to_dict()
+    forged["retry_policy"]["max_attempts"] = 40
+
+    with pytest.raises(ValueError, match="identity does not verify"):
+        PartitionTaskTemplate.from_dict(forged)
+    with pytest.raises(ValueError, match="max_attempts=1"):
+        PartitionRetryPolicy(False, 2)
+
+
 # -- packets and fusion ---------------------------------------------------
+
+_COLLECTION_ID = "c" * 64
 
 
 def _members(count: int, template: PartitionTaskTemplate,
@@ -168,7 +204,8 @@ def _members(count: int, template: PartitionTaskTemplate,
 def test_fusion_bundles_neighbours_without_merging_identity():
     spec = _spec(10, 10)
     template = _template()
-    packets = fuse_members(_members(64, template, spec), template.template_id,
+    packets = fuse_members(_members(64, template, spec), _COLLECTION_ID,
+                           template.template_id,
                            max_members=8, cost_per_member=1,
                            target_packet_cost=8)
     assert len(packets) == 8
@@ -185,7 +222,8 @@ def test_fusion_bundles_neighbours_without_merging_identity():
 def test_work_already_large_enough_is_not_bundled():
     spec = _spec(10, 10)
     template = _template(estimated_cost_units=32)
-    packets = fuse_members(_members(4, template, spec), template.template_id,
+    packets = fuse_members(_members(4, template, spec), _COLLECTION_ID,
+                           template.template_id,
                            max_members=8, cost_per_member=32,
                            target_packet_cost=8)
     assert len(packets) == 4
@@ -197,16 +235,17 @@ def test_a_packet_refuses_duplicate_or_unordered_members():
     template = _template()
     member = PacketMember(template.logical_task_key(spec.key_at(0)), 0, "b")
     with pytest.raises(ValueError, match="cannot repeat a logical task"):
-        WorkPacket.bind(template.template_id, (member, member))
+        WorkPacket.bind(_COLLECTION_ID, template.template_id, (member, member))
     later = PacketMember(template.logical_task_key(spec.key_at(1)), 1, "b")
     with pytest.raises(ValueError, match="partition order"):
-        WorkPacket.bind(template.template_id, (later, member))
+        WorkPacket.bind(_COLLECTION_ID, template.template_id, (later, member))
 
 
 def test_a_partial_packet_keeps_committed_members_and_retries_the_rest():
     spec = _spec(10, 10)
     template = _template()
-    packet = WorkPacket.bind(template.template_id, _members(4, template, spec))
+    packet = WorkPacket.bind(
+        _COLLECTION_ID, template.template_id, _members(4, template, spec))
     keys = packet.logical_task_keys
     attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
     result = PacketResult.bind(attempt, packet, (
@@ -227,7 +266,8 @@ def test_a_partial_packet_keeps_committed_members_and_retries_the_rest():
 def test_a_non_retry_safe_template_retries_nothing_automatically():
     spec = _spec(10, 10)
     template = _template(retry_safe=False)
-    packet = WorkPacket.bind(template.template_id, _members(2, template, spec))
+    packet = WorkPacket.bind(
+        _COLLECTION_ID, template.template_id, _members(2, template, spec))
     attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
     result = PacketResult.bind(attempt, packet, tuple(
         (key, MemberOutcome.FAILED) for key in packet.logical_task_keys))
@@ -237,7 +277,8 @@ def test_a_non_retry_safe_template_retries_nothing_automatically():
 def test_an_attempt_must_report_exactly_its_packet():
     spec = _spec(10, 10)
     template = _template()
-    packet = WorkPacket.bind(template.template_id, _members(2, template, spec))
+    packet = WorkPacket.bind(
+        _COLLECTION_ID, template.template_id, _members(2, template, spec))
     attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
     with pytest.raises(ValueError, match="exactly its packet's members"):
         PacketResult.bind(attempt, packet, (
@@ -247,7 +288,8 @@ def test_an_attempt_must_report_exactly_its_packet():
 def test_packet_records_round_trip():
     spec = _spec(10, 10)
     template = _template()
-    packet = WorkPacket.bind(template.template_id, _members(3, template, spec))
+    packet = WorkPacket.bind(
+        _COLLECTION_ID, template.template_id, _members(3, template, spec))
     assert WorkPacket.from_dict(packet.to_dict()) == packet
     attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
     assert PacketAttempt.from_dict(attempt.to_dict()) == attempt
@@ -263,6 +305,20 @@ def test_packet_records_round_trip():
                               for key, outcome in result.outcomes]:
         with pytest.raises(ValueError, match="identity does not verify"):
             PacketResult.from_dict(forged)
+
+
+def test_packet_result_identity_is_independent_of_mapping_iteration_order():
+    spec = _spec(10, 10)
+    template = _template()
+    packet = WorkPacket.bind(
+        _COLLECTION_ID, template.template_id, _members(3, template, spec))
+    attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
+    forward = tuple(
+        (key, MemberOutcome.FAILED) for key in packet.logical_task_keys)
+    reverse = tuple(reversed(forward))
+
+    assert PacketResult.bind(attempt, packet, forward) == PacketResult.bind(
+        attempt, packet, reverse)
 
 
 # -- collection completeness ----------------------------------------------

@@ -7,6 +7,7 @@ quietly replaced.
 """
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ import pytest
 from acquisition import (
     AssetCandidate,
     AssetExtent,
+    FrozenSessionError,
     PlanningSessionStore,
     ProviderQuota,
     QuotaExceededError,
@@ -74,6 +76,23 @@ def test_resuming_appends_in_discovery_order_without_duplicates(db_path):
         == ["a", "b"]
     assert store.cursor_for("s1", "q1").pages_read == 2
     assert store.cursor_for("s1", "q1").exhausted is True
+
+
+def test_repeated_asset_id_cannot_change_metadata_across_pages(db_path):
+    store = PlanningSessionStore(db_path)
+    store.open_session("s1")
+    candidate = _candidate("a")
+    store.record_page("s1", "q1", {"q": 1}, cursor="1", exhausted=False,
+                      candidates=(candidate,))
+    with pytest.raises(ValueError, match="conflicting metadata"):
+        store.record_page(
+            "s1", "q1", {"q": 1}, cursor=None, exhausted=True,
+            candidates=(dataclasses.replace(
+                candidate, locator="https://example.invalid/relabelled"),))
+    # The page and cursor advance share a transaction, so the refusal leaves
+    # the original durable state intact.
+    assert store.cursor_for("s1", "q1").cursor == "1"
+    assert store.cursor_for("s1", "q1").pages_read == 1
 
 
 def test_quota_is_shared_between_planning_and_transfer(db_path):
@@ -148,6 +167,31 @@ def test_freezing_is_idempotent_but_refuses_a_different_snapshot(db_path):
         store.freeze_session("s1", "b" * 64)
     with pytest.raises(KeyError):
         store.freeze_session("unknown", "a" * 64)
+
+
+def test_frozen_session_is_structurally_read_only(db_path):
+    store = PlanningSessionStore(db_path)
+    store.open_session("s1")
+    store.freeze_session("s1", "a" * 64)
+    with pytest.raises(FrozenSessionError, match="frozen and read-only"):
+        store.record_page(
+            "s1", "q1", {"q": 1}, cursor=None, exhausted=True,
+            candidates=(_candidate("a"),))
+    with pytest.raises(FrozenSessionError, match="frozen and read-only"):
+        store.record_limit("s1", "MAX_PAGES_PER_QUERY", "q1")
+    assert store.known_query_ids("s1") == ()
+    assert store.limits_for("s1") == ()
+
+
+def test_a_persisted_query_cannot_be_relabelled_on_resume(db_path):
+    store = PlanningSessionStore(db_path)
+    store.open_session("s1")
+    store.record_page("s1", "q1", {"q": 1}, cursor="1", exhausted=False,
+                      candidates=(_candidate("a"),))
+    with pytest.raises(ValueError, match="cannot be relabelled"):
+        store.record_page(
+            "s1", "q1", {"q": 2}, cursor=None, exhausted=True,
+            candidates=(_candidate("b"),))
 
 
 def test_open_session_does_not_reset_existing_durable_state(db_path):

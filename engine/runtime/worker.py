@@ -25,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--stage-dir", type=Path, required=True)
     parser.add_argument("--attempt-token", required=True)
+    parser.add_argument("--provider-name", required=True)
     args = parser.parse_args(argv)
 
     runtime_root = args.runtime_root.resolve()
@@ -35,7 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         raw = _read_strict_json(supervisor / "attempt.json")
         spec = AttemptSpec.from_dict(raw)
-        _verify_invocation(spec, args.attempt_token, stage)
+        _verify_invocation(
+            spec, args.attempt_token, stage, args.provider_name)
         _claim_worker(supervisor, spec)
 
         inputs = _load_inputs(spec, runtime_root)
@@ -86,16 +88,24 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def _verify_invocation(spec: AttemptSpec, token: str, stage: Path) -> None:
+def _verify_invocation(spec: AttemptSpec, token: str, stage: Path,
+                       provider_name: str) -> None:
     if spec.attempt_token != token:
         raise RuntimeError("worker argv token does not match immutable attempt spec")
     if Path(spec.stage_dir).resolve() != stage:
         raise RuntimeError("worker stage directory does not match attempt spec")
-    if spec.provider != "stage1-local-subprocess":
-        raise RuntimeError("worker refuses an attempt for another provider")
+    if provider_name not in {
+            "stage1-local-subprocess", "stage9a-slurm"}:
+        raise RuntimeError("worker refuses an unknown execution provider")
+    if spec.provider != provider_name:
+        raise RuntimeError("worker provider does not match immutable attempt spec")
     if operation_component(spec.task.component.operation_key) != spec.task.component:
         raise RuntimeError("worker component binding is not in the closed registry")
-    input_names = {binding.input_name for binding in spec.task.inputs}
+    input_names = {
+        binding.input_name for binding in spec.task.inputs
+    } | {
+        binding.input_name for binding in spec.task.external_inputs
+    }
     if set(spec.input_artifacts) != input_names:
         raise RuntimeError("attempt input artifact bindings do not match task ports")
     for recipe in spec.task.outputs:
@@ -136,10 +146,10 @@ def _claim_worker(supervisor: Path, spec: AttemptSpec) -> None:
 
 def _load_inputs(spec: AttemptSpec, runtime_root: Path) -> dict[str, Any]:
     values: dict[str, Any] = {}
-    for name, manifest_raw in sorted(spec.input_artifacts.items()):
-        manifest_path = Path(manifest_raw)
-        if not manifest_path.is_absolute():
-            raise ValueError(f"input manifest for {name!r} must be absolute")
+    for name, receipt in sorted(spec.input_artifacts.items()):
+        manifest_path = Path(receipt.manifest_path)
+        if manifest_path.is_symlink():
+            raise ValueError(f"input manifest for {name!r} cannot be a symlink")
         manifest_path = manifest_path.resolve()
         _require_within(manifest_path, runtime_root, "input manifest")
         manifest = _read_strict_json(manifest_path)
@@ -152,10 +162,21 @@ def _load_inputs(spec: AttemptSpec, runtime_root: Path) -> dict[str, Any]:
         if (manifest["schema"] != "stage1-artifact-manifest-v1"
                 or manifest["media_type"] != "application/json"):
             raise ValueError(f"input manifest for {name!r} has unsupported schema/media type")
+        if (manifest["artifact_id"] != receipt.artifact_id
+                or manifest["recipe_id"] != receipt.recipe_id
+                or manifest["content_sha256"] != receipt.content_sha256
+                or type(manifest["size_bytes"]) is not int
+                or manifest["size_bytes"] != receipt.size_bytes):
+            raise ValueError(
+                f"input manifest for {name!r} does not match its exact "
+                "attempt receipt")
 
         object_raw = Path(manifest["object_path"])
-        object_path = (object_raw if object_raw.is_absolute()
-                       else runtime_root / object_raw).resolve()
+        object_candidate = (object_raw if object_raw.is_absolute()
+                            else runtime_root / object_raw)
+        if object_candidate.is_symlink():
+            raise ValueError(f"input object for {name!r} cannot be a symlink")
+        object_path = object_candidate.resolve()
         _require_within(object_path, runtime_root, "input object")
         payload = object_path.read_bytes()
         if len(payload) != int(manifest["size_bytes"]):

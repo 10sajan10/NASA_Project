@@ -9,19 +9,28 @@ import dataclasses
 
 import pytest
 
-from capabilities import CapabilityCatalog
-from contracts import OriginClass
+from capabilities import (
+    BindingParameterization,
+    BoundInvocation,
+    CapabilityCatalog,
+    CapabilitySpec,
+    TransformationAuthority,
+)
+from contracts import IntrinsicUncertainty, OriginClass
 from stage4.fixtures import (
     CONCEPT,
     make_unit_bridge_fixture,
     make_vector_decomposition_spec,
 )
+from engine.runtime.identity import strict_copy
 from transformations import (
     TransformationKind,
     TransformationLimitCode,
+    TransformationLossPolicy,
     TransformationPort,
     TransformationSearchLimits,
     TransformationSpec,
+    UncertaintyPropagationPolicy,
     ValueSemantics,
     expand_transform_catalog,
     unit_affine_rule,
@@ -150,8 +159,63 @@ def test_transformation_identity_is_content_addressed_and_deterministic():
     second = make_vector_decomposition_spec()
 
     assert first.spec_id == second.spec_id == first.expected_id()
+    assert TransformationSpec.from_dict(first.to_dict()) == first
     assert first.to_capability_spec().spec_id \
         == second.to_capability_spec().spec_id
+
+
+def test_unit_mapping_requires_known_uncertainty_to_be_rebound_or_unknown():
+    bridge = make_unit_bridge_fixture().transformations[0]
+    manufactured = dataclasses.replace(
+        bridge.output_ports[0].descriptor,
+        intrinsic_uncertainty=IntrinsicUncertainty.known(
+            "uncertainty:invented-kilometres-v1", "c" * 64))
+    with pytest.raises(ValueError, match="UNKNOWN source uncertainty"):
+        TransformationSpec.bind_unit_affine(
+            transformation_id="manufactured-known-uncertainty",
+            transformation_version="1.0.0",
+            execution_profile=bridge.execution_profile,
+            source=bridge.input_ports[0].descriptor,
+            result=manufactured,
+            cost_units=1,
+        )
+
+    source_uncertainty = IntrinsicUncertainty.known(
+        "uncertainty:absolute-metres-v1", "a" * 64)
+    source = dataclasses.replace(
+        bridge.input_ports[0].descriptor,
+        intrinsic_uncertainty=source_uncertainty)
+
+    unchanged = dataclasses.replace(
+        bridge.output_ports[0].descriptor,
+        intrinsic_uncertainty=source_uncertainty)
+    with pytest.raises(ValueError, match="cannot preserve a KNOWN"):
+        TransformationSpec.bind_unit_affine(
+            transformation_id="unchanged-known-uncertainty",
+            transformation_version="1.0.0",
+            execution_profile=bridge.execution_profile,
+            source=source,
+            result=unchanged,
+            cost_units=1,
+        )
+
+    propagated = dataclasses.replace(
+        bridge.output_ports[0].descriptor,
+        intrinsic_uncertainty=IntrinsicUncertainty.known(
+            "uncertainty:absolute-kilometres-v1", "b" * 64))
+    rebound = TransformationSpec.bind_unit_affine(
+        transformation_id="rebound-known-uncertainty",
+        transformation_version="1.0.0",
+        execution_profile=bridge.execution_profile,
+        source=source,
+        result=propagated,
+        cost_units=1,
+    )
+    assert rebound.loss_policy \
+        is TransformationLossPolicy.NUMERIC_AFFINE_MAPPING
+    assert rebound.uncertainty_propagation_policy \
+        is UncertaintyPropagationPolicy.REBIND_OR_MARK_UNKNOWN
+    assert TransformationSpec.from_dict(rebound.to_dict()) == rebound
 
 
 def test_transformation_lowers_to_an_ordinary_capability():
@@ -164,6 +228,143 @@ def test_transformation_lowers_to_an_ordinary_capability():
     assert len(capability.input_ports) == 1
     assert len(capability.output_ports) == 1
     assert capability.parameterizations[0].metric_estimates["cost_units"] == 1
+
+
+def test_lowering_retains_content_addressed_semantic_authority_roundtrip():
+    bridge = make_unit_bridge_fixture().transformations[0]
+    capability = bridge.to_capability_spec()
+    authority = capability.transformation_authority
+
+    assert authority is not None
+    assert authority.transformation_spec_id == bridge.spec_id
+    assert authority.kind == TransformationKind.UNIT_AFFINE.value
+    assert authority.semantic_rule_id == bridge.semantic_rule_id
+    assert authority.loss_policy == bridge.loss_policy.value
+    assert authority.uncertainty_propagation_policy \
+        == bridge.uncertainty_propagation_policy.value
+    assert authority.transformation_spec["input_ports"][0][
+        "value_semantics"] == ValueSemantics.SCALAR_CONTINUOUS_INTENSIVE.value
+    assert strict_copy(
+        authority.transformation_spec["input_ports"][0]["descriptor"]) \
+        == bridge.input_ports[0].descriptor.to_dict()
+    with pytest.raises(TypeError, match="immutable"):
+        authority.transformation_spec["parameters"]["factor"] = 666
+    assert CapabilitySpec.from_dict(capability.to_dict()) == capability
+
+    invocation = BoundInvocation.bind(
+        capability, capability.parameterizations[0])
+    assert invocation.transformation_authority == authority
+    assert BoundInvocation.from_dict(invocation.to_dict()) == invocation
+
+
+def _rebind_transform_capability(
+        capability, *, parameters, authority):
+    return CapabilitySpec.bind(
+        capability_id=capability.capability_id,
+        capability_version=capability.capability_version,
+        implementation=capability.implementation,
+        binder=capability.binder,
+        input_ports=capability.input_ports,
+        output_ports=capability.output_ports,
+        parameter_schema=capability.parameter_schema,
+        parameterizations=(BindingParameterization(
+            parameters, {"cost_units": 0}),),
+        execution_profile_id=capability.execution_profile_id,
+        transformation_authority=authority,
+    )
+
+
+def test_raw_reserved_transform_capability_cannot_forge_factor_666():
+    capability = make_unit_bridge_fixture().transformations[0].to_capability_spec()
+
+    with pytest.raises(ValueError, match="require authenticated"):
+        _rebind_transform_capability(
+            capability,
+            parameters={"factor": 666, "offset": 0},
+            authority=None,
+        )
+
+    # Stealing a genuine certificate is also insufficient: the exact closed
+    # parameters and cost are part of the authority replay.
+    with pytest.raises(ValueError, match="capability lowering"):
+        _rebind_transform_capability(
+            capability,
+            parameters={"factor": 666, "offset": 0},
+            authority=capability.transformation_authority,
+        )
+
+
+def test_readdressed_certificate_tampering_still_fails_semantic_replay():
+    bridge = make_unit_bridge_fixture().transformations[0]
+    capability = bridge.to_capability_spec()
+    authority = capability.transformation_authority
+    assert authority is not None
+
+    forged_rule = TransformationAuthority.bind(
+        transformation_spec=bridge.to_dict(),
+        semantic_rule_implementation_sha256="0" * 64,
+        parameter_rule_sha256=authority.parameter_rule_sha256,
+    )
+    # The outer certificate has a correct content hash.  It still cannot
+    # substitute a caller-chosen semantic implementation digest.
+    assert forged_rule.authority_id == forged_rule.expected_id()
+    with pytest.raises(ValueError, match="semantic-rule implementation"):
+        _rebind_transform_capability(
+            capability,
+            parameters=dict(bridge.parameters),
+            authority=forged_rule,
+        )
+
+    changed_spec = bridge.to_dict()
+    changed_spec["parameters"]["factor"] = 666
+    readdressed = TransformationAuthority.bind(
+        transformation_spec=changed_spec,
+        semantic_rule_implementation_sha256=
+            authority.semantic_rule_implementation_sha256,
+        parameter_rule_sha256=authority.parameter_rule_sha256,
+    )
+    assert readdressed.authority_id == readdressed.expected_id()
+    with pytest.raises(ValueError, match="unit coefficients|specification identity"):
+        _rebind_transform_capability(
+            capability,
+            parameters={"factor": 666, "offset": 0},
+            authority=readdressed,
+        )
+
+    changed_policy = bridge.to_dict()
+    changed_policy["loss_policy"] = \
+        TransformationLossPolicy.EXACT_SELECTION.value
+    readdressed_policy = TransformationAuthority.bind(
+        transformation_spec=changed_policy,
+        semantic_rule_implementation_sha256=
+            authority.semantic_rule_implementation_sha256,
+        parameter_rule_sha256=authority.parameter_rule_sha256,
+    )
+    assert readdressed_policy.authority_id != authority.authority_id
+    with pytest.raises(ValueError, match="loss policy"):
+        _rebind_transform_capability(
+            capability,
+            parameters=dict(bridge.parameters),
+            authority=readdressed_policy,
+        )
+
+    changed_uncertainty_policy = bridge.to_dict()
+    changed_uncertainty_policy["uncertainty_propagation_policy"] = \
+        UncertaintyPropagationPolicy.PRESERVE.value
+    readdressed_uncertainty_policy = TransformationAuthority.bind(
+        transformation_spec=changed_uncertainty_policy,
+        semantic_rule_implementation_sha256=
+            authority.semantic_rule_implementation_sha256,
+        parameter_rule_sha256=authority.parameter_rule_sha256,
+    )
+    assert readdressed_uncertainty_policy.authority_id \
+        != authority.authority_id
+    with pytest.raises(ValueError, match="uncertainty policy"):
+        _rebind_transform_capability(
+            capability,
+            parameters=dict(bridge.parameters),
+            authority=readdressed_uncertainty_policy,
+        )
 
 
 # --------------------------------------------------------------------------

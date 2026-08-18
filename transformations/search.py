@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable
 
-from capabilities import ArtifactLeaf, CapabilityCatalog
+from capabilities import (
+    ArtifactLeaf,
+    CapabilityCatalog,
+    DiscoveryLayerCertificate,
+)
 from capabilities.implementation import _digest
 from contracts import ArtifactDescriptor
 from engine.runtime.identity import require_object_fields, strict_hash
@@ -294,6 +298,13 @@ class TransformationExpansion:
             raise TypeError("augmented catalog is invalid")
         if self.expansion_id != self.expected_id():
             raise ValueError("transformation expansion identity does not verify")
+        provenance = self.augmented_catalog.discovery_provenance
+        if provenance.base_catalog_id != self.base_catalog_id:
+            raise ValueError(
+                "augmented catalog provenance names another base catalog")
+        if self.discovery_layer() not in provenance.layers:
+            raise ValueError(
+                "augmented catalog omits its transformation discovery layer")
 
     @property
     def complete(self) -> bool:
@@ -307,11 +318,34 @@ class TransformationExpansion:
     def reachable_transformation_spec_ids(self) -> tuple[str, ...]:
         return tuple(item.transformation_spec_id for item in self.transitions)
 
+    def discovery_layer(self):
+        """Return the exact certificate layer for this finite closure.
+
+        The import is local to keep the transformation model independent of
+        the resolution package while still making the safe hand-off the
+        obvious API at their boundary.
+        """
+        return DiscoveryLayerCertificate.bind(
+            "TRANSFORMATION_EXPANSION",
+            self.expansion_id,
+            source_ids=(self.transformation_catalog_id,),
+            limits=self.limits.to_dict(),
+            limit_reasons=self.limit_reasons,
+            complete=self.discovery_complete,
+        )
+
+    def discovery_certificate(self):
+        """Project the provenance already authenticated by catalog identity."""
+        from resolution.upstream import DiscoveryCertificate
+
+        return DiscoveryCertificate.for_catalog(self.augmented_catalog)
+
     def expected_id(self) -> str:
         return strict_hash(_expansion_payload(
             self.base_catalog_id, self.transformation_catalog_id, self.limits,
             self.states, self.transitions, self.frontier,
-            self.discovery_complete, self.limit_reasons, self.augmented_catalog))
+            self.discovery_complete, self.limit_reasons,
+            self.augmented_catalog.content_id))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -346,6 +380,100 @@ class TransformationExpansion:
         return cls(**raw)
 
 
+@dataclass(frozen=True)
+class TransformationDiscoveryReplay:
+    """Independent deterministic replay inputs for one closure certificate.
+
+    A catalog layer and its hashes can prove only internal integrity.  They do
+    not prove that the closure algorithm actually explored the declared
+    transformation catalog.  Resolution therefore receives these frozen
+    inputs separately and reruns the finite closure before trusting a layer's
+    completeness verdict.
+    """
+
+    replay_id: str
+    base_catalog: CapabilityCatalog
+    transformation_catalog: TransformationCatalog
+    limits: TransformationSearchLimits
+    seed_descriptors: tuple[ArtifactDescriptor, ...] = ()
+    artifact_leaves: tuple[ArtifactLeaf, ...] = ()
+
+    def __post_init__(self) -> None:
+        _digest(self.replay_id, "transformation replay_id")
+        if not isinstance(self.base_catalog, CapabilityCatalog):
+            raise TypeError("transformation replay base catalog is invalid")
+        if not isinstance(self.transformation_catalog, TransformationCatalog):
+            raise TypeError("transformation replay catalog is invalid")
+        if not isinstance(self.limits, TransformationSearchLimits):
+            raise TypeError("transformation replay limits are invalid")
+        if (not isinstance(self.seed_descriptors, tuple)
+                or not all(isinstance(item, ArtifactDescriptor)
+                           for item in self.seed_descriptors)):
+            raise TypeError("transformation replay seeds must be descriptors")
+        if (not isinstance(self.artifact_leaves, tuple)
+                or not all(isinstance(item, ArtifactLeaf)
+                           for item in self.artifact_leaves)):
+            raise TypeError("transformation replay leaves are invalid")
+        if self.replay_id != self.expected_id():
+            raise ValueError("transformation replay identity does not verify")
+
+    @classmethod
+    def bind(
+        cls,
+        base_catalog: CapabilityCatalog,
+        transformation_catalog: TransformationCatalog,
+        *,
+        limits: TransformationSearchLimits = TransformationSearchLimits(),
+        seed_descriptors: Iterable[ArtifactDescriptor] = (),
+        artifact_leaves: Iterable[ArtifactLeaf] = (),
+    ) -> "TransformationDiscoveryReplay":
+        seeds = tuple(sorted(
+            seed_descriptors, key=lambda item: item.descriptor_id))
+        leaves = tuple(sorted(
+            artifact_leaves, key=lambda item: item.leaf_id))
+        payload = {
+            "schema": "stage8r-transformation-discovery-replay-v1",
+            "base_catalog_id": base_catalog.catalog_id,
+            "transformation_catalog_id": transformation_catalog.catalog_id,
+            "limits": limits.to_dict(),
+            "seed_descriptor_ids": [item.descriptor_id for item in seeds],
+            "artifact_leaf_ids": [item.leaf_id for item in leaves],
+        }
+        return cls(
+            strict_hash(payload), base_catalog, transformation_catalog,
+            limits, seeds, leaves)
+
+    def expected_id(self) -> str:
+        return strict_hash({
+            "schema": "stage8r-transformation-discovery-replay-v1",
+            "base_catalog_id": self.base_catalog.catalog_id,
+            "transformation_catalog_id": self.transformation_catalog.catalog_id,
+            "limits": self.limits.to_dict(),
+            "seed_descriptor_ids": [
+                item.descriptor_id for item in self.seed_descriptors],
+            "artifact_leaf_ids": [item.leaf_id for item in self.artifact_leaves],
+        })
+
+    def verify(
+        self,
+        catalog: CapabilityCatalog,
+        layer: DiscoveryLayerCertificate,
+    ) -> None:
+        replayed = expand_transform_catalog(
+            self.base_catalog,
+            self.transformation_catalog,
+            seed_descriptors=self.seed_descriptors,
+            artifact_leaves=self.artifact_leaves,
+            limits=self.limits,
+        )
+        if replayed.discovery_layer() != layer:
+            raise ValueError(
+                "transformation discovery layer disagrees with independent replay")
+        if replayed.augmented_catalog != catalog:
+            raise ValueError(
+                "transformation discovery catalog disagrees with independent replay")
+
+
 def _expansion_payload(
         base_catalog_id: str, transformation_catalog_id: str,
         limits: TransformationSearchLimits,
@@ -354,10 +482,10 @@ def _expansion_payload(
         frontier: tuple[TransformationFrontierItem, ...],
         discovery_complete: bool,
         limit_reasons: tuple[TransformationLimitReason, ...],
-        augmented_catalog: CapabilityCatalog,
+        augmented_catalog_content_id: str,
 ) -> dict[str, Any]:
     return {
-        "schema": "stage4-transformation-expansion-v1",
+        "schema": "stage8r-transformation-expansion-v2",
         "base_catalog_id": base_catalog_id,
         "transformation_catalog_id": transformation_catalog_id,
         "limits": limits.to_dict(),
@@ -366,7 +494,7 @@ def _expansion_payload(
         "frontier": [item.to_dict() for item in frontier],
         "discovery_complete": discovery_complete,
         "limit_reasons": [item.to_dict() for item in limit_reasons],
-        "augmented_catalog": augmented_catalog.to_dict(),
+        "augmented_catalog_content_id": augmented_catalog_content_id,
     }
 
 
@@ -532,16 +660,36 @@ def expand_transform_catalog(
         previous_profile = profile_by_id.setdefault(profile.profile_id, profile)
         if previous_profile != profile:
             raise ValueError("profile identity collision during transformation expansion")
-    augmented = CapabilityCatalog.freeze(
-        capability_by_id.values(), profile_by_id.values())
     frontier = tuple(sorted(
         frontier_items, key=lambda item: item.transformation_spec_id))
     complete = not limit_reasons
+    # The expansion record binds the exact spec/profile contents but not the
+    # final catalog ID, because that ID in turn embeds this expansion record.
+    # This two-level construction avoids a hash cycle while keeping both
+    # directions replayable.
+    content_catalog = CapabilityCatalog.freeze(
+        capability_by_id.values(), profile_by_id.values())
     payload = _expansion_payload(
         base_catalog.catalog_id, transform_catalog.catalog_id, limits, states,
-        transitions, frontier, complete, limit_reasons, augmented)
+        transitions, frontier, complete, limit_reasons,
+        content_catalog.content_id)
+    expansion_id = strict_hash(payload)
+    layer = DiscoveryLayerCertificate.bind(
+        "TRANSFORMATION_EXPANSION",
+        expansion_id,
+        source_ids=(transform_catalog.catalog_id,),
+        limits=limits.to_dict(),
+        limit_reasons=limit_reasons,
+        complete=complete,
+    )
+    augmented = CapabilityCatalog.freeze(
+        capability_by_id.values(),
+        profile_by_id.values(),
+        discovery_base_catalog_id=base_catalog.catalog_id,
+        discovery_layers=(*base_catalog.discovery_provenance.layers, layer),
+    )
     return TransformationExpansion(
-        strict_hash(payload), base_catalog.catalog_id,
+        expansion_id, base_catalog.catalog_id,
         transform_catalog.catalog_id, limits, states, transitions, frontier,
         complete, limit_reasons, augmented,
     )

@@ -20,6 +20,7 @@ from contracts import BBoxSupport, TemporalSupport
 from engine.runtime.identity import require_object_fields, strict_hash
 
 from .manifest import AssetConditionalIdentity, AssetExtent
+from .schema import SourceSchema
 
 
 class SourceSearchError(RuntimeError):
@@ -82,6 +83,7 @@ class SourceDescriptor:
     credential_ref: CredentialRef
     supports_conditional_fetch: bool
     page_size: int
+    schemas: tuple[SourceSchema, ...]
 
     def __post_init__(self) -> None:
         for value, label in (
@@ -96,6 +98,34 @@ class SourceDescriptor:
         if (isinstance(self.page_size, bool)
                 or not isinstance(self.page_size, int) or self.page_size < 1):
             raise ValueError("source page_size must be a positive integer")
+        if (not isinstance(self.schemas, tuple) or not self.schemas
+                or not all(isinstance(item, SourceSchema)
+                           for item in self.schemas)):
+            raise TypeError("source descriptor needs a non-empty schema tuple")
+        if any(item.source_id != self.source_id for item in self.schemas):
+            raise ValueError("all source schemas must belong to the descriptor")
+        keys = tuple(
+            (item.concept_id, item.schema_version, item.units,
+             item.representation) for item in self.schemas)
+        if len(keys) != len(set(keys)):
+            raise ValueError("source descriptor cannot repeat a source schema")
+
+    def schema_for_query(self, query: "MetadataQuery") -> SourceSchema:
+        if not isinstance(query, MetadataQuery):
+            raise TypeError("schema lookup requires a MetadataQuery")
+        matches = tuple(
+            item for item in self.schemas
+            if (item.concept_id == query.concept_id
+                and item.schema_version == query.schema_version
+                and item.units == query.units
+                and item.representation == query.representation))
+        if len(matches) != 1:
+            raise ValueError(
+                f"source {self.source_id!r} has no unique frozen schema for "
+                f"query {query.query_id}")
+        schema = matches[0]
+        schema.validates_query(query)
+        return schema
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +135,7 @@ class SourceDescriptor:
             "credential_ref": self.credential_ref.to_dict(),
             "supports_conditional_fetch": self.supports_conditional_fetch,
             "page_size": self.page_size,
+            "schemas": [item.to_dict() for item in self.schemas],
         }
 
     @classmethod
@@ -113,6 +144,10 @@ class SourceDescriptor:
             value, {field.name for field in dataclasses.fields(cls)},
             "SourceDescriptor")
         raw["credential_ref"] = CredentialRef.from_dict(raw["credential_ref"])
+        if not isinstance(raw["schemas"], list):
+            raise ValueError("SourceDescriptor.schemas must be an array")
+        raw["schemas"] = tuple(SourceSchema.from_dict(item)
+                               for item in raw["schemas"])
         return cls(**raw)
 
 

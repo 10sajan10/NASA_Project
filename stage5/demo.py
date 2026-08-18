@@ -24,16 +24,19 @@ from pathlib import Path
 from typing import Any
 
 from acquisition import (
+    AcquisitionDiscoveryReplay,
     AcquisitionExpansion,
     AcquisitionLimits,
     AcquisitionSearch,
     BoundAssetManifest,
+    FetchedContentBinding,
     ManifestShardStore,
     PayloadFetcher,
     PayloadStore,
     PlanningSessionStore,
     ProviderQuota,
-    lower_manifest_to_capability,
+    lower_fetched_content_to_capability,
+    verify_fetch_receipt,
     verify_binding,
 )
 from capabilities import BoundInvocation, CapabilityCatalog
@@ -50,12 +53,17 @@ from plans import (
     PlanSnapshotRef,
 )
 from resolution import (
+    DiscoveryCertificate,
+    DiscoveryLayerCertificate,
+    DiscoveryLayerScope,
+    DiscoveryUniverseContract,
     ResolutionOutcome,
     ResolutionStatus,
-    UpstreamCompleteness,
     WorkflowResolver,
 )
 from transformations import (
+    TransformationCatalog,
+    TransformationDiscoveryReplay,
     TransformationSearchLimits,
     expand_transform_catalog,
 )
@@ -69,14 +77,19 @@ class Stage5DemoPlan:
     coarse_bound: BoundAssetManifest
     local_bound: BoundAssetManifest
     support_bound: BoundAssetManifest
+    coarse_content: FetchedContentBinding
+    local_content: FetchedContentBinding
+    support_content: FetchedContentBinding
     catalog: CapabilityCatalog
-    upstream: UpstreamCompleteness
+    discovery_certificate: DiscoveryCertificate
+    discovery_universe: DiscoveryUniverseContract
     resolution: ResolutionOutcome
     selected_invocations: tuple[BoundInvocation, ...]
     bound_plan: BoundDerivationPlan
     deployment_plan: DeploymentPlan
     compilation: CompilationResult
     planning_bytes: int
+    fetch_bytes: int
 
 
 def _union_bounds(bound: BoundAssetManifest,
@@ -100,11 +113,17 @@ def build_demo_plan(root: Path, *, session_id: str = "stage5-demo") -> Stage5Dem
     remote = fx.make_remote_connector()
 
     # -- phase 1: metadata only ------------------------------------------
+    acquisition_requests = fx.acquisition_requests()
+    second_order_rules = (fx.support_rule(),)
+    declared_source_ids = tuple(sorted({
+        *(item.query.source_id for item in acquisition_requests),
+        *(item.source_id for item in second_order_rules),
+    }))
     acquisition = AcquisitionSearch(
         session_store, shards, (local, remote),
         limits=AcquisitionLimits(), quota=ProviderQuota(),
-    ).discover(session_id, fx.acquisition_requests(),
-               second_order=(fx.support_rule(),))
+    ).discover(session_id, acquisition_requests,
+               second_order=second_order_rules)
     planning_bytes = local.bytes_transferred + remote.bytes_transferred
     if planning_bytes:
         raise RuntimeError(
@@ -119,53 +138,97 @@ def build_demo_plan(root: Path, *, session_id: str = "stage5-demo") -> Stage5Dem
     if coarse is None or pinned is None or support is None:
         raise RuntimeError("Stage-5 discovery did not bind all three manifests")
 
-    # -- phase 2: catalog, closure, selection, validation ----------------
-    coarse_descriptor = fx.descriptor(
-        fx.FLOW_CONCEPT, fx.COARSE_UNITS, _union_bounds(coarse, shards),
-        OriginClass.OBSERVATION)
+    # -- phase 2: exact bytes before authoritative lowering --------------
+    # The metadata snapshot remains byte-free.  Once manifests are bound we
+    # fetch each candidate admitted to this small demo and mint post-fetch
+    # identities.  Only those identities may enter the authoritative catalog.
+    payloads = PayloadStore(root / "payloads")
+    fetcher = PayloadFetcher(
+        session_store, payloads, quota=ProviderQuota())
+    coarse_receipt = fetcher.fetch(coarse, remote, shards)
+    pinned_receipt = fetcher.fetch(pinned, local, shards)
+    support_receipt = fetcher.fetch(support, remote, shards)
+    coarse_content = FetchedContentBinding.bind(
+        coarse, coarse_receipt, payloads, shards)
+    pinned_content = FetchedContentBinding.bind(
+        pinned, pinned_receipt, payloads, shards)
+    support_content = FetchedContentBinding.bind(
+        support, support_receipt, payloads, shards)
+    fetch_bytes = local.bytes_transferred + remote.bytes_transferred
+
+    # -- phase 3: catalog, closure, selection, validation ----------------
+    coarse_descriptor = coarse_content.descriptor
     converted_descriptor = fx.descriptor(
-        fx.FLOW_CONCEPT, fx.TARGET_UNITS, _union_bounds(coarse, shards),
+        fx.FLOW_CONCEPT, fx.TARGET_UNITS,
+        coarse_content.descriptor.spatial_support.bounds,
         OriginClass.DERIVED)
-    pinned_descriptor = fx.descriptor(
-        fx.FLOW_CONCEPT, fx.TARGET_UNITS, _union_bounds(pinned, shards),
-        OriginClass.OBSERVATION)
-    support_descriptor = fx.descriptor(
-        fx.SUPPORT_CONCEPT, fx.SUPPORT_UNITS, _union_bounds(support, shards),
-        OriginClass.OBSERVATION)
+    pinned_descriptor = pinned_content.descriptor
+    support_descriptor = support_content.descriptor
 
     profile = fx.acquisition_profile()
+    catalog_specs = (
+        lower_fetched_content_to_capability(
+            coarse_content, profile, cost_units=fx.REMOTE_COST),
+        lower_fetched_content_to_capability(
+            pinned_content, profile, cost_units=fx.LOCAL_COST),
+        lower_fetched_content_to_capability(
+            support_content, profile,
+            cost_units=fx.SUPPORT_COST),
+        fx.downscale_model(
+            coarse_descriptor, support_descriptor, converted_descriptor),
+    )
+    catalog_profiles = (profile, fx.transform_profile(), fx.model_profile())
+    acquisition_layer = acquisition.discovery_layer()
+    # The same typed content without provenance is the replayable base. The
+    # operational catalog has a different ID because acquisition discovery is
+    # load-bearing and embedded in it.
+    authored_content = CapabilityCatalog.freeze(catalog_specs, catalog_profiles)
     base_catalog = CapabilityCatalog.freeze(
+        catalog_specs,
+        catalog_profiles,
+        discovery_base_catalog_id=authored_content.catalog_id,
+        discovery_layers=(acquisition_layer,),
+    )
+    transform_limits = TransformationSearchLimits()
+    transformation_catalog = TransformationCatalog.freeze((
+        fx.unit_transform(coarse_descriptor, converted_descriptor),
+    ))
+    # Declare the intended scope before transformation discovery produces its
+    # catalog or certificate. Acquisition and transformation must both appear.
+    discovery_universe = DiscoveryUniverseContract.declare(
+        base_catalog.catalog_id,
         (
-            lower_manifest_to_capability(
-                coarse, coarse_descriptor, profile, cost_units=fx.REMOTE_COST),
-            lower_manifest_to_capability(
-                pinned, pinned_descriptor, profile, cost_units=fx.LOCAL_COST),
-            lower_manifest_to_capability(
-                support, support_descriptor, profile,
-                cost_units=fx.SUPPORT_COST),
-            fx.downscale_model(
-                coarse_descriptor, support_descriptor, converted_descriptor),
+            DiscoveryLayerScope.bind(
+                acquisition_layer.layer_kind,
+                source_ids=acquisition_layer.source_ids,
+                limits=acquisition.limits.to_dict()),
+            DiscoveryLayerScope.bind(
+                "TRANSFORMATION_EXPANSION",
+                source_ids=(transformation_catalog.catalog_id,),
+                limits=transform_limits.to_dict()),
         ),
-        (profile, fx.transform_profile(), fx.model_profile()),
     )
     closure = expand_transform_catalog(
         base_catalog,
-        (fx.unit_transform(coarse_descriptor, converted_descriptor),),
-        limits=TransformationSearchLimits())
+        transformation_catalog,
+        limits=transform_limits)
 
-    # Two discovery layers ran above the resolver.  They are folded into the
-    # single upstream channel Stage 4 introduced rather than reported twice.
-    upstream = UpstreamCompleteness.merge_all((
-        UpstreamCompleteness.from_layer(
-            acquisition.complete, acquisition.limit_codes),
-        UpstreamCompleteness.from_layer(
-            closure.complete,
-            tuple(sorted({item.code.value for item in closure.limit_reasons}))),
-    ))
+    # Two discovery layers ran above the resolver. Both identities, their
+    # configured bounds, and any activated reasons are folded into one
+    # certificate for the exact augmented catalog.
+    discovery_certificate = closure.discovery_certificate()
     resolution = WorkflowResolver(
         closure.augmented_catalog,
         fx.deployment_snapshot(),
-        **upstream.resolver_kwargs(),
+        discovery_certificate=discovery_certificate,
+        discovery_universe=discovery_universe,
+        discovery_replays=(
+            AcquisitionDiscoveryReplay(
+                acquisition, session_store, shards),
+            TransformationDiscoveryReplay.bind(
+                base_catalog, transformation_catalog,
+                limits=transform_limits),
+        ),
     ).resolve(fx.root_uses())
     if (resolution.status is not ResolutionStatus.READY
             or not resolution.eligible_for_binding
@@ -222,23 +285,24 @@ def build_demo_plan(root: Path, *, session_id: str = "stage5-demo") -> Stage5Dem
             or compilation.graph is None):
         raise RuntimeError(compilation.record.message)
 
-    planning_bytes = local.bytes_transferred + remote.bytes_transferred
-    if planning_bytes:
-        raise RuntimeError(
-            "planning transferred payload bytes before binding was complete")
     return Stage5DemoPlan(
         acquisition=acquisition,
         coarse_bound=coarse,
         local_bound=pinned,
         support_bound=support,
+        coarse_content=coarse_content,
+        local_content=pinned_content,
+        support_content=support_content,
         catalog=closure.augmented_catalog,
-        upstream=upstream,
+        discovery_certificate=discovery_certificate,
+        discovery_universe=discovery_universe,
         resolution=resolution,
         selected_invocations=selected,
         bound_plan=bound_plan,
         deployment_plan=deployment_plan,
         compilation=compilation,
         planning_bytes=planning_bytes,
+        fetch_bytes=fetch_bytes,
     )
 
 
@@ -250,19 +314,21 @@ def run_demo(runtime_root: Path | str) -> dict[str, Any]:
 
     shards = ManifestShardStore(planning_root / "manifest-shards")
     session_store = PlanningSessionStore(planning_root / "planning.sqlite3")
-    payloads = PayloadStore(root / "assets")
+    payloads = PayloadStore(planning_root / "payloads")
     remote = fx.make_remote_connector()
 
-    # -- phase 3: verify the binding, then move bytes --------------------
+    # The authoritative plan was already lowered from verified exact bytes.
+    # Recheck the provider promise and cached receipt before dispatch.
     verification = verify_binding(
         demo.coarse_bound, shards, remote.observed_identities())
     if not verification.fresh:
         raise RuntimeError("the bound coarse manifest went stale before transfer")
-    receipt = PayloadFetcher(
-        session_store, payloads, quota=ProviderQuota()
-    ).fetch(demo.coarse_bound, remote, shards)
-    if remote.bytes_transferred <= 0:
-        raise RuntimeError("payload transfer moved no bytes")
+    receipt = verify_fetch_receipt(
+        demo.coarse_bound,
+        payloads.read_receipt(demo.coarse_bound.manifest_root),
+        payloads,
+        shards,
+    )
 
     # -- phase 4: execute the compiled plan ------------------------------
     graph = demo.compilation.graph
@@ -302,10 +368,11 @@ def run_demo(runtime_root: Path | str) -> dict[str, Any]:
         "coarse_asset_ids": list(demo.coarse_bound.asset_ids),
         "coverage_status": demo.coarse_bound.coverage.status.value,
         "bytes_transferred_during_planning": demo.planning_bytes,
-        "bytes_transferred_after_binding": remote.bytes_transferred,
+        "bytes_transferred_after_binding": demo.fetch_bytes,
         "binding_status": verification.status.value,
         "fetch_receipt_assets": list(receipt.asset_ids),
-        "upstream_completeness": demo.upstream.to_dict(),
+        "discovery_certificate": demo.discovery_certificate.to_dict(),
+        "discovery_universe": demo.discovery_universe.to_dict(),
         "effective_discovery_complete": (
             demo.resolution.selection.discovery_complete),
         "globally_optimal": (
@@ -333,7 +400,8 @@ def run_demo(runtime_root: Path | str) -> dict[str, Any]:
 def _manifest_root_is_bound(demo: Stage5DemoPlan) -> bool:
     """The bound derivation must carry the exact manifest it reads."""
     return any(
-        binding.runtime_parameters.get("manifest_root")
+        isinstance(binding.runtime_parameters.get("content_binding"), dict)
+        and binding.runtime_parameters["content_binding"].get("manifest_root")
         == demo.coarse_bound.manifest_root
         for binding in demo.bound_plan.invocation_bindings)
 

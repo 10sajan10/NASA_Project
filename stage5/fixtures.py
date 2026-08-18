@@ -20,12 +20,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from grid_convention import FIELD_JSON_SCHEMA
+
 from acquisition import (
     AssetCandidate,
     AssetExtent,
     AssetMissingError,
     AssetMutatedError,
     AcquisitionRequest,
+    AssemblyMode,
     ConditionalIdentityKind,
     AssetConditionalIdentity,
     CredentialRef,
@@ -35,6 +38,7 @@ from acquisition import (
     SecondOrderQuerySpec,
     SourceConnector,
     SourceDescriptor,
+    SourceSchema,
     TransientSourceError,
 )
 from capabilities import (
@@ -59,10 +63,13 @@ from contracts import (
     Missingness,
     MissingnessStatus,
     OriginClass,
+    GridDescriptor,
     Requirement,
     RequirementUse,
     SampleSemantics,
+    ScaleBasis,
     SpatialRequirement,
+    SpatialScale,
     TemporalKind,
     TemporalRequirement,
     TemporalSupport,
@@ -73,7 +80,7 @@ from transformations import (
     TransformationSpec,
 )
 
-SCHEMA_VERSION = "example-field-v1"
+SCHEMA_VERSION = FIELD_JSON_SCHEMA
 REPRESENTATION = "application/json"
 FLOW_CONCEPT = "example.field.flow_speed"
 SUPPORT_CONCEPT = "example.field.support"
@@ -110,11 +117,20 @@ MPS_TO_KMPH = 3.6
 TIME_STEPS = (
     "2026-01-01T00:00:00Z",
     "2026-01-01T01:00:00Z",
-    "2026-01-01T02:00:00Z",
 )
 Y_COORDS = (0.0, 2.0, 4.0)
 WEST_X = (-1.0, 0.0, 1.0)
 EAST_X = (2.0, 3.0, 4.0)
+FAR_X = (6.0, 7.0, 8.0)
+
+
+def field_grid() -> GridDescriptor:
+    """The exact Stage-5 payload lattice, in sample-centre convention."""
+    return GridDescriptor(
+        CRS, AXES, (len(Y_COORDS), len(WEST_X + EAST_X)),
+        ("1", "0", "-1", "0", "2", "0"),
+        SpatialScale("1", "2", "degree", ScaleBasis.ANGULAR),
+    )
 
 
 def target_bbox() -> BBoxSupport:
@@ -130,8 +146,9 @@ def target_window() -> TemporalSupport:
 
 def _field(x: tuple[float, ...], value: float) -> dict[str, Any]:
     return {
-        "schema": "field-json-v1",
+        "schema": "field-json-v2",
         "crs": CRS,
+        "axis_order": ["x", "y"],
         "x": list(x),
         "y": list(Y_COORDS),
         "time": list(TIME_STEPS),
@@ -149,8 +166,9 @@ def _payload(value: dict[str, Any]) -> bytes:
 def expected_converted_field() -> dict[str, Any]:
     """The field the demo must commit: both tiles joined, then converted."""
     return {
-        "schema": "field-json-v1",
+        "schema": "field-json-v2",
         "crs": CRS,
+        "axis_order": ["x", "y"],
         "x": list(WEST_X + EAST_X),
         "y": list(Y_COORDS),
         "time": list(TIME_STEPS),
@@ -203,6 +221,19 @@ class FixtureConnector(SourceConnector):
 
     def remove(self, asset_id: str) -> None:
         self._entries[asset_id].present = False
+
+    def replace_payload_without_version(self, asset_id: str,
+                                        payload: bytes) -> None:
+        """Adversarial provider control: violate an unchanged weak ETag.
+
+        The replacement must keep its declared size so metadata and manifest
+        identity remain byte-for-byte identical.  Stage-8R uses this to prove
+        post-fetch content, rather than the weak ETag, reaches task identity.
+        """
+        entry = self._entries[asset_id]
+        if len(payload) != entry.candidate.byte_size:
+            raise ValueError("adversarial replacement must preserve byte_size")
+        entry.payload = payload
 
     def observed_identities(self) -> dict[str, str | None]:
         result: dict[str, str | None] = {}
@@ -324,8 +355,23 @@ def make_local_connector() -> FixtureConnector:
             credential_ref=CredentialRef("none", "unauthenticated"),
             supports_conditional_fetch=True,
             page_size=10,
+            schemas=(SourceSchema(
+                source_id=LOCAL_SOURCE_ID,
+                concept_id=FLOW_CONCEPT,
+                schema_version=SCHEMA_VERSION,
+                representation=REPRESENTATION,
+                units=TARGET_UNITS,
+                spatial_crs=CRS,
+                spatial_axis_order=AXES,
+                temporal_kind=TemporalKind.SERIES,
+                sample_semantics=SampleSemantics.INSTANTANEOUS,
+                origin=OriginClass.OBSERVATION,
+                assembly_mode=AssemblyMode.SINGLE_ASSET,
+                component_names=("speed",),
+                grid=field_grid(),
+            ),),
         ),
-        (_Entry(_checksum_candidate("local-fine-0", ("0", "0", "4", "4"),
+        (_Entry(_checksum_candidate("local-fine-0", field_grid().support_bounds,
                                     payload), payload, FLOW_CONCEPT),),
     )
 
@@ -340,19 +386,19 @@ def make_remote_connector(*, page_size: int = 1) -> FixtureConnector:
     """
     west = _payload(_field(WEST_X, WEST_VALUE))
     east = _payload(_field(EAST_X, EAST_VALUE))
-    far = _payload(_field(WEST_X, 99.0))
+    far = _payload(_field(FAR_X, 99.0))
     support = _payload(_field(WEST_X + EAST_X, 1.0))
     entries = (
-        _Entry(_etag_candidate("remote-tile-west", ("-1", "-1", "2", "5"),
+        _Entry(_etag_candidate("remote-tile-west", ("-1.5", "-1", "1.5", "5"),
                                west, "etag-west-1"), west, FLOW_CONCEPT),
-        _Entry(_etag_candidate("remote-tile-east", ("2", "-1", "5", "5"),
+        _Entry(_etag_candidate("remote-tile-east", ("1.5", "-1", "4.5", "5"),
                                east, "etag-east-1"), east, FLOW_CONCEPT),
         # Outside the request: proves the connector filters rather than the
         # binder silently dropping unrelated assets later.
-        _Entry(_etag_candidate("remote-tile-far", ("6", "-1", "8", "5"),
+        _Entry(_etag_candidate("remote-tile-far", ("5.5", "-1", "8.5", "5"),
                                far, "etag-far-1"), far, FLOW_CONCEPT),
         # Only discoverable once the tile union above is known.
-        _Entry(_etag_candidate("remote-support-0", ("-1", "-1", "5", "5"),
+        _Entry(_etag_candidate("remote-support-0", field_grid().support_bounds,
                                support, "etag-support-1"), support,
                SUPPORT_CONCEPT),
     )
@@ -364,6 +410,38 @@ def make_remote_connector(*, page_size: int = 1) -> FixtureConnector:
             credential_ref=CredentialRef("env", "STAGE5_ARCHIVE_TOKEN"),
             supports_conditional_fetch=True,
             page_size=page_size,
+            schemas=(
+                SourceSchema(
+                    source_id=REMOTE_SOURCE_ID,
+                    concept_id=FLOW_CONCEPT,
+                    schema_version=SCHEMA_VERSION,
+                    representation=REPRESENTATION,
+                    units=COARSE_UNITS,
+                    spatial_crs=CRS,
+                    spatial_axis_order=AXES,
+                    temporal_kind=TemporalKind.SERIES,
+                    sample_semantics=SampleSemantics.INSTANTANEOUS,
+                    origin=OriginClass.OBSERVATION,
+                    assembly_mode=AssemblyMode.FIELD_JSON_X_TILES_V1,
+                    component_names=("speed",),
+                    grid=field_grid(),
+                ),
+                SourceSchema(
+                    source_id=REMOTE_SOURCE_ID,
+                    concept_id=SUPPORT_CONCEPT,
+                    schema_version=SCHEMA_VERSION,
+                    representation=REPRESENTATION,
+                    units=SUPPORT_UNITS,
+                    spatial_crs=CRS,
+                    spatial_axis_order=AXES,
+                    temporal_kind=TemporalKind.SERIES,
+                    sample_semantics=SampleSemantics.INSTANTANEOUS,
+                    origin=OriginClass.OBSERVATION,
+                    assembly_mode=AssemblyMode.SINGLE_ASSET,
+                    component_names=("speed",),
+                    grid=field_grid(),
+                ),
+            ),
         ),
         entries,
     )
@@ -412,21 +490,25 @@ def acquisition_requests() -> tuple[AcquisitionRequest, ...]:
 
 def descriptor(concept_id: str, units: str, bounds: tuple[str, str, str, str],
                origin: OriginClass) -> ArtifactDescriptor:
+    grid = field_grid()
+    support = BBoxSupport(CRS, AXES, bounds)
+    grid.require_support(support)
     return ArtifactDescriptor(
         concept_id=concept_id,
         schema_version=SCHEMA_VERSION,
         representation=REPRESENTATION,
         units=units,
-        spatial_support=BBoxSupport(CRS, AXES, bounds),
+        spatial_support=support,
         temporal_support=TemporalSupport(
             TemporalKind.SERIES, start=WINDOW_START, end=WINDOW_END,
             cadence_s=CADENCE_S, max_gap_s=MAX_GAP_S,
             sample_semantics=SampleSemantics.INSTANTANEOUS),
         vertical_support=None,
-        grid=None,
+        grid=grid,
         native_resolution=None,
         origin=origin,
         missingness=Missingness(MissingnessStatus.COMPLETE),
+        component_names=("speed",),
     )
 
 

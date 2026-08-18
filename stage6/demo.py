@@ -38,6 +38,8 @@ from plans import (
     PlanSnapshotRef,
 )
 from resolution import (
+    DiscoveryCertificate,
+    DiscoveryUniverseContract,
     ResolutionOutcome,
     ResolutionStatus,
     SelectionConstraints,
@@ -62,6 +64,10 @@ def _resolver(fixture: fx.Stage6Fixture) -> Callable[
     def resolve(constraints: SelectionConstraints) -> ResolutionOutcome:
         return WorkflowResolver(
             fixture.catalog, fixture.deployment_snapshot,
+            discovery_certificate=DiscoveryCertificate.for_base_catalog(
+                fixture.catalog),
+            discovery_universe=DiscoveryUniverseContract.declare(
+                fixture.catalog.catalog_id),
             evidence_snapshot=fixture.evidence_snapshot,
         ).resolve(fixture.root_uses, constraints=constraints)
     return resolve

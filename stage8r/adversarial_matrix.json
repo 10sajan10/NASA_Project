@@ -1,0 +1,125 @@
+{
+  "base_commit": "45aaee1",
+  "cases": [
+    {
+      "case_id": "8R-A-DISCOVERY-CERTIFICATE",
+      "expected": "A truncated or uncertified generated catalog is not globally optimal or execution eligible.",
+      "owner_track": "8R-A",
+      "regression_test": "tests/test_stage4_integration.py::test_predeclared_universe_rejects_copied_truncated_catalog_contents",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-A-TRANSFORM-AUTHORITY",
+      "expected": "A reserved transform operation without an authenticated matching transformation certificate is rejected.",
+      "owner_track": "8R-A",
+      "regression_test": "tests/test_stage4_transformations.py::test_raw_reserved_transform_capability_cannot_forge_factor_666",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-A-TRANSFORM-LOSS-POLICY",
+      "expected": "A value-changing transform carries an explicit loss and uncertainty policy and cannot silently reuse a known input uncertainty model.",
+      "owner_track": "8R-A",
+      "regression_test": "tests/test_stage8r_open_gates.py::test_transform_uncertainty_policy_gate",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-A-CONTESTED-ARC",
+      "expected": "An alternative is reported only when its exact producer output satisfies the contested requirement use.",
+      "owner_track": "8R-A",
+      "regression_test": "tests/test_stage6_integration.py::test_alternatives_force_the_exact_contested_satisfaction_arc",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-B-ACQUISITION-IDENTITY",
+      "expected": "Coverage is metadata-derived and executable; exact fetched bytes enter a post-fetch bound identity.",
+      "owner_track": "8R-B",
+      "regression_test": "tests/test_stage8r_open_gates.py::test_acquisition_identity_gate",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-C-GRID-CONTRACT",
+      "expected": "Descriptor, runtime, and commit agree on affine axes, signed orientation, aggregation, and CRS.",
+      "owner_track": "8R-C",
+      "regression_test": "tests/test_stage8r_grid_contract.py",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-D-PACKET-REPLAY",
+      "expected": "Duplicate packet results are idempotent, conflicting replay fails, and NOT_ATTEMPTED consumes no attempt.",
+      "owner_track": "8R-D",
+      "regression_test": "tests/test_stage8r_open_gates.py::test_packet_result_replay_gate",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-D-RESERVATION-RESTART",
+      "expected": "Restart reconstructs or fences active reservations before any new dispatch.",
+      "owner_track": "8R-D",
+      "regression_test": "tests/test_stage8r_open_gates.py::test_reservation_restart_gate",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-D-FULL-GRAPH-RANK",
+      "expected": "Live scheduling ranks ready heads from the entire immutable dependency graph.",
+      "owner_track": "8R-D",
+      "regression_test": "tests/test_stage8r_open_gates.py::test_full_graph_rank_gate",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-E-SLURM-PARTIAL-VISIBILITY",
+      "expected": "squeue absence plus unavailable sacct remains unknown and cannot authorize sbatch.",
+      "owner_track": "8R-E",
+      "regression_test": "tests/test_stage8r_open_gates.py::test_slurm_partial_visibility_gate",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-F-CUBE-AUTHORITY",
+      "expected": "Only a validated authoritative artifact can be projected into Cube entries and lineage through an idempotent outbox.",
+      "owner_track": "8R-F",
+      "regression_test": "tests/test_cube_projection.py",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-O-FETCH-CRASH-QUOTA",
+      "expected": "A mid-transfer crash reuses verified completed assets, and every reopened asset consumes a new durable call/byte reservation before provider access.",
+      "owner_track": "8R-OPERATIONAL-CLOSEOUT",
+      "regression_test": "tests/test_stage5_integration.py::test_mid_transfer_crash_cannot_reuse_quota_for_an_extra_provider_call",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-O-FETCH-LIVE-OWNER",
+      "expected": "Two same-node fetchers cannot concurrently transfer one manifest; process death releases ownership without erasing checkpoints.",
+      "owner_track": "8R-OPERATIONAL-CLOSEOUT",
+      "regression_test": "tests/test_stage5_integration.py::test_a_live_same_node_fetch_owner_prevents_concurrent_transfer",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-O-PACKET-NOT-LAUNCHED",
+      "expected": "An expired packet fence is released without consuming retry sequence only after the exact RuntimeStore run proves zero launch/commit evidence under the exclusive controller lock.",
+      "owner_track": "8R-OPERATIONAL-CLOSEOUT",
+      "regression_test": "tests/test_stage7_admission.py::test_expired_packet_releases_only_after_exact_run_proves_never_launched",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-O-PACKET-LATE-TERMINAL",
+      "expected": "Lease expiry cannot discard the exact terminal result of the packet's already-bound runtime run.",
+      "owner_track": "8R-OPERATIONAL-CLOSEOUT",
+      "regression_test": "tests/test_stage7_admission.py::test_expired_packet_accepts_only_its_exact_terminal_runtime_result",
+      "status": "PASS"
+    },
+    {
+      "case_id": "8R-O-REAL-SITE-EVIDENCE",
+      "expected": "A real Slurm deployment is never claimed from fake-scheduler evidence; validation requires an authorized provisioned site.",
+      "owner_track": "8R-OPERATIONAL-CLOSEOUT",
+      "regression_test": "tests/test_stage9a_slurm.py::test_the_flags_we_send_exist_in_the_installed_slurm",
+      "status": "BLOCKED_EXTERNAL"
+    },
+    {
+      "case_id": "8R-F-PROJECTION-AUTHORITY",
+      "expected": "A self-consistent projection receipt is not artifact authority; publication requires a ProjectionAuthority minted only after the manifest is re-read and the object re-hashed, bound to that exact artifact.",
+      "owner_track": "8R-F",
+      "regression_test": "tests/test_cube_projection.py::test_a_self_consistent_receipt_is_not_authority",
+      "status": "PASS"
+    }
+  ],
+  "schema": "stage8r-adversarial-matrix-v1"
+}

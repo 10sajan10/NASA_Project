@@ -9,11 +9,13 @@ import hashlib
 import math
 import os
 import re
-from bisect import bisect_right
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
-from .identity import strict_json_loads
+from grid_convention import FIELD_JSON_SCHEMA
+
+from .identity import strict_hash, strict_json_loads
 from .types import ExecutableComponent
 
 ASSET_STORE_ENVIRONMENT = "NASA_STAGE5_ASSET_STORE"
@@ -90,8 +92,9 @@ def _identity(parameters: dict[str, Any],
 # gridded-field transformations.  Component tensors are indexed [time][y][x].
 # This is an execution format, not a claim that JSON is an appropriate storage
 # format for production-sized scientific arrays.
-_FIELD_SCHEMA = "field-json-v1"
-_FIELD_KEYS = frozenset({"schema", "crs", "x", "y", "time", "components"})
+_FIELD_SCHEMA = FIELD_JSON_SCHEMA
+_FIELD_KEYS = frozenset({
+    "schema", "crs", "axis_order", "x", "y", "time", "components"})
 _AUTHORITY_CRS = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*:[A-Za-z0-9_.-]+$")
 
 # The vector decomposition operation is domain-neutral.  In particular, this
@@ -146,13 +149,15 @@ def _axis(value: Any, context: str, *, minimum_length: int = 1) -> list[float]:
     if len(result) < minimum_length:
         raise ValueError(
             f"{context} must contain at least {minimum_length} coordinates")
-    if any(right <= left for left, right in zip(result, result[1:])):
-        raise ValueError(f"{context} coordinates must be strictly increasing")
+    differences = [right - left for left, right in zip(result, result[1:])]
+    if differences and (any(item == 0 for item in differences)
+                        or min(differences) < 0 < max(differences)):
+        raise ValueError(f"{context} coordinates must be strictly monotonic")
     return result
 
 
 def _validate_field(value: Any, context: str = "field") -> dict[str, Any]:
-    """Validate and normalize a canonical finite ``field-json-v1`` value."""
+    """Validate and normalize a canonical finite ``field-json-v2`` value."""
     if not isinstance(value, dict):
         raise TypeError(f"{context} must be an object")
     _exact_keys(value, _FIELD_KEYS, context)
@@ -161,6 +166,13 @@ def _validate_field(value: Any, context: str = "field") -> dict[str, Any]:
     crs = value["crs"]
     if not isinstance(crs, str) or not crs.strip():
         raise ValueError(f"{context}.crs must be a non-empty string")
+    axis_order = value["axis_order"]
+    if (not isinstance(axis_order, (list, tuple)) or len(axis_order) != 2
+            or any(not isinstance(item, str) or not item
+                   for item in axis_order)
+            or axis_order[0] == axis_order[1]):
+        raise ValueError(
+            f"{context}.axis_order must name distinct x/y coordinate axes")
     x = _axis(value["x"], f"{context}.x")
     y = _axis(value["y"], f"{context}.y")
     raw_time = value["time"]
@@ -218,6 +230,7 @@ def _validate_field(value: Any, context: str = "field") -> dict[str, Any]:
     return {
         "schema": _FIELD_SCHEMA,
         "crs": crs,
+        "axis_order": list(axis_order),
         "x": x,
         "y": y,
         "time": time,
@@ -230,10 +243,13 @@ def _field_with(field: dict[str, Any], *,
                 y: list[float] | None = None,
                 time: list[str] | None = None,
                 crs: str | None = None,
+                axis_order: list[str] | None = None,
                 components: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "schema": _FIELD_SCHEMA,
         "crs": field["crs"] if crs is None else crs,
+        "axis_order": (field["axis_order"] if axis_order is None
+                       else list(axis_order)),
         "x": field["x"] if x is None else x,
         "y": field["y"] if y is None else y,
         "time": field["time"] if time is None else time,
@@ -257,7 +273,7 @@ def _unit_affine(parameters: dict[str, Any],
         raise ValueError("factor cannot be zero")
     source = inputs["source"]
     if isinstance(source, bool) or not isinstance(source, (int, float, dict)):
-        raise TypeError("unit-affine source must be a number or field-json-v1")
+        raise TypeError("unit-affine source must be a number or field-json-v2")
     if isinstance(source, dict):
         field = _validate_field(source, "unit-affine source")
         components = {
@@ -338,11 +354,24 @@ def _temporal_align(parameters: dict[str, Any],
 
 
 def _bracket(axis: list[float], coordinate: float, context: str) -> tuple[int, float]:
-    if coordinate < axis[0] or coordinate > axis[-1]:
+    lower_bound, upper_bound = sorted((axis[0], axis[-1]))
+    if coordinate < lower_bound or coordinate > upper_bound:
         raise ValueError(f"{context} coordinate {coordinate} is outside source grid")
     if coordinate == axis[-1]:
         return len(axis) - 2, 1.0
-    lower = bisect_right(axis, coordinate) - 1
+    # The array index, rather than numeric coordinate order, is authoritative.
+    # A north-up y axis is decreasing, so use a small direction-neutral binary
+    # search and retain a signed denominator for the interpolation fraction.
+    increasing = axis[-1] > axis[0]
+    left, right = 0, len(axis) - 1
+    while right - left > 1:
+        middle = (left + right) // 2
+        if ((axis[middle] <= coordinate) if increasing
+                else (axis[middle] >= coordinate)):
+            left = middle
+        else:
+            right = middle
+    lower = left
     fraction = ((coordinate - axis[lower])
                 / (axis[lower + 1] - axis[lower]))
     return lower, fraction
@@ -439,7 +468,17 @@ def _spatial_block_aggregate(parameters: dict[str, Any],
         components[name] = planes
 
     def _centres(axis: list[float], block: int) -> list[float]:
-        return [math.fsum(axis[index * block:(index + 1) * block]) / block
+        # Coordinate identity is decimal and exact at the descriptor/commit
+        # boundary.  Binary accumulation made an ordinary 0.1/0.2 pair emit
+        # 0.15000000000000002, which the authoritative affine validator
+        # correctly rejected against the declared 0.15 centre.  Convert each
+        # already-validated JSON number through its canonical decimal spelling,
+        # perform the exact mean there, then emit the shortest JSON float.
+        divisor = Decimal(block)
+        return [float(sum(
+                    (Decimal(str(value)) for value in
+                     axis[index * block:(index + 1) * block]),
+                    Decimal(0)) / divisor)
                 for index in range(len(axis) // block)]
 
     return {"result": _field_with(
@@ -477,10 +516,132 @@ def _authority_crs(value: Any, context: str) -> str:
     return value
 
 
+_REPROJECTION_PUBLIC_PARAMETERS = frozenset({
+    "source_crs", "target_crs", "target_x", "target_y"})
+_REPROJECTION_BOUND_PARAMETERS = frozenset({
+    *_REPROJECTION_PUBLIC_PARAMETERS, "pipeline_projjson",
+    "source_axis_order", "target_axis_order"})
+
+
+def bind_reprojection_parameters(
+        parameters: dict[str, Any], *,
+        source_axis_order: tuple[str, str] | list[str],
+        target_axis_order: tuple[str, str] | list[str],
+) -> dict[str, Any]:
+    """Select and freeze the exact locally available target-to-source pipeline.
+
+    PROJ may choose between operations based on locally installed grid files.
+    Planning therefore uses ``TransformerGroup`` and refuses a degraded choice
+    when its preferred operation is unavailable.  The chosen PROJJSON is then
+    content-addressed with the transformation instead of repeating that choice
+    at execution time.
+    """
+    _exact_keys(parameters, _REPROJECTION_PUBLIC_PARAMETERS,
+                "reprojection authority parameters")
+    source_crs = _authority_crs(parameters["source_crs"], "source_crs")
+    target_crs = _authority_crs(parameters["target_crs"], "target_crs")
+    target_x = _axis(parameters["target_x"], "target_x")
+    target_y = _axis(parameters["target_y"], "target_y")
+    for value, label in ((source_axis_order, "source_axis_order"),
+                         (target_axis_order, "target_axis_order")):
+        if (not isinstance(value, (tuple, list)) or len(value) != 2
+                or any(not isinstance(item, str) or not item for item in value)
+                or value[0] == value[1]):
+            raise ValueError(f"{label} must name distinct x/y axes")
+    try:
+        from pyproj.transformer import TransformerGroup
+        group = TransformerGroup(target_crs, source_crs, always_xy=True)
+    except Exception as exc:  # pragma: no cover - site diagnostics
+        raise ValueError("invalid or unavailable closed CRS transformation") from exc
+    if not group.best_available:
+        unavailable = ", ".join(
+            operation.name for operation in group.unavailable_operations[:3])
+        detail = f": {unavailable}" if unavailable else ""
+        raise ValueError(
+            "preferred PROJ operation is unavailable (required local grid "
+            f"data may be missing){detail}")
+    if not group.transformers:
+        raise ValueError("PROJ found no available target-to-source operation")
+    transformer = group.transformers[0]
+    # Exercise every target sample now.  This resolves deferred pipeline
+    # selection and exposes missing grid data before expensive upstream work.
+    for y_value in target_y:
+        for x_value in target_x:
+            try:
+                transformer.transform(x_value, y_value, errcheck=True)
+            except Exception as exc:
+                raise ValueError(
+                    "PROJ could not transform every declared target sample") from exc
+    try:
+        pipeline = transformer.to_json_dict()
+    except Exception as exc:  # pragma: no cover - dependency diagnostics
+        raise ValueError("PROJ did not expose the selected pipeline identity") from exc
+    if not isinstance(pipeline, dict) or not pipeline:
+        raise ValueError("PROJ selected pipeline identity is empty")
+    return {
+        "source_crs": source_crs,
+        "target_crs": target_crs,
+        "target_x": target_x,
+        "target_y": target_y,
+        "source_axis_order": list(source_axis_order),
+        "target_axis_order": list(target_axis_order),
+        "pipeline_projjson": pipeline,
+    }
+
+
+def reprojection_sample_points(
+        parameters: dict[str, Any], *, verify_local_selection: bool,
+) -> list[list[tuple[float, float]]]:
+    """Replay one frozen pipeline and return all target samples in source CRS."""
+    _exact_keys(parameters, _REPROJECTION_BOUND_PARAMETERS,
+                "bound reprojection parameters")
+    source_crs = _authority_crs(parameters["source_crs"], "source_crs")
+    target_crs = _authority_crs(parameters["target_crs"], "target_crs")
+    target_x = _axis(parameters["target_x"], "target_x")
+    target_y = _axis(parameters["target_y"], "target_y")
+    pipeline = parameters["pipeline_projjson"]
+    if not isinstance(pipeline, dict) or not pipeline:
+        raise ValueError("pipeline_projjson must be a non-empty object")
+    if verify_local_selection:
+        public = {name: parameters[name]
+                  for name in _REPROJECTION_PUBLIC_PARAMETERS}
+        expected = bind_reprojection_parameters(
+            public,
+            source_axis_order=parameters["source_axis_order"],
+            target_axis_order=parameters["target_axis_order"],
+        )
+        if strict_hash(expected["pipeline_projjson"]) != strict_hash(pipeline):
+            raise ValueError(
+                "bound PROJ pipeline is not the locally selected exact pipeline")
+    try:
+        import json
+        from pyproj import Transformer
+        transformer = Transformer.from_pipeline(json.dumps(
+            pipeline, sort_keys=True, separators=(",", ":")))
+    except Exception as exc:  # pragma: no cover - dependency/site diagnostics
+        raise ValueError("bound PROJ pipeline is invalid or unavailable") from exc
+    sample_points: list[list[tuple[float, float]]] = []
+    for target_y_value in target_y:
+        row: list[tuple[float, float]] = []
+        for target_x_value in target_x:
+            try:
+                source_x, source_y = transformer.transform(
+                    target_x_value, target_y_value, errcheck=True)
+            except Exception as exc:
+                raise ValueError(
+                    "bound PROJ pipeline failed for a declared target sample") \
+                    from exc
+            row.append((
+                _finite_number(source_x, "transformed source x"),
+                _finite_number(source_y, "transformed source y"),
+            ))
+        sample_points.append(row)
+    return sample_points
+
+
 def _reproject_bilinear(parameters: dict[str, Any],
                         inputs: dict[str, Any]) -> dict[str, Any]:
-    _exact_keys(parameters,
-                {"source_crs", "target_crs", "target_x", "target_y"},
+    _exact_keys(parameters, _REPROJECTION_BOUND_PARAMETERS,
                 "bilinear-reprojection parameters")
     _exact_keys(inputs, {"source"}, "bilinear-reprojection inputs")
     field = _validate_field(inputs["source"], "bilinear-reprojection source")
@@ -490,25 +651,13 @@ def _reproject_bilinear(parameters: dict[str, Any],
     target_crs = _authority_crs(parameters["target_crs"], "target_crs")
     if field["crs"] != source_crs:
         raise ValueError("source_crs does not equal the source field CRS")
+    if tuple(field["axis_order"]) != tuple(parameters["source_axis_order"]):
+        raise ValueError(
+            "source_axis_order does not equal the source field axes")
     target_x = _axis(parameters["target_x"], "target_x")
     target_y = _axis(parameters["target_y"], "target_y")
-    try:
-        from pyproj import Transformer
-        transformer = Transformer.from_crs(
-            target_crs, source_crs, always_xy=True)
-    except Exception as exc:  # pragma: no cover - dependency/site diagnostics
-        raise ValueError("invalid or unavailable closed CRS transformation") from exc
-    sample_points: list[list[tuple[float, float]]] = []
-    for target_y_value in target_y:
-        row: list[tuple[float, float]] = []
-        for target_x_value in target_x:
-            source_x, source_y = transformer.transform(
-                target_x_value, target_y_value, errcheck=True)
-            row.append((
-                _finite_number(source_x, "transformed source x"),
-                _finite_number(source_y, "transformed source y"),
-            ))
-        sample_points.append(row)
+    sample_points = reprojection_sample_points(
+        parameters, verify_local_selection=False)
     components = {
         name: _bilinear_tensor(tensor, field["x"], field["y"],
                                sample_points, "transformed target")
@@ -516,6 +665,7 @@ def _reproject_bilinear(parameters: dict[str, Any],
     }
     return {"result": _field_with(
         field, x=target_x, y=target_y, crs=target_crs,
+        axis_order=parameters["target_axis_order"],
         components=components)}
 
 
@@ -607,7 +757,7 @@ def _assemble_tiles(tiles: list[dict[str, Any]]) -> dict[str, Any]:
               for index, tile in enumerate(tiles)]
     reference = fields[0]
     for index, field in enumerate(fields[1:], start=1):
-        for key in ("crs", "y", "time"):
+        for key in ("crs", "axis_order", "y", "time"):
             if field[key] != reference[key]:
                 raise ValueError(
                     f"acquired tile[{index}] disagrees on {key}; Stage 5 joins "
@@ -649,18 +799,53 @@ def _acquisition_materialize(parameters: dict[str, Any],
     different store paths therefore still produce identical results, and a
     tampered blob fails closed rather than flowing into a commit.
     """
-    _exact_keys(parameters, {"manifest_root", "asset_ids"},
+    _exact_keys(parameters, {"content_binding"},
                 "acquisition-materialize parameters")
     _exact_keys(inputs, set(), "acquisition-materialize inputs")
-    manifest_root = parameters["manifest_root"]
+    binding = parameters["content_binding"]
+    if not isinstance(binding, dict):
+        raise ValueError("content_binding must be an object")
+    _exact_keys(binding, {
+        "schema", "binding_id", "manifest_root", "source_id", "receipt_id",
+        "content_root", "assets", "source_schema_id", "coverage_contract_id",
+        "assembly_mode", "descriptor",
+    }, "fetched content binding")
+    if binding["schema"] != "stage8r-fetched-content-binding-v1":
+        raise ValueError("fetched content binding schema is unsupported")
+    binding_payload = dict(binding)
+    binding_id = binding_payload.pop("binding_id")
+    if (not isinstance(binding_id, str)
+            or strict_hash(binding_payload) != binding_id):
+        raise ValueError("fetched content binding identity does not verify")
+    manifest_root = binding["manifest_root"]
     if not isinstance(manifest_root, str) or not re.fullmatch(
             r"[0-9a-f]{64}", manifest_root):
         raise ValueError("manifest_root must be a lowercase sha256 digest")
-    asset_ids = parameters["asset_ids"]
-    if (not isinstance(asset_ids, (list, tuple)) or not asset_ids
-            or any(not isinstance(item, str) or not item
-                   for item in asset_ids)):
-        raise ValueError("asset_ids must be a non-empty array of strings")
+    source_id = binding["source_id"]
+    if not isinstance(source_id, str) or not source_id:
+        raise ValueError("fetched content source_id must be text")
+    assets = binding["assets"]
+    if not isinstance(assets, list) or not assets:
+        raise ValueError("fetched content assets must be a non-empty array")
+    for asset in assets:
+        if not isinstance(asset, dict):
+            raise ValueError("fetched content asset must be an object")
+        _exact_keys(asset, {"asset_id", "blob_sha256", "byte_size"},
+                    "fetched content asset")
+        if (not isinstance(asset["asset_id"], str) or not asset["asset_id"]
+                or not isinstance(asset["blob_sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", asset["blob_sha256"])
+                or isinstance(asset["byte_size"], bool)
+                or not isinstance(asset["byte_size"], int)
+                or asset["byte_size"] < 0):
+            raise ValueError("fetched content asset fields are malformed")
+    asset_ids = [item["asset_id"] for item in assets]
+    if asset_ids != sorted(set(asset_ids)):
+        raise ValueError("fetched content asset order is not canonical")
+    expected_content_root = strict_hash({
+        "schema": "stage8r-fetched-content-root-v1", "assets": assets})
+    if binding["content_root"] != expected_content_root:
+        raise ValueError("fetched content root does not verify")
 
     root = os.environ.get(ASSET_STORE_ENVIRONMENT, "")
     if not root:
@@ -676,30 +861,41 @@ def _acquisition_materialize(parameters: dict[str, Any],
             f"no fetch receipt for manifest {manifest_root}; payload transfer "
             "must complete before materialization")
     receipt = strict_json_loads(receipt_path.read_text(encoding="utf-8"))
-    if not isinstance(receipt, dict) or \
-            receipt.get("schema") != "stage5-fetch-receipt-v1":
-        raise ValueError("fetch receipt schema is not stage5-fetch-receipt-v1")
+    if not isinstance(receipt, dict):
+        raise ValueError("fetch receipt must be an object")
+    _exact_keys(receipt, {
+        "schema", "receipt_id", "manifest_root", "source_id", "assets",
+        "content_root", "total_bytes", "transient_retries",
+    }, "fetch receipt")
+    if receipt["schema"] != "stage8r-fetch-receipt-v2":
+        raise ValueError("fetch receipt schema is not stage8r-fetch-receipt-v2")
     if receipt.get("manifest_root") != manifest_root:
         raise ValueError("fetch receipt does not match the requested manifest")
-    digests = receipt.get("asset_digests")
-    if not isinstance(digests, list):
-        raise ValueError("fetch receipt asset digests are malformed")
-    digest_by_asset: dict[str, str] = {}
-    for entry in digests:
-        if (not isinstance(entry, list) or len(entry) != 2
-                or not all(isinstance(item, str) for item in entry)):
-            raise ValueError("fetch receipt asset digests are malformed")
-        digest_by_asset[entry[0]] = entry[1]
-    absent = [item for item in asset_ids if item not in digest_by_asset]
-    if absent:
-        raise RuntimeError(
-            f"the receipt for {manifest_root} is missing assets {sorted(absent)}")
+    if receipt["source_id"] != source_id:
+        raise ValueError("fetch receipt source does not match content binding")
+    if receipt["assets"] != assets:
+        raise ValueError("fetch receipt assets do not exactly match binding")
+    if receipt["content_root"] != binding["content_root"]:
+        raise ValueError("fetch receipt content root does not match binding")
+    receipt_identity = {
+        "schema": "stage8r-fetch-receipt-identity-v1",
+        "manifest_root": receipt["manifest_root"],
+        "source_id": receipt["source_id"],
+        "content_root": receipt["content_root"],
+        "assets": receipt["assets"],
+        "total_bytes": receipt["total_bytes"],
+    }
+    if strict_hash(receipt_identity) != receipt["receipt_id"]:
+        raise ValueError("fetch receipt identity does not verify")
+    if receipt["receipt_id"] != binding["receipt_id"]:
+        raise ValueError("fetch receipt identity does not match binding")
+    if receipt["total_bytes"] != sum(item["byte_size"] for item in assets):
+        raise ValueError("fetch receipt total bytes do not verify")
 
     tiles: list[Any] = []
-    for asset_id in asset_ids:
-        digest = digest_by_asset[asset_id]
-        if not re.fullmatch(r"[0-9a-f]{64}", digest):
-            raise ValueError(f"receipt digest for {asset_id!r} is malformed")
+    for asset in assets:
+        asset_id = asset["asset_id"]
+        digest = asset["blob_sha256"]
         blob = store / digest[:2] / digest
         if not blob.exists():
             raise RuntimeError(f"payload {digest} is absent from the store")
@@ -708,19 +904,23 @@ def _acquisition_materialize(parameters: dict[str, Any],
             raise RuntimeError(
                 f"payload {digest} failed its content check; refusing to "
                 "materialize tampered bytes")
+        if len(payload) != asset["byte_size"]:
+            raise RuntimeError(
+                f"payload {digest} size disagrees with fetched binding")
         tiles.append(strict_json_loads(payload.decode("utf-8")))
 
-    if all(isinstance(item, dict) for item in tiles):
-        return {"result": _assemble_tiles(tiles)}
-    if len(tiles) == 1:
+    assembly_mode = binding["assembly_mode"]
+    if assembly_mode == "SINGLE_ASSET" and len(tiles) == 1:
         return {"result": tiles[0]}
-    raise ValueError(
-        "a multi-asset manifest must materialize field-json-v1 tiles")
+    if (assembly_mode == "FIELD_JSON_X_TILES_V1"
+            and all(isinstance(item, dict) for item in tiles)):
+        return {"result": _assemble_tiles(tiles)}
+    raise ValueError("fetched content assembly mode cannot materialize payloads")
 
 
 def _same_grid(left: dict[str, Any], right: dict[str, Any],
                context: str) -> None:
-    for key in ("crs", "x", "y", "time"):
+    for key in ("crs", "axis_order", "x", "y", "time"):
         if left[key] != right[key]:
             raise ValueError(f"{context} disagree on {key}")
 
@@ -826,6 +1026,9 @@ def _dependency_identity(key: str) -> bytes:
         import pyproj
         pyproj_version = pyproj.__version__
         proj_version = pyproj.proj_version_str
+        epsg_version = pyproj.database.get_database_metadata("EPSG.VERSION")
+        proj_database_version = pyproj.database.get_database_metadata(
+            "PROJ.VERSION")
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
             "the closed reprojection component requires identifiable pyproj/PROJ"
@@ -833,6 +1036,7 @@ def _dependency_identity(key: str) -> bytes:
     if not pyproj_version or not proj_version:
         raise RuntimeError("pyproj/PROJ dependency versions cannot be empty")
     return (f"pyproj={pyproj_version}\0PROJ={proj_version}"
+            f"\0EPSG={epsg_version}\0PROJ_DB={proj_database_version}"
             .encode("utf-8"))
 
 

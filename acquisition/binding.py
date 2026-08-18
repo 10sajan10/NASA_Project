@@ -29,6 +29,7 @@ from engine.runtime.identity import (
     strict_copy,
     strict_hash,
 )
+from contracts.identity import canonical_decimal, decimal_value
 
 from .connector import (
     AssetCandidate,
@@ -42,6 +43,7 @@ from .manifest import (
     ManifestShardStore,
     DEFAULT_SHARD_SIZE,
 )
+from .schema import SourceSchema
 
 
 class BindingRejectionCode(str, Enum):
@@ -93,6 +95,10 @@ class BoundAssetManifest:
     manifest: AssetManifest
     coverage: CoverageAssessment
     query_payload: dict[str, Any]
+    source_schema: SourceSchema
+    target_spatial: BBoxSupport
+    target_temporal: TemporalSupport
+    halo: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.manifest, AssetManifest):
@@ -104,6 +110,16 @@ class BoundAssetManifest:
                 "a manifest cannot be bound over incomplete coverage")
         if not isinstance(self.query_payload, dict):
             raise TypeError("bound manifest query payload must be an object")
+        if not isinstance(self.source_schema, SourceSchema):
+            raise TypeError("bound manifest needs a frozen SourceSchema")
+        if not isinstance(self.target_spatial, BBoxSupport):
+            raise TypeError("bound manifest target_spatial must be typed")
+        if not isinstance(self.target_temporal, TemporalSupport):
+            raise TypeError("bound manifest target_temporal must be typed")
+        normalized_halo = canonical_decimal(self.halo, "bound manifest halo")
+        if decimal_value(normalized_halo) < 0:
+            raise ValueError("bound manifest halo cannot be negative")
+        object.__setattr__(self, "halo", normalized_halo)
         # Detach and freeze before doing any identity checks.  ``frozen=True``
         # on a dataclass does not make a nested dict immutable; without this a
         # caller could mutate the query after binding and relabel the same
@@ -117,6 +133,9 @@ class BoundAssetManifest:
         if query.source_id != self.manifest.source_id:
             raise ValueError(
                 "bound query source does not match the manifest source")
+        self.source_schema.validates_query(query)
+        if self.source_schema.source_id != self.manifest.source_id:
+            raise ValueError("bound source schema does not own the manifest")
         if self.coverage.selected_asset_ids != tuple(sorted(set(
                 self.coverage.selected_asset_ids))):
             raise ValueError("bound asset IDs must be unique and sorted")
@@ -136,6 +155,19 @@ class BoundAssetManifest:
     def asset_ids(self) -> tuple[str, ...]:
         return self.coverage.selected_asset_ids
 
+    @property
+    def coverage_contract_id(self) -> str:
+        """Identity of the exact support/halo proof used for this manifest."""
+        return strict_hash({
+            "schema": "stage8r-acquisition-coverage-contract-v1",
+            "manifest_root": self.manifest_root,
+            "source_schema_id": self.source_schema.schema_id,
+            "target_spatial": self.target_spatial.to_dict(),
+            "target_temporal": self.target_temporal.to_dict(),
+            "halo": self.halo,
+            "coverage": self.coverage.to_dict(),
+        })
+
     def authorization(self):
         """Mint the token that lets a connector release payload bytes.
 
@@ -150,15 +182,24 @@ class BoundAssetManifest:
             "manifest": self.manifest.to_dict(),
             "coverage": self.coverage.to_dict(),
             "query_payload": strict_copy(self.query_payload),
+            "source_schema": self.source_schema.to_dict(),
+            "target_spatial": self.target_spatial.to_dict(),
+            "target_temporal": self.target_temporal.to_dict(),
+            "halo": self.halo,
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "BoundAssetManifest":
         raw = require_object_fields(
-            value, {"manifest", "coverage", "query_payload"},
+            value, {"manifest", "coverage", "query_payload", "source_schema",
+                    "target_spatial", "target_temporal", "halo"},
             "BoundAssetManifest")
         raw["manifest"] = AssetManifest.from_dict(raw["manifest"])
         raw["coverage"] = CoverageAssessment.from_dict(raw["coverage"])
+        raw["source_schema"] = SourceSchema.from_dict(raw["source_schema"])
+        raw["target_spatial"] = BBoxSupport.from_dict(raw["target_spatial"])
+        raw["target_temporal"] = TemporalSupport.from_dict(
+            raw["target_temporal"])
         return cls(**raw)
 
 
@@ -194,6 +235,7 @@ def bind_manifest(
     candidates: Iterable[AssetCandidate],
     *,
     query: MetadataQuery,
+    source_schema: SourceSchema,
     store: ManifestShardStore,
     target_spatial: BBoxSupport,
     target_temporal: TemporalSupport,
@@ -208,6 +250,9 @@ def bind_manifest(
     """
     if not isinstance(query, MetadataQuery):
         raise TypeError("bind_manifest requires a MetadataQuery")
+    if not isinstance(source_schema, SourceSchema):
+        raise TypeError("bind_manifest requires a frozen SourceSchema")
+    source_schema.validates_query(query)
     values = tuple(candidates)
     if not values:
         return BindingResult(None, (BindingRejection(
@@ -242,7 +287,8 @@ def bind_manifest(
 
     coverage = assess_coverage(
         bindable, target_spatial=target_spatial,
-        target_temporal=target_temporal, halo=halo)
+        target_temporal=target_temporal, halo=halo,
+        assembly_mode=source_schema.assembly_mode)
     if not coverage.complete:
         rejections.append(BindingRejection(
             BindingRejectionCode.COVERAGE_GAP, (), coverage.detail))
@@ -256,7 +302,9 @@ def bind_manifest(
         source_id=query.source_id, query_id=query.query_id, assets=ordered,
         store=store, shard_size=shard_size)
     return BindingResult(
-        BoundAssetManifest(manifest, coverage, query.to_dict()),
+        BoundAssetManifest(
+            manifest, coverage, query.to_dict(), source_schema,
+            target_spatial, target_temporal, str(halo)),
         tuple(rejections), tuple(sorted(unbindable)))
 
 
@@ -268,6 +316,7 @@ class BindingStatus(str, Enum):
 class StaleReasonCode(str, Enum):
     ASSET_MISSING = "ASSET_MISSING"
     ASSET_MUTATED = "ASSET_MUTATED"
+    ASSET_SIZE_MISMATCH = "ASSET_SIZE_MISMATCH"
 
 
 @dataclass(frozen=True)

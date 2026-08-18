@@ -15,7 +15,12 @@ from typing import Any, Callable, Iterator
 from engine.runtime.identity import require_object_fields
 
 from .manifest import CollectionManifest, CollectionState
-from .packet import PacketMember, WorkPacket, fuse_members
+from .packet import (
+    PacketMember,
+    WorkPacket,
+    expected_deployment_binding_id,
+    fuse_members,
+)
 from .space import PartitionSetSpec
 from .store import PartitionStore
 from .template import PartitionTaskTemplate
@@ -115,16 +120,18 @@ class BoundedAdmissionController:
                      ) -> tuple[WorkPacket, ...]:
         """Bundle a bounded slice of admitted partitions into work packets."""
         ceiling = limit if limit is not None else self.policy.high_watermark
+        binding_id = expected_deployment_binding_id(
+            self.collection_id, self.template.template_id)
         members = tuple(
             PacketMember(
                 logical_task_key=key, partition_index=index,
-                deployment_binding_id=f"binding:{self.template.template_id[:16]}")
+                deployment_binding_id=binding_id)
             for key, index in self.store.iter_admitted(
                 self.collection_id, ceiling))
         if not members:
             return ()
         return fuse_members(
-            members, self.template.template_id,
+            members, self.collection_id, self.template.template_id,
             max_members=self.policy.max_packet_members,
             cost_per_member=self.template.estimated_cost_units,
             target_packet_cost=self.policy.target_packet_cost)

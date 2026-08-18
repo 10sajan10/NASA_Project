@@ -10,6 +10,7 @@ import hashlib
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -30,6 +31,27 @@ from .types import (
     TaskState,
     deployment_id,
 )
+
+
+@dataclass(frozen=True)
+class _ReservationClaim:
+    """Capacity held before the durable attempt/fence identity is minted."""
+
+    owner_id: str | None
+    site_id: str | None
+    envelope: object | None
+    started_at: float | None
+
+
+@dataclass(frozen=True)
+class _LiveReservation:
+    """One ledger claim keyed by its durable attempt identity."""
+
+    run_id: str
+    task_id: str
+    site_id: str
+    envelope: object
+    started_at: float | None
 
 
 class WorkflowController:
@@ -72,9 +94,10 @@ class WorkflowController:
         self.scheduling_site_id = site_id
         self.priority_policy = priority_policy
         self.observations = observations
-        # task_id -> (envelope, started_at) for live reservations we own.
-        self._reserved: dict[str, tuple[object, float]] = {}
-        self._ready_since: dict[str, float] = {}
+        # attempt_id -> claim. Attempt identity includes run and fence, so the
+        # same scientific task may execute concurrently in independent runs.
+        self._reserved: dict[str, _LiveReservation] = {}
+        self._ready_since: dict[tuple[str, str], float] = {}
         self.controller_id = uuid.uuid4().hex
         self._closed = False
         self._lock = ControllerLock(root / "control" / "controller.lock")
@@ -82,6 +105,12 @@ class WorkflowController:
             self.store = RuntimeStore(root / "control" / "runtime.sqlite3")
             self.controller_epoch = self.store.start_controller_session(
                 self.controller_id)
+            swept = self.store.sweep_terminal_attempt_reservations()
+            if self.ledger is not None:
+                for attempt_id in swept:
+                    if self.ledger.reservation(attempt_id) is not None:
+                        self.ledger.release(attempt_id)
+            self._recover_resource_reservations()
             self.provider = provider or LocalSubprocessProvider(
                 root, site=self.site)
             if self.provider.root != root:
@@ -108,6 +137,7 @@ class WorkflowController:
     def tick(self, run_id: str) -> RunState:
         """Advance one nonblocking controller iteration."""
         self._require_open()
+        self._prune_ready_since()
         current = self.store.run_state(run_id)
         if current is not RunState.RUNNING:
             return current
@@ -137,21 +167,26 @@ class WorkflowController:
                 self._stop_cancelled_attempt(
                     cancelled, error="attempt deadline exceeded")
 
-        self._release_finished_reservations(run_id)
+        self._release_finished_reservations()
         active = self._global_active_attempt_count()
         if active < self.max_inflight:
             ready = self.store.ready_tasks(run_id)
-            for task in self._order_ready(ready):
+            for task in self._order_ready(run_id, ready):
                 if active >= self.max_inflight:
                     break
-                if not self._reserve_for(task):
+                claim = self._reserve_for(run_id, task)
+                if claim is None:
                     continue      # no capacity for this one yet; try the next
                 before = self._global_active_attempt_count()
-                self._dispatch(run_id, task)
+                try:
+                    self._dispatch(run_id, task, claim)
+                except BaseException:
+                    self._release_claim(claim)
+                    raise
                 if self._global_active_attempt_count() > before:
                     active += 1
                 else:
-                    self._release_reservation(task.task_id)
+                    self._release_claim(claim)
 
         return self.store.finalize_run_state(run_id)
 
@@ -185,6 +220,7 @@ class WorkflowController:
             self.store.finalize_run_state(run_id)
             return True
         self._stop_cancelled_attempt(record, error="cancelled")
+        self._release_finished_reservations()
         self.store.finalize_run_state(run_id)
         return True
 
@@ -230,6 +266,7 @@ class WorkflowController:
         self._closed = True
         try:
             try:
+                self._release_finished_reservations()
                 self.provider.close()
             finally:
                 self.store.stop_controller_session(self.controller_id)
@@ -243,7 +280,10 @@ class WorkflowController:
                  _traceback: object) -> None:
         self.close()
 
-    def _dispatch(self, run_id: str, task: BoundTask) -> None:
+    def _dispatch(
+            self, run_id: str, task: BoundTask,
+            claim: _ReservationClaim,
+    ) -> AttemptSpec | None:
         try:
             preflight_request(task.resources, self.site)
             if operation_component(
@@ -253,7 +293,7 @@ class WorkflowController:
         except (ValueError, RuntimeError) as exc:
             self.store.fail_ready_task_preflight(
                 run_id, task.task_id, str(exc))
-            return
+            return None
         binding_id = deployment_id(
             self.store.load_graph_for_run(run_id).plan_id,
             self.site,
@@ -274,9 +314,26 @@ class WorkflowController:
             self.provider.name,
             str(stage_dir),
             self.controller_epoch,
+            reservation_site_id=claim.site_id,
+            reservation_envelope=(
+                claim.envelope.to_dict()
+                if claim.envelope is not None else None),
         )
+        if self.ledger is not None:
+            assert claim.owner_id is not None
+            assert claim.site_id is not None
+            assert claim.envelope is not None
+            self.ledger.rekey(claim.owner_id, spec.attempt_id)
+            self._reserved[spec.attempt_id] = _LiveReservation(
+                run_id=run_id,
+                task_id=task.task_id,
+                site_id=claim.site_id,
+                envelope=claim.envelope,
+                started_at=claim.started_at,
+            )
         self.store.mark_submitting(spec.attempt_id)
         self._submit_persisted_spec(spec)
+        return spec
 
     def _submit_persisted_spec(self, spec: AttemptSpec) -> None:
         """Submit one already-persisted intent and attach its durable handle."""
@@ -402,7 +459,8 @@ class WorkflowController:
 
     # -- Stage-8 policy bridge --------------------------------------------
 
-    def _order_ready(self, ready: "list[BoundTask]") -> "list[BoundTask]":
+    def _order_ready(self, run_id: str,
+                     ready: "list[BoundTask]") -> "list[BoundTask]":
         """Order ready work by the Stage-8 policy when one was supplied.
 
         With no policy this is the Stage-1 order the store already returned,
@@ -412,24 +470,40 @@ class WorkflowController:
             return ready
         from scheduling import (ScheduledNode, critical_path_ranks,
                                 order_ready_tasks)
+        graph = self.store.load_graph_for_run(run_id)
+        by_key = {task.key: task for task in graph.tasks}
         nodes = []
-        for task in ready:
+        for task in graph.tasks:
             declared = float(getattr(task.resources, "walltime_s", 1.0) or 1.0)
             estimate = declared
             if self.observations is not None:
                 estimate = self.observations.duration_estimate(
                     task.key, declared).value
-            nodes.append(ScheduledNode(task.task_id, estimate))
+            nodes.append(ScheduledNode(
+                task.task_id,
+                estimate,
+                tuple(by_key[binding.upstream_task].task_id
+                      for binding in task.inputs),
+            ))
         ranks = critical_path_ranks(nodes)
         now = time.monotonic()
-        waiting = {task.task_id: max(now - self._ready_since.get(
-            task.task_id, now), 0.0) for task in ready}
-        by_id = {task.task_id: task for task in ready}
         for task in ready:
-            self._ready_since.setdefault(task.task_id, now)
+            self._ready_since.setdefault((run_id, task.task_id), now)
+        waiting = {task.task_id: max(now - self._ready_since[
+            (run_id, task.task_id)], 0.0) for task in ready}
+        by_id = {task.task_id: task for task in ready}
         return [by_id[key] for key in order_ready_tasks(
             [task.task_id for task in ready], ranks, waiting,
             self.priority_policy)]
+
+    def _prune_ready_since(self) -> None:
+        """Retain aging timestamps only while their durable task is READY."""
+        if not self._ready_since:
+            return
+        ready = self.store.ready_task_identities()
+        for identity in tuple(self._ready_since):
+            if identity not in ready:
+                self._ready_since.pop(identity, None)
 
     def _envelope_for(self, task: "BoundTask"):
         from scheduling import ResourceEnvelopeSpec
@@ -440,52 +514,138 @@ class WorkflowController:
             gpus=max(0, int(getattr(request, "gpus", 0))),
             scratch_mb=0)
 
-    def _reserve_for(self, task: "BoundTask") -> bool:
+    def _recover_resource_reservations(self) -> None:
+        """Fence node capacity from every durable active attempt on restart."""
+        if self.ledger is None:
+            return
+        from scheduling import (
+            OversubscriptionError,
+            ResourceEnvelopeSpec,
+            best_fit_site,
+        )
+
+        added: list[str] = []
+        try:
+            for record in self.store.active_attempt_reservations():
+                attempt_id = record.spec.attempt_id
+                expected = self._envelope_for(record.spec.task)
+                if record.released_at is not None:
+                    raise RuntimeError(
+                        "an active attempt has a released durable reservation")
+                if record.envelope is None:
+                    site_id = self.scheduling_site_id or best_fit_site(
+                        self.ledger, expected)
+                    if site_id is None:
+                        raise RuntimeError(
+                            "node capacity cannot cover a durable active attempt")
+                    envelope = expected
+                else:
+                    if record.site_id is None:
+                        raise RuntimeError(
+                            "durable attempt reservation has no execution site")
+                    site_id = record.site_id
+                    envelope = ResourceEnvelopeSpec.from_dict(record.envelope)
+                    if envelope != expected:
+                        raise RuntimeError(
+                            "durable attempt reservation disagrees with its "
+                            "immutable task resource request")
+
+                existing = self.ledger.reservation(attempt_id)
+                if existing is None:
+                    try:
+                        self.ledger.reserve(attempt_id, site_id, envelope)
+                    except (KeyError, OversubscriptionError, ValueError) as exc:
+                        raise RuntimeError(
+                            "node capacity cannot reconstruct durable active "
+                            f"attempt {attempt_id}: {exc}") from exc
+                    added.append(attempt_id)
+                elif (existing.site_id != site_id
+                      or existing.envelope != envelope):
+                    raise RuntimeError(
+                        "live ledger reservation conflicts with durable attempt")
+
+                if record.envelope is None:
+                    self.store.adopt_attempt_reservation(
+                        attempt_id, site_id, envelope.to_dict())
+                self._reserved[attempt_id] = _LiveReservation(
+                    run_id=record.spec.run_id,
+                    task_id=record.spec.task.task_id,
+                    site_id=site_id,
+                    envelope=envelope,
+                    # A monotonic start timestamp cannot survive a process
+                    # restart. Do not invent an underestimate for observations.
+                    started_at=None,
+                )
+            if not self.ledger.invariant_holds():
+                raise RuntimeError(
+                    "reconstructed resource reservations exceed node capacity")
+        except BaseException:
+            for attempt_id in reversed(added):
+                try:
+                    self.ledger.release(attempt_id)
+                except KeyError:
+                    pass
+            self._reserved.clear()
+            raise
+
+    def _reserve_for(
+            self, run_id: str, task: "BoundTask",
+    ) -> _ReservationClaim | None:
         """Claim capacity before dispatch, or decline to start this task."""
         if self.ledger is None:
-            return True
-        if task.task_id in self._reserved:
-            return True
+            return _ReservationClaim(None, None, None, None)
         from scheduling import OversubscriptionError, best_fit_site
         envelope = self._envelope_for(task)
         site_id = self.scheduling_site_id or best_fit_site(
             self.ledger, envelope)
         if site_id is None:
-            return False
+            return None
+        owner_id = "dispatch:" + strict_hash({
+            "schema": "stage8r-pre-attempt-reservation-v1",
+            "controller_epoch": self.controller_epoch,
+            "run_id": run_id,
+            "task_id": task.task_id,
+            "nonce": uuid.uuid4().hex,
+        })
         try:
-            self.ledger.reserve(task.task_id, site_id, envelope)
-        except OversubscriptionError:
-            return False
-        self._reserved[task.task_id] = (envelope, time.monotonic())
-        return True
+            self.ledger.reserve(owner_id, site_id, envelope)
+        except (KeyError, OversubscriptionError):
+            return None
+        return _ReservationClaim(
+            owner_id, site_id, envelope, time.monotonic())
 
-    def _release_reservation(self, task_id: str) -> None:
-        if self.ledger is None or task_id not in self._reserved:
+    def _release_claim(self, claim: _ReservationClaim) -> None:
+        """Release only a pre-attempt claim that was never durably adopted."""
+        if self.ledger is None or claim.owner_id is None:
             return
-        self._reserved.pop(task_id, None)
         try:
-            self.ledger.release(task_id)
+            self.ledger.release(claim.owner_id)
         except KeyError:
+            # Successful dispatch rekeys it to attempt_id, where the normal
+            # terminal-attempt release path owns it.
             pass
 
-    def _release_finished_reservations(self, run_id: str) -> None:
-        """Return capacity for tasks that are no longer running.
-
-        Reservations are released on the *task* leaving an active state, not
-        on process exit, so a task still validating or committing keeps its
-        resources until it is genuinely done.
-        """
+    def _release_finished_reservations(self) -> None:
+        """Return capacity only after the owning durable attempt is terminal."""
         if self.ledger is None or not self._reserved:
             return
-        live = {"READY", "RUNNING", "VALIDATING", "COMMITTING"}
-        active = {row["task_id"] for row in self.store.task_rows(run_id)
-                  if row["state"] in live}
-        for task_id in list(self._reserved):
-            if task_id in active:
+        active = {
+            record.spec.attempt_id
+            for record in self.store.active_attempt_reservations()
+        }
+        for attempt_id, reservation in list(self._reserved.items()):
+            if attempt_id in active:
                 continue
-            envelope, started = self._reserved[task_id]
-            self._release_reservation(task_id)
-            self._record_observation(run_id, task_id, envelope, started)
+            self.ledger.release(attempt_id)
+            self.store.release_attempt_reservation(attempt_id)
+            self._reserved.pop(attempt_id, None)
+            if reservation.started_at is not None:
+                self._record_observation(
+                    reservation.run_id,
+                    reservation.task_id,
+                    reservation.envelope,
+                    reservation.started_at,
+                )
 
     def _record_observation(self, run_id: str, task_id: str, envelope,
                             started: float) -> None:

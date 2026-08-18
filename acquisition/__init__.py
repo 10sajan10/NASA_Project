@@ -47,17 +47,24 @@ from .coverage import (
     expand_bbox,
     order_assets,
 )
+from .content import FetchedContentBinding
 from .fetch import (
     BindingStaleError,
+    FetchLeaseBusyError,
+    FetchedAsset,
     FetchReceipt,
     PayloadFetcher,
     PayloadStore,
+    verify_fetch_receipt,
 )
 from .lowering import (
     ACQUISITION_BINDER_KEY,
     ACQUISITION_OPERATION_KEY,
     acquisition_capability_id,
+    lower_fetched_content_to_capability,
     lower_manifest_to_capability,
+    verify_bound_acquisition_authority,
+    verify_capability_acquisition_authority,
 )
 from .manifest import (
     AssetConditionalIdentity,
@@ -76,10 +83,12 @@ from .quarantine import (
 )
 from .search import (
     AcquisitionExpansion,
+    AcquisitionDiscoveryReplay,
     AcquisitionLimitCode,
     AcquisitionLimitReason,
     AcquisitionLimits,
     AcquisitionRequest,
+    AcquisitionScope,
     AcquisitionSearch,
     QueryOutcome,
     SecondOrderQuerySpec,
@@ -88,20 +97,25 @@ from .search import (
 )
 from .session import (
     CursorState,
+    FetchAssetCheckpoint,
+    FrozenSessionError,
     PlanningSessionStore,
     ProviderQuota,
     QuotaExceededError,
     QuotaUsage,
 )
+from .schema import AssemblyMode, SourceSchema
 
 __all__ = [
     "ACQUISITION_BINDER_KEY",
     "ACQUISITION_OPERATION_KEY",
     "AcquisitionExpansion",
+    "AcquisitionDiscoveryReplay",
     "AcquisitionLimitCode",
     "AcquisitionLimitReason",
     "AcquisitionLimits",
     "AcquisitionRequest",
+    "AcquisitionScope",
     "AcquisitionSearch",
     "AssetCandidate",
     "AssetConditionalIdentity",
@@ -110,6 +124,7 @@ __all__ = [
     "AssetMissingError",
     "AssetMutatedError",
     "AssetRef",
+    "AssemblyMode",
     "BindingRejection",
     "BindingRejectionCode",
     "BindingResult",
@@ -125,7 +140,12 @@ __all__ = [
     "EnvironmentSecretResolver",
     "ExclusionChildPlan",
     "FetchAuthorization",
+    "FetchAssetCheckpoint",
+    "FetchLeaseBusyError",
+    "FetchedAsset",
+    "FetchedContentBinding",
     "FetchReceipt",
+    "FrozenSessionError",
     "IngestionResult",
     "IngestionStatus",
     "ManifestShard",
@@ -146,6 +166,7 @@ __all__ = [
     "SnapshotIngestionPlan",
     "SourceConnector",
     "SourceDescriptor",
+    "SourceSchema",
     "SourceSearchError",
     "StaleReason",
     "StaleReasonCode",
@@ -156,9 +177,13 @@ __all__ = [
     "derive_exclusion_plan",
     "expand_bbox",
     "ingest_snapshot",
+    "lower_fetched_content_to_capability",
     "lower_manifest_to_capability",
     "order_assets",
     "second_order_rule",
     "second_order_rule_keys",
     "verify_binding",
+    "verify_bound_acquisition_authority",
+    "verify_capability_acquisition_authority",
+    "verify_fetch_receipt",
 ]

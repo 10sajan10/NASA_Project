@@ -7,6 +7,7 @@ surfaced through the *existing* upstream completeness channel.
 """
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ from acquisition import (
     second_order_rule,
     second_order_rule_keys,
 )
-from resolution import UpstreamCompleteness
+from resolution import DiscoveryLayerCertificate, UpstreamCompleteness
 from stage5 import fixtures as fx
 
 
@@ -68,7 +69,7 @@ def test_second_order_query_uses_the_discovered_extent_not_the_request(
     # The tiles overhang the request, so the follow-up asks about a strictly
     # larger region than anything derivable before round one.
     assert list(support.query_payload["spatial"]["bounds"]) == \
-        ["-1", "-1", "5", "5"]
+        ["-1.5", "-1", "4.5", "5"]
     assert fx.target_bbox().bounds == ("0", "0", "4", "4")
 
 
@@ -82,22 +83,44 @@ def test_no_payload_bytes_move_during_discovery(workspace):
     assert remote.payload_calls == 0
 
 
-def test_restart_resumes_from_the_persisted_cursor(tmp_path):
+def test_query_schema_facts_must_be_authorized_before_provider_access(
+        workspace):
+    remote = fx.make_remote_connector()
+    forged = dataclasses.replace(fx.remote_query(), units=fx.TARGET_UNITS)
+    with pytest.raises(ValueError, match="frozen schema|source schema"):
+        _search(workspace, (remote,)).discover(
+            "s1", (AcquisitionRequest(
+                query=forged,
+                target_spatial=fx.target_bbox(),
+                target_temporal=fx.target_window()),))
+    assert remote.search_calls == 0
+    assert remote.bytes_transferred == 0
+
+
+def test_restart_resumes_from_the_persisted_cursor_without_erasing_truncation(
+        tmp_path):
     session_store = PlanningSessionStore(tmp_path / "planning.sqlite3")
     shards = ManifestShardStore(tmp_path / "shards")
     request = (AcquisitionRequest(query=fx.remote_query(),
                                   target_spatial=fx.target_bbox(),
                                   target_temporal=fx.target_window()),)
 
-    # One page per call, and only one page allowed: discovery must stop mid
-    # pagination with a typed reason rather than pretending to be finished.
+    # Crash after page one is durably stored, before the second call returns.
+    # The two-page bound is frozen from the start and remains unchanged.
     first_remote = fx.make_remote_connector(page_size=1)
-    first = AcquisitionSearch(
-        session_store, shards, (first_remote,),
-        limits=AcquisitionLimits(max_pages_per_query=1)).discover(
-            "s1", request)
-    assert not first.complete
-    assert AcquisitionLimitCode.MAX_PAGES_PER_QUERY.value in first.limit_codes
+    original_search = first_remote.search_metadata
+
+    def crash_after_first_page(query, cursor, limit):
+        if first_remote.search_calls:
+            raise RuntimeError("simulated controller crash")
+        return original_search(query, cursor, limit)
+
+    first_remote.search_metadata = crash_after_first_page
+    limits = AcquisitionLimits(max_pages_per_query=2)
+    with pytest.raises(RuntimeError, match="simulated controller crash"):
+        AcquisitionSearch(
+            session_store, shards, (first_remote,), limits=limits,
+        ).discover("s1", request)
     assert first_remote.search_calls == 1
     state = session_store.cursor_for("s1", fx.remote_query().query_id)
     assert state.cursor == "1" and state.pages_read == 1
@@ -106,11 +129,11 @@ def test_restart_resumes_from_the_persisted_cursor(tmp_path):
     reopened = PlanningSessionStore(tmp_path / "planning.sqlite3")
     second_remote = fx.make_remote_connector(page_size=1)
     second = AcquisitionSearch(
-        reopened, shards, (second_remote,),
-        limits=AcquisitionLimits(max_pages_per_query=2)).discover(
+        reopened, shards, (second_remote,), limits=limits).discover(
             "s1", request)
 
     assert second.complete
+    assert not second.limit_codes
     # Only the *remaining* page was fetched; the first was not paid for twice.
     assert second_remote.search_calls == 1
     assert reopened.cursor_for("s1", fx.remote_query().query_id).exhausted
@@ -118,6 +141,66 @@ def test_restart_resumes_from_the_persisted_cursor(tmp_path):
     assert outcome.resumed is True
     assert outcome.pages_read == 2
     assert outcome.candidate_count == 2
+
+
+def test_acquisition_scope_round_trip_and_identity_bind_the_exact_universe(
+        workspace):
+    from acquisition import AcquisitionScope, ProviderQuota
+
+    request = AcquisitionRequest(
+        query=fx.local_query(),
+        target_spatial=fx.target_bbox(),
+        target_temporal=fx.target_window(),
+    )
+    limits = AcquisitionLimits(max_pages_per_query=3)
+    quota = ProviderQuota(max_metadata_calls=7, max_payload_calls=11,
+                          max_bytes=4096)
+    descriptor = fx.make_local_connector().descriptor
+    scope = AcquisitionScope.bind(
+        (request,), (), (descriptor,), limits, quota)
+
+    assert AcquisitionScope.from_dict(scope.to_dict()) == scope
+    assert scope.scope_id == scope.expected_id()
+
+    changed = AcquisitionScope.bind(
+        (request,), (), (descriptor,),
+        AcquisitionLimits(max_pages_per_query=4), quota)
+    assert changed.scope_id != scope.scope_id
+
+    tampered = scope.to_dict()
+    tampered["quota"]["max_bytes"] += 1
+    with pytest.raises(ValueError, match="identity does not verify"):
+        AcquisitionScope.from_dict(tampered)
+
+
+def test_expansion_identity_cannot_conflate_different_empty_query_scopes(
+        tmp_path):
+    from acquisition import ProviderQuota
+
+    limits = AcquisitionLimits(max_pages_per_query=1)
+    quota = ProviderQuota()
+    query = fx.remote_query()
+    # Both searches activate the same page limit before they can bind a
+    # complete manifest.  Their exact query scopes must still distinguish the
+    # availability snapshots.
+    def run(tag, *, bind):
+        store = PlanningSessionStore(tmp_path / f"{tag}.sqlite3")
+        shards = ManifestShardStore(tmp_path / f"{tag}-shards")
+        connector = fx.make_remote_connector(page_size=1)
+        return AcquisitionSearch(
+            store, shards, (connector,), limits=limits, quota=quota,
+        ).discover(
+            "same-session-id",
+            (AcquisitionRequest(
+                query=query,
+                target_spatial=fx.target_bbox(),
+                target_temporal=fx.target_window(), bind=bind),),
+        )
+
+    first = run("first", bind=True)
+    second = run("second", bind=False)
+    assert first.scope.scope_id != second.scope.scope_id
+    assert first.expansion_id != second.expansion_id
 
 
 def test_an_exhausted_query_is_not_re_paginated_on_a_later_pass(tmp_path):
@@ -209,6 +292,33 @@ def test_truncation_is_persisted_so_a_restart_cannot_forget_it(workspace):
         in session_store.limits_for("s1")
 
 
+def test_a_restart_cannot_relabel_a_truncated_session_complete(workspace):
+    """Later exhaustion does not erase an earlier omitted frontier."""
+    session_store, _shards = workspace
+    remote = fx.make_remote_connector(page_size=1)
+    request = AcquisitionRequest(
+        query=fx.remote_query(),
+        target_spatial=fx.target_bbox(),
+        target_temporal=fx.target_window(),
+    )
+    first = _search(
+        workspace, (remote,),
+        limits=AcquisitionLimits(max_pages_per_query=1),
+    ).discover("s1", (request,))
+    assert not first.complete
+
+    # A fresh process may not widen the pre-provider durable scope and relabel
+    # those prior pages as a complete search.
+    calls_before = remote.search_calls
+    with pytest.raises(ValueError, match="another acquisition scope"):
+        _search(
+            workspace, (remote,),
+            limits=AcquisitionLimits(max_pages_per_query=50),
+        ).discover("s1", (request,))
+    assert remote.search_calls == calls_before
+    assert session_store.snapshot_id_for("s1") is None
+
+
 def test_expansion_completeness_and_reasons_cannot_disagree(workspace):
     expansion = _search(workspace, (fx.make_local_connector(),)).discover(
         "s1", (AcquisitionRequest(query=fx.local_query(),
@@ -218,7 +328,7 @@ def test_expansion_completeness_and_reasons_cannot_disagree(workspace):
     assert expansion.expansion_id == expansion.expected_id()
 
 
-def test_truncated_discovery_flows_into_the_existing_upstream_channel(
+def test_truncated_discovery_binds_identity_limits_and_reasons_in_a_layer(
         workspace):
     remote = fx.make_remote_connector(page_size=1)
     expansion = _search(workspace, (remote,),
@@ -227,13 +337,20 @@ def test_truncated_discovery_flows_into_the_existing_upstream_channel(
         "s1", (AcquisitionRequest(query=fx.remote_query(),
                                   target_spatial=fx.target_bbox(),
                                   target_temporal=fx.target_window()),))
-    upstream = UpstreamCompleteness.from_layer(
-        expansion.complete, expansion.limit_codes)
-    kwargs = upstream.resolver_kwargs()
-    # Exactly the two keyword arguments Stage 4 already added, no third one.
-    assert set(kwargs) == {"upstream_discovery_complete", "upstream_limit_codes"}
-    assert kwargs["upstream_discovery_complete"] is False
-    assert "MAX_PAGES_PER_QUERY" in kwargs["upstream_limit_codes"]
+    layer = expansion.discovery_layer()
+
+    assert DiscoveryLayerCertificate.from_dict(layer.to_dict()) == layer
+    assert layer.expansion_id == expansion.expansion_id
+    assert layer.source_ids == (fx.REMOTE_SOURCE_ID,)
+    assert layer.complete is False
+    assert "MAX_PAGES_PER_QUERY" in layer.limit_codes
+    assert {item.name for item in layer.limits} == {
+        "connector_deadline_s",
+        "max_assets_per_query",
+        "max_pages_per_query",
+        "max_queries",
+        "max_rounds",
+    }
 
 
 def test_upstream_layers_merge_by_conjunction_and_union():

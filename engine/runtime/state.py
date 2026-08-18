@@ -12,6 +12,8 @@ from typing import Any, Iterable, Iterator
 
 from .identity import strict_canonical_json, strict_hash, strict_json_loads
 from .types import (
+    ArtifactRecipe,
+    AttemptInputReceipt,
     AttemptSpec,
     AttemptState,
     BoundExecutionGraph,
@@ -84,6 +86,18 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
   FOREIGN KEY(run_id, upstream_task_id) REFERENCES tasks(run_id, task_id),
   FOREIGN KEY(run_id, downstream_task_id) REFERENCES tasks(run_id, task_id)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS task_external_inputs (
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  input_name TEXT NOT NULL,
+  artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+  source_run_id TEXT NOT NULL,
+  recipe_id TEXT NOT NULL REFERENCES artifact_recipes(recipe_id),
+  manifest_path TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  PRIMARY KEY(run_id, task_id, input_name),
+  FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
+) STRICT;
 CREATE TABLE IF NOT EXISTS attempts (
   attempt_id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL,
@@ -108,6 +122,13 @@ CREATE TABLE IF NOT EXISTS attempts (
   UNIQUE(run_id, task_id, fencing_token)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS attempts_active_idx ON attempts(state, updated_at);
+CREATE TABLE IF NOT EXISTS attempt_resource_reservations (
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+  site_id TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  reserved_at REAL NOT NULL,
+  released_at REAL
+) STRICT;
 CREATE TABLE IF NOT EXISTS task_leases (
   run_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
@@ -246,6 +267,24 @@ CREATE TABLE IF NOT EXISTS artifact_catalog_projection (
     REFERENCES artifact_commits(run_id, recipe_id),
   FOREIGN KEY(artifact_id) REFERENCES artifacts(artifact_id)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS cube_projection_outbox (
+  run_id TEXT NOT NULL,
+  recipe_id TEXT NOT NULL,
+  artifact_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('PENDING','PROJECTED','FAILED')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  projection_id TEXT,
+  entry_id TEXT,
+  created_at REAL NOT NULL,
+  projected_at REAL,
+  PRIMARY KEY(run_id, recipe_id),
+  FOREIGN KEY(run_id, recipe_id)
+    REFERENCES artifact_commits(run_id, recipe_id),
+  FOREIGN KEY(artifact_id) REFERENCES artifacts(artifact_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS cube_projection_outbox_state
+  ON cube_projection_outbox(state, created_at, run_id, recipe_id);
 """.replace(") STRICT;", ");")
 
 
@@ -297,6 +336,35 @@ _ATTEMPT_TRANSITIONS: dict[AttemptState, set[AttemptState]] = {
     AttemptState.CANCELLED: set(),
 }
 
+_ACTIVE_RESERVATION_STATES = (
+    AttemptState.CREATED,
+    AttemptState.SUBMITTING,
+    AttemptState.SUBMISSION_UNKNOWN,
+    AttemptState.SUBMITTED,
+    AttemptState.RUNNING,
+    AttemptState.RESULT_READY,
+)
+_RESOURCE_ENVELOPE_FIELDS = frozenset(
+    {"cpu_cores", "memory_mb", "gpus", "scratch_mb"})
+
+
+def _reservation_envelope(value: dict[str, Any]) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != _RESOURCE_ENVELOPE_FIELDS:
+        raise ValueError(
+            "reservation envelope must declare CPU, memory, GPU, and scratch")
+    result: dict[str, int] = {}
+    for name in sorted(_RESOURCE_ENVELOPE_FIELDS):
+        amount = value[name]
+        if (isinstance(amount, bool) or not isinstance(amount, int)
+                or amount < 0):
+            raise ValueError(
+                f"reservation envelope {name} must be a non-negative integer")
+        result[name] = amount
+    if result["cpu_cores"] < 1 or result["memory_mb"] < 1:
+        raise ValueError(
+            "reservation envelope requires at least one core and some memory")
+    return result
+
 
 class ControllerLock:
     def __init__(self, path: Path) -> None:
@@ -319,6 +387,34 @@ class AttemptRecord:
     spec: AttemptSpec
     state: AttemptState
     handle: ExternalHandle | None
+
+
+@dataclass(frozen=True)
+class AttemptReservationRecord:
+    """Durable reservation identity for one currently active attempt.
+
+    Older attempts may have no reservation row because the Stage-8 bridge
+    originally kept this state only in memory.  A restarting controller must
+    adopt those attempts before dispatching anything else.
+    """
+
+    spec: AttemptSpec
+    state: AttemptState
+    site_id: str | None
+    envelope: dict[str, int] | None
+    reserved_at: float | None
+    released_at: float | None
+
+
+@dataclass(frozen=True)
+class CommittedExternalArtifact:
+    """Authoritative metadata for an artifact eligible as an external input."""
+
+    artifact_id: str
+    source_run_id: str
+    recipe: ArtifactRecipe
+    manifest_path: str
+    content_sha256: str
 
 
 class RuntimeStore:
@@ -425,6 +521,12 @@ class RuntimeStore:
                 "VALUES(?,?,?,?,?)", (run_id, graph.plan_id,
                                       RunState.RUNNING.value, now, now))
             for task in graph.tasks:
+                external = {
+                    binding.input_name:
+                        self._resolve_committed_external_artifact(
+                            con, binding.artifact_id)
+                    for binding in task.external_inputs
+                }
                 unmet = len(task.inputs)
                 state = TaskState.READY if unmet == 0 else TaskState.WAITING
                 con.execute(
@@ -434,6 +536,16 @@ class RuntimeStore:
                     (run_id, task.task_id, task.key,
                      strict_canonical_json(task.to_dict()), state.value,
                      unmet, now if state is TaskState.READY else None))
+                for input_name, artifact in sorted(external.items()):
+                    con.execute(
+                        "INSERT INTO task_external_inputs"
+                        "(run_id,task_id,input_name,artifact_id,source_run_id,"
+                        " recipe_id,manifest_path,content_sha256) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (run_id, task.task_id, input_name,
+                         artifact.artifact_id, artifact.source_run_id,
+                         artifact.recipe.recipe_id, artifact.manifest_path,
+                         artifact.content_sha256))
                 for recipe in task.outputs:
                     recipe_json = strict_canonical_json(
                         __import__("dataclasses").asdict(recipe))
@@ -496,6 +608,96 @@ class RuntimeStore:
             raise KeyError(run_id)
         return RunState(row[0])
 
+    def cancel_run_if_never_launched(
+        self, run_id: str, expected_plan_id: str,
+    ) -> RunState:
+        """Prove a same-node run never launched, then cancel it durably.
+
+        The controller file lock is the liveness proof: a live controller may
+        still create an attempt and therefore prevents reconciliation.  Under
+        that lock, zero attempt rows, zero commits, zero task attempt counts,
+        and no leases make cancellation safe.  Replaying after a crash between
+        RuntimeStore cancellation and an outer control-store release is
+        idempotent.
+        """
+        if (not isinstance(expected_plan_id, str)
+                or len(expected_plan_id) != 64
+                or any(value not in "0123456789abcdef"
+                       for value in expected_plan_id)):
+            raise ValueError("expected_plan_id must be a SHA-256 digest")
+        lock = ControllerLock(self.db_path.parent / "controller.lock")
+        try:
+            with self.transaction() as con:
+                run = con.execute(
+                    "SELECT plan_id,state FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if run is None:
+                    raise KeyError(run_id)
+                if run[0] != expected_plan_id:
+                    raise RuntimeError(
+                        "unlaunched reconciliation resolved another plan")
+                attempts = int(con.execute(
+                    "SELECT COUNT(*) FROM attempts WHERE run_id=?", (run_id,),
+                ).fetchone()[0])
+                commits = int(con.execute(
+                    "SELECT COUNT(*) FROM artifact_commits WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()[0])
+                leases = int(con.execute(
+                    "SELECT COUNT(*) FROM task_leases WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()[0])
+                tasks = con.execute(
+                    "SELECT task_id,state,attempt_count,current_attempt_id "
+                    "FROM tasks WHERE run_id=? ORDER BY task_id", (run_id,),
+                ).fetchall()
+                if (attempts or commits or leases
+                        or any(int(row[2]) != 0 or row[3] is not None
+                               for row in tasks)):
+                    raise RuntimeError(
+                        "runtime run has launch/commit evidence and cannot be "
+                        "released as never launched")
+                current = RunState(run[1])
+                if current is RunState.RUNNING:
+                    for row in tasks:
+                        state = TaskState(row[1])
+                        if state is TaskState.CANCELLED:
+                            continue
+                        if TaskState.CANCELLED not in _TASK_TRANSITIONS[state]:
+                            raise RuntimeError(
+                                "unlaunched run contains a non-cancellable "
+                                f"task state {state.value}")
+                        self._transition_task(
+                            con, run_id, row[0], state, TaskState.CANCELLED,
+                            "NeverLaunchedRunReconciled", {})
+                    con.execute(
+                        "UPDATE wake_conditions SET status='CONSUMED' "
+                        "WHERE run_id=? AND status='ACTIVE'", (run_id,),
+                    )
+                    changed = con.execute(
+                        "UPDATE runs SET state=?,state_version=state_version+1,"
+                        "updated_at=? WHERE run_id=? AND state=?",
+                        (RunState.CANCELLED.value, time.time(), run_id,
+                         RunState.RUNNING.value),
+                    )
+                    if changed.rowcount != 1:
+                        raise RuntimeError(
+                            "unlaunched run cancellation compare-and-swap failed")
+                    self._event(
+                        con, f"run:{run_id}:never-launched-cancelled", run_id,
+                        "run", run_id, RunState.RUNNING.value,
+                        RunState.CANCELLED.value,
+                        "NeverLaunchedRunReconciled", {})
+                    return RunState.CANCELLED
+                if current in {RunState.CANCELLED, RunState.FAILED}:
+                    return current
+                raise RuntimeError(
+                    f"run state {current.value} cannot prove never-launched "
+                    "reconciliation")
+        finally:
+            lock.close()
+
     def task_state(self, run_id: str, task_id: str) -> TaskState:
         with self.connect() as con:
             row = con.execute(
@@ -529,6 +731,15 @@ class RuntimeStore:
                 (run_id, TaskState.READY.value, now)).fetchall()
         return [BoundTask.from_dict(strict_json_loads(row[0])) for row in rows]
 
+    def ready_task_identities(self) -> frozenset[tuple[str, str]]:
+        """Global READY set used to bound the controller's aging cache."""
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT run_id,task_id FROM tasks WHERE state=?",
+                (TaskState.READY.value,),
+            ).fetchall()
+        return frozenset((row[0], row[1]) for row in rows)
+
     def fail_ready_task_preflight(self, run_id: str, task_id: str,
                                   error: str) -> None:
         """Reject an infeasible READY task before creating an attempt."""
@@ -547,24 +758,155 @@ class RuntimeStore:
                 (time.time(), run_id, task_id))
 
     def active_attempt_count(self, run_id: str) -> int:
-        active = tuple(state.value for state in (
-            AttemptState.CREATED, AttemptState.SUBMITTING,
-            AttemptState.SUBMISSION_UNKNOWN, AttemptState.SUBMITTED,
-            AttemptState.RUNNING, AttemptState.RESULT_READY))
+        active = tuple(state.value for state in _ACTIVE_RESERVATION_STATES)
         placeholders = ",".join("?" for _ in active)
         with self.connect() as con:
             return int(con.execute(
                 f"SELECT COUNT(*) FROM attempts WHERE run_id=? AND state IN ({placeholders})",
                 (run_id, *active)).fetchone()[0])
 
+    def active_attempt_reservations(self) -> tuple[AttemptReservationRecord, ...]:
+        """All durable attempts that must consume capacity before dispatch.
+
+        This query is deliberately global across runs.  A controller can tick
+        one run while another run still owns a local process, and capacity is
+        a property of the node rather than of whichever run was ticked last.
+        """
+        active = tuple(state.value for state in _ACTIVE_RESERVATION_STATES)
+        placeholders = ",".join("?" for _ in active)
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT a.spec_json,a.state,r.site_id,r.envelope_json,"
+                "r.reserved_at,r.released_at FROM attempts a "
+                "LEFT JOIN attempt_resource_reservations r "
+                "ON r.attempt_id=a.attempt_id "
+                f"WHERE a.state IN ({placeholders}) "
+                "ORDER BY a.created_at,a.attempt_id",
+                active,
+            ).fetchall()
+        result = []
+        for row in rows:
+            envelope = None
+            if row[3] is not None:
+                decoded = strict_json_loads(row[3])
+                envelope = _reservation_envelope(decoded)
+            result.append(AttemptReservationRecord(
+                spec=AttemptSpec.from_dict(strict_json_loads(row[0])),
+                state=AttemptState(row[1]),
+                site_id=row[2],
+                envelope=envelope,
+                reserved_at=row[4],
+                released_at=row[5],
+            ))
+        return tuple(result)
+
+    def adopt_attempt_reservation(
+            self, attempt_id: str, site_id: str,
+            envelope: dict[str, Any],
+    ) -> None:
+        """Durably bind a pre-Stage-8R active attempt to reconstructed capacity."""
+        if not isinstance(site_id, str) or not site_id.strip():
+            raise ValueError("attempt reservation site cannot be empty")
+        canonical = _reservation_envelope(envelope)
+        active = tuple(state.value for state in _ACTIVE_RESERVATION_STATES)
+        placeholders = ",".join("?" for _ in active)
+        now = time.time()
+        with self.transaction() as con:
+            row = con.execute(
+                f"SELECT state FROM attempts WHERE attempt_id=? "
+                f"AND state IN ({placeholders})",
+                (attempt_id, *active),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "cannot adopt a reservation for a non-active attempt")
+            existing = con.execute(
+                "SELECT site_id,envelope_json,released_at "
+                "FROM attempt_resource_reservations WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            encoded = strict_canonical_json(canonical)
+            if existing is not None:
+                if (existing[0] != site_id or existing[1] != encoded
+                        or existing[2] is not None):
+                    raise RuntimeError(
+                        "durable attempt reservation identity conflict")
+                return
+            con.execute(
+                "INSERT INTO attempt_resource_reservations"
+                "(attempt_id,site_id,envelope_json,reserved_at) "
+                "VALUES(?,?,?,?)",
+                (attempt_id, site_id, encoded, now),
+            )
+
+    def release_attempt_reservation(self, attempt_id: str) -> None:
+        """Mark a durable reservation released after its attempt is terminal."""
+        with self.transaction() as con:
+            row = con.execute(
+                "SELECT state FROM attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(attempt_id)
+            if AttemptState(row[0]) in _ACTIVE_RESERVATION_STATES:
+                raise RuntimeError(
+                    "cannot release capacity while its attempt is active")
+            con.execute(
+                "UPDATE attempt_resource_reservations "
+                "SET released_at=COALESCE(released_at,?) WHERE attempt_id=?",
+                (time.time(), attempt_id),
+            )
+
+    def sweep_terminal_attempt_reservations(self) -> tuple[str, ...]:
+        """Close the crash window after terminal state but before release.
+
+        Attempt state is authoritative.  Therefore an unreleased reservation
+        whose attempt is already terminal cannot consume node capacity after a
+        restart.  The update is idempotent and records one common recovery
+        timestamp for the exact set repaired by this sweep.
+        """
+        active = tuple(state.value for state in _ACTIVE_RESERVATION_STATES)
+        placeholders = ",".join("?" for _ in active)
+        with self.transaction() as con:
+            rows = con.execute(
+                "SELECT r.attempt_id FROM attempt_resource_reservations r "
+                "JOIN attempts a ON a.attempt_id=r.attempt_id "
+                "WHERE r.released_at IS NULL "
+                f"AND a.state NOT IN ({placeholders}) "
+                "ORDER BY r.attempt_id",
+                active,
+            ).fetchall()
+            attempt_ids = tuple(row[0] for row in rows)
+            if attempt_ids:
+                repaired = ",".join("?" for _ in attempt_ids)
+                con.execute(
+                    "UPDATE attempt_resource_reservations SET released_at=? "
+                    f"WHERE released_at IS NULL AND attempt_id IN ({repaired})",
+                    (time.time(), *attempt_ids),
+                )
+        return attempt_ids
+
     def create_attempt(self, run_id: str, task: BoundTask,
                        deployment_id: str, provider: str, stage_dir: str,
-                       controller_epoch: int) -> AttemptSpec:
+                       controller_epoch: int, *,
+                       reservation_site_id: str | None = None,
+                       reservation_envelope: dict[str, Any] | None = None,
+                       ) -> AttemptSpec:
         now = time.time()
         if not isinstance(provider, str) or not provider:
             raise ValueError("attempt provider cannot be empty")
         if not isinstance(stage_dir, str) or not Path(stage_dir).is_absolute():
             raise ValueError("attempt stage_dir must be an absolute path")
+        if (reservation_site_id is None) != (reservation_envelope is None):
+            raise ValueError(
+                "attempt reservation site and envelope must be supplied together")
+        durable_envelope = None
+        if reservation_site_id is not None:
+            if not isinstance(reservation_site_id, str) \
+                    or not reservation_site_id.strip():
+                raise ValueError("attempt reservation site cannot be empty")
+            assert reservation_envelope is not None
+            durable_envelope = _reservation_envelope(reservation_envelope)
         with self.transaction() as con:
             run = con.execute(
                 "SELECT state FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -599,7 +941,7 @@ class RuntimeStore:
                 attempt_number=attempt_number,
                 fencing_token=fence,
                 provider=provider,
-                input_artifacts=self._input_manifest_paths(
+                input_artifacts=self._input_artifact_receipts(
                     con, run_id, task.task_id),
                 stage_dir=stage_dir,
                 created_at=now,
@@ -613,6 +955,14 @@ class RuntimeStore:
                  spec.attempt_token, deployment_id,
                  strict_canonical_json(spec.to_dict()), provider, stage_dir,
                  AttemptState.CREATED.value, now, now))
+            if reservation_site_id is not None:
+                assert durable_envelope is not None
+                con.execute(
+                    "INSERT INTO attempt_resource_reservations"
+                    "(attempt_id,site_id,envelope_json,reserved_at) "
+                    "VALUES(?,?,?,?)",
+                    (aid, reservation_site_id,
+                     strict_canonical_json(durable_envelope), now))
             self._transition_task(
                 con, run_id, task.task_id, TaskState.READY,
                 TaskState.RUNNING, "AttemptCreated", {"attempt_id": aid})
@@ -1103,6 +1453,18 @@ class RuntimeStore:
                 "WHERE s.run_id=? AND s.task_id=? AND s.output_name=?",
                 (run_id, task_id, output_name)).fetchone()
 
+    def committed_external_artifact(
+            self, artifact_id: str) -> CommittedExternalArtifact:
+        """Resolve one artifact only through an authoritative Stage-1 commit.
+
+        This is the read boundary used by partition compilation to inspect the
+        frozen scientific descriptor.  Run creation repeats the lookup inside
+        its own transaction, so a caller cannot substitute this result for a
+        different graph binding between planning and registration.
+        """
+        with self.connect() as con:
+            return self._resolve_committed_external_artifact(con, artifact_id)
+
     def project_catalog_outbox(self, *, limit: int = 100) -> int:
         """Idempotently project committed artifacts into the catalog view.
 
@@ -1161,21 +1523,137 @@ class RuntimeStore:
                 projected += 1
         return projected
 
-    def _input_manifest_paths(self, con: sqlite3.Connection,
-                              run_id: str, downstream_task_id: str) -> dict[str, str]:
-        rows = con.execute(
-            "SELECT d.input_name,a.manifest_path FROM task_dependencies d "
+    def _input_artifact_receipts(
+            self, con: sqlite3.Connection, run_id: str,
+            downstream_task_id: str) -> dict[str, AttemptInputReceipt]:
+        internal_rows = con.execute(
+            "SELECT d.input_name,a.artifact_id,a.recipe_id,a.manifest_path,"
+            "a.content_sha256,a.manifest_json FROM task_dependencies d "
             "JOIN task_output_slots s ON s.run_id=d.run_id "
             "AND s.task_id=d.upstream_task_id AND s.output_name=d.upstream_output "
             "JOIN artifacts a ON a.artifact_id=s.artifact_id "
+            "AND a.recipe_id=s.recipe_id "
+            "JOIN artifact_commits c ON c.run_id=s.run_id "
+            "AND c.task_id=s.task_id AND c.output_name=s.output_name "
+            "AND c.artifact_id=s.artifact_id AND c.recipe_id=s.recipe_id "
             "WHERE d.run_id=? AND d.downstream_task_id=? AND d.satisfied=1",
             (run_id, downstream_task_id)).fetchall()
-        expected = int(con.execute(
+        expected_internal = int(con.execute(
             "SELECT COUNT(*) FROM task_dependencies WHERE run_id=? AND downstream_task_id=?",
             (run_id, downstream_task_id)).fetchone()[0])
-        if len(rows) != expected:
+        if len(internal_rows) != expected_internal:
             raise RuntimeError("task became READY before all artifacts committed")
-        return {row[0]: row[1] for row in rows}
+        external_rows = con.execute(
+            "SELECT e.input_name,e.artifact_id,e.recipe_id,e.manifest_path,"
+            "e.content_sha256,a.manifest_json "
+            "FROM task_external_inputs e "
+            "JOIN artifacts a ON a.artifact_id=e.artifact_id "
+            "AND a.recipe_id=e.recipe_id "
+            "AND a.manifest_path=e.manifest_path "
+            "AND a.content_sha256=e.content_sha256 "
+            "WHERE e.run_id=? AND e.task_id=? "
+            "AND EXISTS (SELECT 1 FROM artifact_commits c "
+            "            WHERE c.run_id=e.source_run_id "
+            "            AND c.artifact_id=e.artifact_id "
+            "            AND c.recipe_id=e.recipe_id)",
+            (run_id, downstream_task_id)).fetchall()
+        task_row = con.execute(
+            "SELECT task_json FROM tasks WHERE run_id=? AND task_id=?",
+            (run_id, downstream_task_id)).fetchone()
+        if task_row is None:
+            raise KeyError((run_id, downstream_task_id))
+        task = BoundTask.from_dict(strict_json_loads(task_row[0]))
+        expected_external = {
+            value.input_name: value.artifact_id
+            for value in task.external_inputs
+        }
+        actual_external = {row[0]: row[1] for row in external_rows}
+        if actual_external != expected_external:
+            raise RuntimeError(
+                "external artifact input binding lost authoritative commit")
+        result = {
+            row[0]: self._attempt_input_receipt(row)
+            for row in internal_rows
+        }
+        result.update({
+            row[0]: self._attempt_input_receipt(row)
+            for row in external_rows
+        })
+        if len(result) != expected_internal + len(expected_external):
+            raise RuntimeError("attempt input ports are not uniquely bound")
+        return result
+
+    @staticmethod
+    def _attempt_input_receipt(row: sqlite3.Row) -> AttemptInputReceipt:
+        manifest = strict_json_loads(row[5])
+        required = {
+            "schema", "artifact_id", "recipe_id", "media_type",
+            "content_sha256", "size_bytes", "object_path",
+        }
+        if (not isinstance(manifest, dict) or set(manifest) != required
+                or manifest["schema"] != "stage1-artifact-manifest-v1"
+                or manifest["artifact_id"] != row[1]
+                or manifest["recipe_id"] != row[2]
+                or manifest["content_sha256"] != row[4]):
+            raise RuntimeError(
+                "attempt input manifest conflicts with artifact authority")
+        return AttemptInputReceipt(
+            artifact_id=row[1],
+            recipe_id=row[2],
+            content_sha256=row[4],
+            size_bytes=manifest["size_bytes"],
+            manifest_path=row[3],
+        )
+
+    def _resolve_committed_external_artifact(
+            self, con: sqlite3.Connection,
+            artifact_id: str) -> CommittedExternalArtifact:
+        row = con.execute(
+            "SELECT a.artifact_id,c.run_id,a.recipe_id,r.recipe_json,"
+            " a.manifest_path,a.manifest_json,a.content_sha256 "
+            "FROM artifacts a "
+            "JOIN artifact_recipes r ON r.recipe_id=a.recipe_id "
+            "JOIN artifact_commits c ON c.artifact_id=a.artifact_id "
+            "AND c.recipe_id=a.recipe_id "
+            "WHERE a.artifact_id=? "
+            "ORDER BY c.committed_at,c.run_id LIMIT 1",
+            (artifact_id,)).fetchone()
+        if row is None:
+            raise ValueError(
+                f"external artifact {artifact_id!r} has no authoritative commit")
+        recipe = ArtifactRecipe.from_dict(strict_json_loads(row[3]))
+        if recipe.recipe_id != row[2]:
+            raise RuntimeError(
+                "authoritative external artifact recipe identity changed")
+        manifest = strict_json_loads(row[5])
+        required = {
+            "schema", "artifact_id", "recipe_id", "media_type",
+            "content_sha256", "size_bytes", "object_path",
+        }
+        if (not isinstance(manifest, dict) or set(manifest) != required
+                or manifest["schema"] != "stage1-artifact-manifest-v1"
+                or manifest["artifact_id"] != row[0]
+                or manifest["recipe_id"] != row[2]
+                or manifest["content_sha256"] != row[6]
+                or manifest["media_type"] != recipe.media_type):
+            raise RuntimeError(
+                "authoritative external artifact manifest metadata conflicts")
+        manifest_path = Path(row[4])
+        if not manifest_path.is_absolute():
+            raise RuntimeError(
+                "authoritative external artifact manifest path is not absolute")
+        try:
+            on_disk = strict_json_loads(
+                manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "authoritative external artifact manifest is unavailable") from exc
+        if on_disk != manifest:
+            raise RuntimeError(
+                "authoritative external artifact manifest changed on disk")
+        return CommittedExternalArtifact(
+            artifact_id=row[0], source_run_id=row[1], recipe=recipe,
+            manifest_path=str(manifest_path), content_sha256=row[6])
 
     def _insert_attempt_wakes(self, con: sqlite3.Connection,
                               spec: AttemptSpec, task_version: int) -> None:

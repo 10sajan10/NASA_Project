@@ -269,8 +269,8 @@ now pins the `transform.*` operations exactly as well.
   block cover is same-CRS and equal-area. Across a reprojection it is not, and
   nothing here implements the area-weighted version that case needs.
 - **Nothing is wired end to end.** The transformation can be declared and
-  executed on a `field-json-v1` value, but no capability in the catalog emits
-  one, and the WRF adapter does not produce `field-json-v1`.
+  executed on a `field-json-v2` value, but no capability in the catalog emits
+  one, and the WRF adapter does not produce `field-json-v2`.
 - **Only the 12:00 files were read.** The georeference is time-invariant, so
   this is sound for grid geometry, but no time series was inspected.
 - **It does not unblock Stage 9B.** R1 still has no promoted golden fixture and

@@ -29,6 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from grid_convention import FIELD_JSON_SCHEMA
+
 from capabilities import (
     BinderRef,
     BindingParameterization,
@@ -57,6 +59,7 @@ from contracts import (
     EvidenceProfile,
     EvidenceRequirement,
     EvidenceSnapshot,
+    GridDescriptor,
     MetricDefinition,
     MetricEvaluator,
     MissingPolicy,
@@ -66,14 +69,16 @@ from contracts import (
     Requirement,
     RequirementUse,
     SampleSemantics,
+    ScaleBasis,
     SpatialRequirement,
+    SpatialScale,
     TemporalKind,
     TemporalRequirement,
     TemporalSupport,
     ValueConstraint,
 )
 
-SCHEMA_VERSION = "example-field-v1"
+SCHEMA_VERSION = FIELD_JSON_SCHEMA
 REPRESENTATION = "application/json"
 SCALAR_SCHEMA = "example-scalar-v1"
 
@@ -117,8 +122,10 @@ MINIMUM_COST_TOTAL = (CONSEQUENCE_COST + COARSE_FLOW_COST + MODEL_COST
 DIRECT_PATH_TOTAL = (CONSEQUENCE_COST + DIRECT_FLOW_COST + TERRAIN_COST
                      + FUEL_COST + IGNITION_COST)                    # 13
 
-TIME_STEPS = ("2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z",
-              "2026-01-01T02:00:00Z")
+TIME_STEPS = (
+    "2026-01-01T00:00:00Z",
+    "2026-01-01T01:00:00Z",
+)
 X_COORDS = (0.0, 2.0, 4.0)
 Y_COORDS = (0.0, 2.0, 4.0)
 
@@ -155,16 +162,30 @@ def _window() -> TemporalSupport:
         sample_semantics=SampleSemantics.INSTANTANEOUS)
 
 
+def _field_grid() -> GridDescriptor:
+    return GridDescriptor(
+        CRS, AXES, (len(Y_COORDS), len(X_COORDS)),
+        ("2", "0", "0", "0", "2", "0"),
+        SpatialScale("2", "2", "degree", ScaleBasis.ANGULAR),
+    )
+
+
 def _field_descriptor(concept_id: str, origin: OriginClass, *,
                       bounds: tuple[str, str, str, str] = IN_SCOPE_BOUNDS,
                       units: str = UNITS) -> ArtifactDescriptor:
+    grid = _field_grid()
+    support = BBoxSupport(CRS, AXES, grid.support_bounds)
+    if not support.contains(BBoxSupport(CRS, AXES, bounds)):
+        raise ValueError("field payload grid does not contain requested bounds")
     return ArtifactDescriptor(
         concept_id=concept_id, schema_version=SCHEMA_VERSION,
         representation=REPRESENTATION, units=units,
-        spatial_support=BBoxSupport(CRS, AXES, bounds),
-        temporal_support=_window(), vertical_support=None, grid=None,
+        spatial_support=support,
+        temporal_support=_window(), vertical_support=None, grid=grid,
         native_resolution=None, origin=origin,
-        missingness=Missingness(MissingnessStatus.COMPLETE))
+        missingness=Missingness(MissingnessStatus.COMPLETE),
+        component_names=(("support",) if concept_id == TERRAIN_CONCEPT
+                         else ("flow",)))
 
 
 def _scalar_descriptor(concept_id: str) -> ArtifactDescriptor:
@@ -246,7 +267,8 @@ def _constant_spec(capability_id: str, descriptor: ArtifactDescriptor,
 
 def _field_payload(value: float, component: str = "flow") -> dict[str, Any]:
     return {
-        "schema": "field-json-v1", "crs": CRS,
+        "schema": "field-json-v2", "crs": CRS,
+        "axis_order": ["x", "y"],
         "x": list(X_COORDS), "y": list(Y_COORDS), "time": list(TIME_STEPS),
         "components": {component: [[[value for _ in X_COORDS]
                                     for _ in Y_COORDS] for _ in TIME_STEPS]},
@@ -258,7 +280,8 @@ def expected_result_field() -> dict[str, Any]:
     flow = COARSE_VALUE * MODEL_GAIN + TERRAIN_VALUE
     value = min(flow * FUEL_VALUE + TERRAIN_VALUE * IGNITION_VALUE, THRESHOLD)
     return {
-        "schema": "field-json-v1", "crs": CRS,
+        "schema": "field-json-v2", "crs": CRS,
+        "axis_order": ["x", "y"],
         "x": list(X_COORDS), "y": list(Y_COORDS), "time": list(TIME_STEPS),
         "components": {"flow": [[[value for _ in X_COORDS]
                                  for _ in Y_COORDS] for _ in TIME_STEPS]},
@@ -343,16 +366,10 @@ def make_stage6_fixture(
     # later satisfy, so the probe binding uses the ungated requirement.
     subject_probe_req = flow_requirement(require_evidence=False)
 
-    coarse_descriptor = _field_descriptor(FLOW_CONCEPT, OriginClass.OBSERVATION)
     # The coarse source is a different concept so it cannot itself satisfy the
     # contested flow requirement; only the model can turn it into one.
-    coarse_descriptor = ArtifactDescriptor(
-        concept_id=f"{FLOW_CONCEPT}.coarse", schema_version=SCHEMA_VERSION,
-        representation=REPRESENTATION, units=UNITS,
-        spatial_support=BBoxSupport(CRS, AXES, IN_SCOPE_BOUNDS),
-        temporal_support=_window(), vertical_support=None, grid=None,
-        native_resolution=None, origin=OriginClass.OBSERVATION,
-        missingness=Missingness(MissingnessStatus.COMPLETE))
+    coarse_descriptor = _field_descriptor(
+        f"{FLOW_CONCEPT}.coarse", OriginClass.OBSERVATION)
     terrain_descriptor = _field_descriptor(
         TERRAIN_CONCEPT, OriginClass.OBSERVATION)
     direct_descriptor = _field_descriptor(FLOW_CONCEPT, OriginClass.OBSERVATION)

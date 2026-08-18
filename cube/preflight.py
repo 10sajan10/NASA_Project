@@ -10,9 +10,9 @@ descriptors, so it can be settled before a single core-hour is spent.  This
 module bridges the legacy `SimulationGrid` to the typed contract in
 `contracts.placement` and reports on a whole publication plan at once.
 
-The bridge is exact rather than approximate: `SimulationGrid.transform` is
-already `Affine(pixel_m, 0, x0, 0, -pixel_m, y1)`, which is the same ordering
-`GridDescriptor.affine` uses.
+The bridge is exact rather than approximate. ``SimulationGrid`` stores raster
+outer edges while ``GridDescriptor`` stores first sample centres, so the bridge
+performs the explicit half-cell translation and no resampling.
 """
 from __future__ import annotations
 
@@ -31,12 +31,14 @@ from .grid import SimulationGrid
 def grid_descriptor(grid: SimulationGrid) -> GridDescriptor:
     """Describe a `SimulationGrid` in typed contract terms. Lossless."""
     pixel = repr(float(grid.pixel_m))
+    first_x = repr(float(grid.x0 + grid.pixel_m / 2.0))
+    first_y = repr(float(grid.y1 - grid.pixel_m / 2.0))
     return GridDescriptor(
         f"EPSG:{int(grid.crs_epsg)}",
         ("easting", "northing"),
         (int(grid.height), int(grid.width)),
-        (pixel, "0", repr(float(grid.x0)),
-         "0", repr(-float(grid.pixel_m)), repr(float(grid.y1))),
+        (pixel, "0", first_x,
+         "0", repr(-float(grid.pixel_m)), first_y),
         SpatialScale(pixel, pixel, "m"),
     )
 

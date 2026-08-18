@@ -20,8 +20,11 @@ from typing import Optional
 
 import duckdb
 
+from engine.runtime.identity import strict_canonical_json, strict_json_loads
+
 from .entries import (
     CubeEntry,
+    ProjectionAuthority,
     EntryInput,
     EntryNotFound,
     ResolutionPolicy,
@@ -106,6 +109,25 @@ CREATE TABLE IF NOT EXISTS entry_inputs (
     PRIMARY KEY (entry_id, port)
 );
 CREATE INDEX IF NOT EXISTS entry_inputs_input ON entry_inputs (input_entry_id);
+
+-- Stage 8R: authoritative RuntimeStore -> Cube projection receipts.  This is
+-- additive to the v3 immutable-entry model.  The receipt stores the complete
+-- scientific descriptor and exact runtime/artifact/lineage identities; it is
+-- committed in the same DuckDB transaction as the entry and all input edges.
+CREATE TABLE IF NOT EXISTS entry_projections (
+    projection_id  TEXT PRIMARY KEY,
+    entry_id       TEXT NOT NULL,
+    run_id         TEXT NOT NULL,
+    recipe_id      TEXT NOT NULL,
+    artifact_id    TEXT NOT NULL,
+    descriptor_id  TEXT NOT NULL,
+    projection_json TEXT NOT NULL,
+    projected_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (run_id, recipe_id),
+    UNIQUE (run_id, artifact_id)
+);
+CREATE INDEX IF NOT EXISTS entry_projections_artifact
+    ON entry_projections (run_id, artifact_id);
 """
 
 # Additive v1 -> v2 migration. `ADD COLUMN IF NOT EXISTS` makes this a
@@ -272,12 +294,49 @@ class Catalog:
     # ------------------------------------------------------------------
 
     def commit_entry(self, entry: CubeEntry) -> CubeEntry:
-        """Commit an entry immutably. Idempotent; never overwrites.
+        """Refuse caller-authored publication.
 
-        Re-deriving the same value from the same inputs yields the same
-        `entry_id`, so a repeat commit returns the entry already stored rather
-        than writing a second copy or mutating the first.
+        A content digest and a free-form producer string are not artifact
+        authority.  Production entries can only arrive through
+        :class:`cube.projection.CubeProjector`, which reconstructs and replays
+        the RuntimeStore commit.  The private fixture helper below exists only
+        so the Cube's resolution/lineage algebra can be tested in isolation.
         """
+        if not isinstance(entry, CubeEntry):
+            raise TypeError("Cube publication requires a typed CubeEntry")
+        raise PermissionError(
+            "raw CubeEntry publication is forbidden; an authoritative "
+            "RuntimeStore artifact projection is required")
+
+    def _insert_entry_rows(self, entry: CubeEntry, depth: int) -> None:
+        """The single place an entry row and its cascade edges are written.
+
+        Both the fixture path and the authoritative projection path go through
+        here, so the isolated semantic tests exercise exactly the rows
+        production writes rather than a parallel implementation that could
+        drift from it.
+        """
+        self.con.execute(
+            "INSERT INTO entries (entry_id, concept, kind, producer, "
+            "content_sha256, grid_json, depth, run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [entry.entry_id, entry.concept, entry.kind, entry.producer,
+             entry.content_sha256, entry.grid_json(), depth, entry.run_id])
+        for edge in entry.inputs:
+            self.con.execute(
+                "INSERT INTO entry_inputs (entry_id, port, input_entry_id) "
+                "VALUES (?, ?, ?)",
+                [entry.entry_id, edge.port, edge.entry_id])
+
+    def _commit_entry_for_test_fixture(self, entry: CubeEntry) -> CubeEntry:
+        """Internal-only constructor for isolated Cube semantic tests.
+
+        Runtime or application code must never use this path.  Its leading
+        underscore and explicit name make that non-authoritative scope visible
+        at every call site; no public alias exists.
+        """
+        if not isinstance(entry, CubeEntry):
+            raise TypeError("fixture publication requires a typed CubeEntry")
         existing = self.entry(entry.entry_id)
         if existing is not None:
             return existing
@@ -290,18 +349,154 @@ class Catalog:
                     f"{edge.entry_id[:12]} on port {edge.port!r}, which is not "
                     "committed; a cascade edge cannot point at nothing")
             depth = max(depth, parent.depth + 1)
-        self.con.execute(
-            "INSERT INTO entries (entry_id, concept, kind, producer, "
-            "content_sha256, grid_json, depth, run_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [entry.entry_id, entry.concept, entry.kind, entry.producer,
-             entry.content_sha256, entry.grid_json(), depth, entry.run_id])
-        for edge in entry.inputs:
-            self.con.execute(
-                "INSERT INTO entry_inputs (entry_id, port, input_entry_id) "
-                "VALUES (?, ?, ?)",
-                [entry.entry_id, edge.port, edge.entry_id])
+        self._insert_entry_rows(entry, depth)
         return self.entry(entry.entry_id)
+
+    def _commit_authoritative_projection(self, projection, authority):
+        """Apply a verified projection receipt atomically (projector only).
+
+        `authority` is unforgeable proof that the artifact was re-read and
+        re-hashed from disk.  Without it this boundary replayed only the
+        projection's *internal* identity, so a self-consistent receipt built by
+        hand published a Cube entry for an artifact that never existed.
+        """
+        # Local import avoids a catalog <-> projector import cycle.
+        from .projection import CubeEntryProjection
+
+        if not isinstance(projection, CubeEntryProjection):
+            raise TypeError("authoritative projection has the wrong type")
+        if not isinstance(authority, ProjectionAuthority):
+            raise PermissionError(
+                "authoritative Cube publication requires a minted "
+                "ProjectionAuthority; internal consistency is not authority")
+        if not authority.authorizes(projection.run_id, projection.artifact_id,
+                                    projection.content_sha256):
+            raise PermissionError(
+                "ProjectionAuthority was minted for a different artifact")
+        # The constructor verifies both projection_id and entry_id, but replay
+        # at this boundary protects against object construction tricks.
+        if (projection.expected_id() != projection.projection_id
+                or projection.entry().entry_id != projection.entry_id):
+            raise ValueError("authoritative Cube projection identity is invalid")
+        encoded = strict_canonical_json(projection.to_dict())
+        entry = projection.entry()
+
+        self.con.execute("BEGIN TRANSACTION")
+        try:
+            existing = self.con.execute(
+                "SELECT projection_json,entry_id FROM entry_projections "
+                "WHERE projection_id=?", [projection.projection_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != encoded or existing[1] != projection.entry_id:
+                    raise RuntimeError("Cube projection identity conflict")
+                stored = self.entry(projection.entry_id)
+                if stored is None or stored.entry_id != entry.entry_id:
+                    raise RuntimeError(
+                        "Cube projection receipt exists without its exact entry")
+                self.con.execute("COMMIT")
+                return stored
+
+            conflict = self.con.execute(
+                "SELECT projection_id FROM entry_projections WHERE "
+                "(run_id=? AND recipe_id=?) OR (run_id=? AND artifact_id=?)",
+                [projection.run_id, projection.recipe_id,
+                 projection.run_id, projection.artifact_id],
+            ).fetchone()
+            if conflict is not None:
+                raise RuntimeError(
+                    "another Cube projection already owns this runtime artifact")
+
+            depth = 0
+            for edge, source in zip(entry.inputs, projection.inputs):
+                parent_projection = self.con.execute(
+                    "SELECT recipe_id,entry_id FROM entry_projections "
+                    "WHERE run_id=? AND artifact_id=?",
+                    [source.source_run_id, source.artifact_id],
+                ).fetchone()
+                if (parent_projection is None
+                        or parent_projection[0] != source.recipe_id
+                        or parent_projection[1] != source.entry_id
+                        or edge.entry_id != source.entry_id
+                        or edge.port != source.port):
+                    raise EntryNotFound(
+                        "authoritative Cube lineage does not match the exact "
+                        "upstream artifact projection")
+                parent = self.entry(edge.entry_id)
+                if parent is None:
+                    raise EntryNotFound(
+                        "authoritative Cube lineage parent is not committed")
+                depth = max(depth, parent.depth + 1)
+
+            stored_entry = self.entry(entry.entry_id)
+            if stored_entry is None:
+                self._insert_entry_rows(entry, depth)
+            else:
+                # A repeat derivation in another run may legitimately reuse
+                # the same immutable Cube entry.  It must already have an
+                # authoritative receipt, and every entry field/edge/depth must
+                # be identical; fixture-authored rows cannot be promoted.
+                receipts = int(self.con.execute(
+                    "SELECT COUNT(*) FROM entry_projections WHERE entry_id=?",
+                    [entry.entry_id],
+                ).fetchone()[0])
+                if (receipts < 1
+                        or stored_entry.concept != entry.concept
+                        or stored_entry.kind != entry.kind
+                        or stored_entry.producer != entry.producer
+                        or stored_entry.content_sha256 != entry.content_sha256
+                        or stored_entry.grid != entry.grid
+                        or stored_entry.depth != depth
+                        or stored_entry.inputs != entry.inputs):
+                    raise RuntimeError(
+                        "existing Cube entry does not match this authoritative "
+                        "repeat derivation")
+            self.con.execute(
+                "INSERT INTO entry_projections"
+                "(projection_id,entry_id,run_id,recipe_id,artifact_id,"
+                "descriptor_id,projection_json) VALUES(?,?,?,?,?,?,?)",
+                [projection.projection_id, projection.entry_id,
+                 projection.run_id, projection.recipe_id,
+                 projection.artifact_id, projection.descriptor_id, encoded],
+            )
+            self.con.execute("COMMIT")
+        except BaseException:
+            self.con.execute("ROLLBACK")
+            raise
+        result = self.entry(entry.entry_id)
+        if result is None:  # pragma: no cover - transaction invariant
+            raise RuntimeError("Cube projection committed without an entry")
+        return result
+
+    def projection_for_artifact(self, run_id: str, artifact_id: str):
+        """Return the verified projection receipt for one runtime artifact."""
+        from .projection import CubeEntryProjection
+
+        row = self.con.execute(
+            "SELECT projection_id,entry_id,projection_json FROM entry_projections "
+            "WHERE run_id=? AND artifact_id=?", [run_id, artifact_id],
+        ).fetchone()
+        if row is None:
+            return None
+        value = CubeEntryProjection.from_dict(strict_json_loads(row[2]))
+        if value.projection_id != row[0] or value.entry_id != row[1]:
+            raise RuntimeError("persisted Cube projection receipt is corrupt")
+        return value
+
+    def projection(self, projection_id: str):
+        """Return one verified projection receipt by its content identity."""
+        from .projection import CubeEntryProjection
+
+        row = self.con.execute(
+            "SELECT entry_id,projection_json FROM entry_projections "
+            "WHERE projection_id=?", [projection_id],
+        ).fetchone()
+        if row is None:
+            return None
+        value = CubeEntryProjection.from_dict(strict_json_loads(row[1]))
+        if value.projection_id != projection_id or value.entry_id != row[0]:
+            raise RuntimeError("persisted Cube projection receipt is corrupt")
+        return value
 
     def _entry_from_row(self, row) -> CubeEntry:
         edges = tuple(

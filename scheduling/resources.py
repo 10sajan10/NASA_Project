@@ -291,6 +291,36 @@ class ReservationLedger:
             raise KeyError(
                 f"task {task_key!r} holds no reservation to release") from exc
 
+    def reservation(self, owner_id: str) -> Reservation | None:
+        """Return the live claim for one task/attempt owner, if present."""
+        return self._live.get(owner_id)
+
+    def rekey(self, owner_id: str, new_owner_id: str) -> Reservation:
+        """Move an already-granted claim to a durable attempt identity.
+
+        Dispatch must reserve before it creates an attempt.  Once the store
+        mints the attempt/fencing identity, this operation changes only the
+        ledger key: usage never drops to zero and is never counted twice.
+        """
+        if owner_id == new_owner_id:
+            try:
+                return self._live[owner_id]
+            except KeyError as exc:
+                raise KeyError(
+                    f"task {owner_id!r} holds no reservation to rekey") from exc
+        if new_owner_id in self._live:
+            raise ValueError(
+                f"task {new_owner_id!r} already holds a reservation")
+        try:
+            previous = self._live.pop(owner_id)
+        except KeyError as exc:
+            raise KeyError(
+                f"task {owner_id!r} holds no reservation to rekey") from exc
+        replacement = Reservation.bind(
+            new_owner_id, previous.site_id, previous.envelope)
+        self._live[new_owner_id] = replacement
+        return replacement
+
     def live_task_keys(self) -> tuple[str, ...]:
         return tuple(sorted(self._live))
 

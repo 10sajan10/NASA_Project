@@ -6,6 +6,7 @@ its size, and that a hole in coverage is reported rather than smoothed over.
 """
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from acquisition import (
     AssetExtent,
     AssetManifest,
     AssetRef,
+    AssemblyMode,
     ConditionalIdentityKind,
     CoverageStatus,
     ManifestShard,
@@ -169,6 +171,50 @@ def test_temporal_gap_is_reported():
     assessment = assess_coverage(
         (early,), target_spatial=target, target_temporal=_window())
     assert assessment.status is CoverageStatus.TEMPORAL_GAP
+
+
+@pytest.mark.parametrize(
+    ("temporal", "label"),
+    (
+        (TemporalSupport(
+            TemporalKind.SERIES, start=START, end=END, cadence_s="1800",
+            max_gap_s="0",
+            sample_semantics=SampleSemantics.INSTANTANEOUS), "cadence"),
+        (TemporalSupport(
+            TemporalKind.SERIES, start=START, end=END, cadence_s="3600",
+            anchor="2026-01-01T00:30:00Z", max_gap_s="0",
+            sample_semantics=SampleSemantics.INSTANTANEOUS), "alignment"),
+        (TemporalSupport(
+            TemporalKind.SERIES, start=START, end=END, cadence_s="3600",
+            max_gap_s="600",
+            sample_semantics=SampleSemantics.INSTANTANEOUS), "maximum-gap"),
+    ),
+)
+def test_coverage_jointly_enforces_timeline_contract(temporal, label):
+    target = BBoxSupport(CRS, AXES, ("0", "0", "4", "4"))
+    asset = _asset("whole", ("0", "0", "4", "4"))
+    asset = dataclasses.replace(
+        asset, extent=AssetExtent(asset.extent.spatial, temporal))
+    assessment = assess_coverage(
+        (asset,), target_spatial=target, target_temporal=_window())
+    assert assessment.status is CoverageStatus.TEMPORAL_CONTRACT_MISMATCH
+    assert label in assessment.detail
+
+
+def test_covered_layout_is_rejected_when_runtime_cannot_assemble_it():
+    target = BBoxSupport(CRS, AXES, ("0", "0", "4", "4"))
+    horizontal_stripes = (
+        _asset("north", ("0", "2", "4", "4")),
+        _asset("south", ("0", "0", "4", "2")),
+    )
+    assessment = assess_coverage(
+        horizontal_stripes,
+        target_spatial=target,
+        target_temporal=_window(),
+        assembly_mode=AssemblyMode.FIELD_JSON_X_TILES_V1,
+    )
+    assert assessment.status is CoverageStatus.ASSEMBLY_UNSUPPORTED
+    assert "cannot be assembled" in assessment.detail
 
 
 def test_crs_mismatch_is_refused_rather_than_reprojected():

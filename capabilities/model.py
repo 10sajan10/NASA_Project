@@ -31,6 +31,33 @@ from .parameters import ParameterSchema
 _PORT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
+def _is_reserved_transformation_operation(operation_key: str) -> bool:
+    """Return whether an operation belongs to the semantic-transform namespace.
+
+    ``transform.*`` is deliberately reserved.  Those operations make a
+    scientific claim (units, grids, value semantics, and assumptions), so a
+    generic capability declaration is not sufficient authority to use one.
+    """
+    return operation_key.startswith("transform.")
+
+
+_ACQUISITION_OPERATION_KEY = "acquisition.materialize.v1"
+_ACQUISITION_BINDER_KEY = "acquisition.materialize.bind.v1"
+_ACQUISITION_AUTHORITY_MINT = object()
+
+
+def _is_reserved_acquisition(
+        operation_key: str, binder_key: str,
+) -> bool:
+    """Return whether either executable identity names acquisition lowering.
+
+    Both sides are checked so a future binder-registry mistake cannot turn the
+    reserved materializer into an ordinary caller-authored producer.
+    """
+    return (operation_key == _ACQUISITION_OPERATION_KEY
+            or binder_key == _ACQUISITION_BINDER_KEY)
+
+
 def _port(value: str, label: str = "port_id") -> None:
     if not isinstance(value, str) or not _PORT.fullmatch(value):
         raise ValueError(f"{label} is not a safe, non-empty port identifier")
@@ -156,6 +183,306 @@ class BindingParameterization:
 
 
 @dataclass(frozen=True)
+class TransformationAuthority:
+    """Content-addressed authority carried by every lowered transform.
+
+    The complete immutable :class:`transformations.TransformationSpec` record
+    is retained instead of projecting only its executable parameters.  The
+    two additional digests bind that record to the closed semantic validator
+    version and to the exact parameter/descriptors rule.  Reconstruction and
+    scientific replay live in :mod:`transformations.model`; this low-level
+    carrier intentionally has no dependency on the Stage-4 package.
+    """
+
+    authority_id: str
+    transformation_spec: dict[str, Any]
+    semantic_rule_implementation_sha256: str
+    parameter_rule_sha256: str
+
+    def __post_init__(self) -> None:
+        _digest(self.authority_id, "transformation authority_id")
+        _digest(
+            self.semantic_rule_implementation_sha256,
+            "semantic rule implementation digest",
+        )
+        _digest(self.parameter_rule_sha256, "transformation parameter rule digest")
+        object.__setattr__(
+            self, "transformation_spec", freeze_json(self.transformation_spec))
+        if not isinstance(self.transformation_spec, dict):
+            raise ValueError("transformation authority spec must be a JSON object")
+        _digest(
+            self.transformation_spec.get("spec_id"),
+            "authority transformation spec_id",
+        )
+        _required_text(
+            self.transformation_spec.get("kind"),
+            "authority transformation kind",
+        )
+        _required_text(
+            self.transformation_spec.get("semantic_rule_id"),
+            "authority semantic_rule_id",
+        )
+        _required_text(
+            self.transformation_spec.get("loss_policy"),
+            "authority transformation loss_policy",
+        )
+        _required_text(
+            self.transformation_spec.get("uncertainty_propagation_policy"),
+            "authority transformation uncertainty_propagation_policy",
+        )
+        if self.authority_id != self.expected_id():
+            raise ValueError("transformation authority identity does not verify")
+
+    @classmethod
+    def bind(
+            cls, *, transformation_spec: dict[str, Any],
+            semantic_rule_implementation_sha256: str,
+            parameter_rule_sha256: str,
+    ) -> "TransformationAuthority":
+        values = {
+            "transformation_spec": strict_copy(transformation_spec),
+            "semantic_rule_implementation_sha256":
+                semantic_rule_implementation_sha256,
+            "parameter_rule_sha256": parameter_rule_sha256,
+        }
+        return cls(strict_hash(cls._identity_payload(values)), **values)
+
+    @staticmethod
+    def _identity_payload(values: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "schema": "stage8r-transformation-authority-v1",
+            **values,
+        }
+
+    @property
+    def transformation_spec_id(self) -> str:
+        return self.transformation_spec["spec_id"]
+
+    @property
+    def kind(self) -> str:
+        return self.transformation_spec["kind"]
+
+    @property
+    def semantic_rule_id(self) -> str:
+        return self.transformation_spec["semantic_rule_id"]
+
+    @property
+    def loss_policy(self) -> str:
+        return self.transformation_spec["loss_policy"]
+
+    @property
+    def uncertainty_propagation_policy(self) -> str:
+        return self.transformation_spec["uncertainty_propagation_policy"]
+
+    def expected_id(self) -> str:
+        return strict_hash(self._identity_payload({
+            "transformation_spec": strict_copy(self.transformation_spec),
+            "semantic_rule_implementation_sha256":
+                self.semantic_rule_implementation_sha256,
+            "parameter_rule_sha256": self.parameter_rule_sha256,
+        }))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "authority_id": self.authority_id,
+            "transformation_spec": strict_copy(self.transformation_spec),
+            "semantic_rule_implementation_sha256":
+                self.semantic_rule_implementation_sha256,
+            "parameter_rule_sha256": self.parameter_rule_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "TransformationAuthority":
+        raw = require_object_fields(
+            value, {field.name for field in dataclasses.fields(cls)},
+            "TransformationAuthority")
+        return cls(**raw)
+
+
+@dataclass(frozen=True, init=False)
+class AcquisitionAuthority:
+    """Content-addressed certificate for one verified acquisition lowering.
+
+    The carrier deliberately lives below :mod:`acquisition` so generic
+    capability records can retain it without introducing a module cycle.  A
+    fresh instance is minted only from a live ``FetchedContentBinding`` by the
+    acquisition lowerer.  Construction and later deserialization are both
+    replayed by :mod:`acquisition.lowering`; this record is not a replacement
+    for receipt/blob verification at the storage boundary.
+    """
+
+    authority_id: str
+    content_binding: dict[str, Any]
+    source_schema_id: str
+    descriptor_id: str
+    source_schema: dict[str, Any]
+    bound_manifest: dict[str, Any]
+    manifest_assets: tuple[dict[str, Any], ...]
+    coverage_contract_id: str
+    execution_profile: dict[str, Any]
+    capability_version: str
+    cost_units: int
+    evidence_profile_id: str
+    lowering_rule_implementation_sha256: str
+
+    def __init__(
+            self, mint: object, *, authority_id: str,
+            content_binding: dict[str, Any], source_schema_id: str,
+            descriptor_id: str, source_schema: dict[str, Any],
+            bound_manifest: dict[str, Any],
+            manifest_assets: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+            coverage_contract_id: str,
+            execution_profile: dict[str, Any],
+            capability_version: str, cost_units: int,
+            evidence_profile_id: str,
+            lowering_rule_implementation_sha256: str,
+    ) -> None:
+        if mint is not _ACQUISITION_AUTHORITY_MINT:
+            raise PermissionError(
+                "AcquisitionAuthority is minted by verified acquisition "
+                "lowering or reconstructed by strict deserialization")
+        _digest(authority_id, "acquisition authority_id")
+        _digest(source_schema_id, "acquisition source_schema_id")
+        _digest(descriptor_id, "acquisition descriptor_id")
+        _digest(
+            coverage_contract_id, "acquisition coverage_contract_id")
+        _digest(
+            lowering_rule_implementation_sha256,
+            "acquisition lowering-rule implementation digest",
+        )
+        _required_text(capability_version, "acquisition capability_version")
+        _required_text(evidence_profile_id, "acquisition evidence_profile_id")
+        if (isinstance(cost_units, bool) or not isinstance(cost_units, int)
+                or cost_units < 0):
+            raise ValueError(
+                "acquisition authority cost_units must be a non-negative integer")
+        frozen_binding = freeze_json(content_binding)
+        frozen_schema = freeze_json(source_schema)
+        frozen_manifest = freeze_json(bound_manifest)
+        frozen_assets = freeze_json(manifest_assets)
+        frozen_profile = freeze_json(execution_profile)
+        if not isinstance(frozen_binding, dict):
+            raise TypeError("acquisition authority content binding must be an object")
+        if not isinstance(frozen_profile, dict):
+            raise TypeError("acquisition authority execution profile must be an object")
+        if not isinstance(frozen_schema, dict):
+            raise TypeError("acquisition authority source schema must be an object")
+        if not isinstance(frozen_manifest, dict):
+            raise TypeError("acquisition authority bound manifest must be an object")
+        if (not isinstance(frozen_assets, tuple) or not frozen_assets
+                or not all(isinstance(item, dict) for item in frozen_assets)):
+            raise TypeError(
+                "acquisition authority manifest assets must be a non-empty array")
+        values = {
+            "authority_id": authority_id,
+            "content_binding": frozen_binding,
+            "source_schema_id": source_schema_id,
+            "descriptor_id": descriptor_id,
+            "source_schema": frozen_schema,
+            "bound_manifest": frozen_manifest,
+            "manifest_assets": frozen_assets,
+            "coverage_contract_id": coverage_contract_id,
+            "execution_profile": frozen_profile,
+            "capability_version": capability_version,
+            "cost_units": cost_units,
+            "evidence_profile_id": evidence_profile_id,
+            "lowering_rule_implementation_sha256":
+                lowering_rule_implementation_sha256,
+        }
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+        if self.authority_id != self.expected_id():
+            raise ValueError("acquisition authority identity does not verify")
+
+    @classmethod
+    def _bind_verified_content(
+            cls, content: Any, execution_profile: Any, *,
+            capability_version: str, cost_units: int,
+            evidence_profile_id: str,
+            lowering_rule_implementation_sha256: str,
+    ) -> "AcquisitionAuthority":
+        """Internal mint used only after Stage-5 receipt/blob verification."""
+        # Local imports avoid making the generic Stage-2 model load Stage 5.
+        from acquisition.content import FetchedContentBinding
+        from .deployment import ExecutionProfile
+
+        if not isinstance(content, FetchedContentBinding):
+            raise TypeError(
+                "acquisition authority requires a verified FetchedContentBinding")
+        if not isinstance(execution_profile, ExecutionProfile):
+            raise TypeError("acquisition authority requires an ExecutionProfile")
+        values = {
+            "content_binding": content.to_dict(),
+            "source_schema_id": content.source_schema_id,
+            "descriptor_id": content.descriptor.descriptor_id,
+            "source_schema": content.bound_manifest.source_schema.to_dict(),
+            "bound_manifest": content.bound_manifest.to_dict(),
+            "manifest_assets": tuple(
+                item.to_dict() for item in content.manifest_assets),
+            "coverage_contract_id":
+                content.bound_manifest.coverage_contract_id,
+            "execution_profile": execution_profile.to_dict(),
+            "capability_version": capability_version,
+            "cost_units": cost_units,
+            "evidence_profile_id": evidence_profile_id,
+            "lowering_rule_implementation_sha256":
+                lowering_rule_implementation_sha256,
+        }
+        authority_id = strict_hash(cls._identity_payload(values))
+        return cls(
+            _ACQUISITION_AUTHORITY_MINT,
+            authority_id=authority_id,
+            **values,
+        )
+
+    @staticmethod
+    def _identity_payload(values: dict[str, Any]) -> dict[str, Any]:
+        return {"schema": "stage8r-acquisition-authority-v1", **values}
+
+    def expected_id(self) -> str:
+        return strict_hash(self._identity_payload({
+            "content_binding": strict_copy(self.content_binding),
+            "source_schema_id": self.source_schema_id,
+            "descriptor_id": self.descriptor_id,
+            "source_schema": strict_copy(self.source_schema),
+            "bound_manifest": strict_copy(self.bound_manifest),
+            "manifest_assets": strict_copy(self.manifest_assets),
+            "coverage_contract_id": self.coverage_contract_id,
+            "execution_profile": strict_copy(self.execution_profile),
+            "capability_version": self.capability_version,
+            "cost_units": self.cost_units,
+            "evidence_profile_id": self.evidence_profile_id,
+            "lowering_rule_implementation_sha256":
+                self.lowering_rule_implementation_sha256,
+        }))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "authority_id": self.authority_id,
+            "content_binding": strict_copy(self.content_binding),
+            "source_schema_id": self.source_schema_id,
+            "descriptor_id": self.descriptor_id,
+            "source_schema": strict_copy(self.source_schema),
+            "bound_manifest": strict_copy(self.bound_manifest),
+            "manifest_assets": strict_copy(self.manifest_assets),
+            "coverage_contract_id": self.coverage_contract_id,
+            "execution_profile": strict_copy(self.execution_profile),
+            "capability_version": self.capability_version,
+            "cost_units": self.cost_units,
+            "evidence_profile_id": self.evidence_profile_id,
+            "lowering_rule_implementation_sha256":
+                self.lowering_rule_implementation_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "AcquisitionAuthority":
+        raw = require_object_fields(
+            value, {field.name for field in dataclasses.fields(cls)},
+            "AcquisitionAuthority")
+        return cls(_ACQUISITION_AUTHORITY_MINT, **raw)
+
+
+@dataclass(frozen=True)
 class CapabilitySpec:
     """A finite relation from input requirements to prospective outputs."""
 
@@ -172,6 +499,8 @@ class CapabilitySpec:
     evidence_profile_id: str
     cost_model_id: str
     execution_profile_id: str
+    transformation_authority: TransformationAuthority | None = None
+    acquisition_authority: AcquisitionAuthority | None = None
 
     def __post_init__(self) -> None:
         _digest(self.spec_id, "capability spec_id")
@@ -189,6 +518,14 @@ class CapabilitySpec:
             raise TypeError("capability binder is invalid")
         if not isinstance(self.parameter_schema, ParameterSchema):
             raise TypeError("capability parameter schema is invalid")
+        if (self.transformation_authority is not None
+                and not isinstance(
+                    self.transformation_authority, TransformationAuthority)):
+            raise TypeError("capability transformation authority is invalid")
+        if (self.acquisition_authority is not None
+                and not isinstance(
+                    self.acquisition_authority, AcquisitionAuthority)):
+            raise TypeError("capability acquisition authority is invalid")
         for values, expected, label in (
             (self.input_ports, InputPortTemplate, "input ports"),
             (self.output_ports, DescriptorTemplate, "output ports"),
@@ -227,6 +564,37 @@ class CapabilitySpec:
             raise ValueError("parameter schema disagrees with its closed binder")
         for parameterization in self.parameterizations:
             self.parameter_schema.validate(parameterization.parameters)
+        reserved_transform = _is_reserved_transformation_operation(
+            self.implementation.operation_key)
+        if reserved_transform and self.transformation_authority is None:
+            raise ValueError(
+                "reserved transform.* operations require authenticated "
+                "TransformationAuthority")
+        if not reserved_transform and self.transformation_authority is not None:
+            raise ValueError(
+                "transformation authority cannot authorize a non-transform operation")
+        if reserved_transform:
+            # Local import avoids making the generic Stage-2 carrier import
+            # Stage 4 at module-load time.  Construction nevertheless fails
+            # closed unless the complete scientific contract replays.
+            from transformations.model import (
+                verify_capability_transformation_authority,
+            )
+            verify_capability_transformation_authority(self)
+        reserved_acquisition = _is_reserved_acquisition(
+            self.implementation.operation_key, self.binder.binder_key)
+        if reserved_acquisition and self.acquisition_authority is None:
+            raise ValueError(
+                "reserved acquisition materializer requires authenticated "
+                "AcquisitionAuthority")
+        if not reserved_acquisition and self.acquisition_authority is not None:
+            raise ValueError(
+                "acquisition authority cannot authorize a non-acquisition operation")
+        if reserved_acquisition:
+            from acquisition.lowering import (
+                verify_capability_acquisition_authority,
+            )
+            verify_capability_acquisition_authority(self)
         if self.spec_id != self.expected_id():
             raise ValueError("capability specification identity does not verify")
 
@@ -242,6 +610,8 @@ class CapabilitySpec:
             applicability_key: str = "always.v1",
             evidence_profile_id: str = "evidence:unknown",
             cost_model_id: str = "cost:declared-v1",
+            transformation_authority: TransformationAuthority | None = None,
+            acquisition_authority: AcquisitionAuthority | None = None,
     ) -> "CapabilitySpec":
         implementation.verify_current()
         binder.verify_current()
@@ -252,12 +622,14 @@ class CapabilitySpec:
         payload = _capability_payload(
             capability_id, capability_version, implementation, binder,
             inputs, outputs, parameter_schema, params, applicability_key,
-            evidence_profile_id, cost_model_id, execution_profile_id)
+            evidence_profile_id, cost_model_id, execution_profile_id,
+            transformation_authority, acquisition_authority)
         return cls(
             strict_hash(payload), capability_id, capability_version,
             implementation, binder, inputs, outputs, parameter_schema, params,
             applicability_key, evidence_profile_id, cost_model_id,
-            execution_profile_id,
+            execution_profile_id, transformation_authority,
+            acquisition_authority,
         )
 
     def expected_id(self) -> str:
@@ -266,10 +638,11 @@ class CapabilitySpec:
             self.implementation, self.binder, self.input_ports,
             self.output_ports, self.parameter_schema, self.parameterizations,
             self.applicability_key, self.evidence_profile_id,
-            self.cost_model_id, self.execution_profile_id))
+            self.cost_model_id, self.execution_profile_id,
+            self.transformation_authority, self.acquisition_authority))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "spec_id": self.spec_id,
             "capability_id": self.capability_id,
             "capability_version": self.capability_version,
@@ -285,12 +658,22 @@ class CapabilitySpec:
             "cost_model_id": self.cost_model_id,
             "execution_profile_id": self.execution_profile_id,
         }
+        if self.transformation_authority is not None:
+            result["transformation_authority"] = (
+                self.transformation_authority.to_dict())
+        if self.acquisition_authority is not None:
+            result["acquisition_authority"] = (
+                self.acquisition_authority.to_dict())
+        return result
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "CapabilitySpec":
-        raw = require_object_fields(
-            value, {field.name for field in dataclasses.fields(cls)},
-            "CapabilitySpec")
+        expected = {field.name for field in dataclasses.fields(cls)}
+        for optional in (
+                "transformation_authority", "acquisition_authority"):
+            if optional not in value:
+                expected.remove(optional)
+        raw = require_object_fields(value, expected, "CapabilitySpec")
         raw["implementation"] = ImplementationRef.from_dict(raw["implementation"])
         raw["binder"] = BinderRef.from_dict(raw["binder"])
         for name, parser in (
@@ -303,6 +686,12 @@ class CapabilitySpec:
             raw[name] = tuple(parser(item) for item in raw[name])
         raw["parameter_schema"] = ParameterSchema.from_dict(
             raw["parameter_schema"])
+        if "transformation_authority" in raw:
+            raw["transformation_authority"] = TransformationAuthority.from_dict(
+                raw["transformation_authority"])
+        if "acquisition_authority" in raw:
+            raw["acquisition_authority"] = AcquisitionAuthority.from_dict(
+                raw["acquisition_authority"])
         return cls(**raw)
 
 
@@ -315,8 +704,10 @@ def _capability_payload(
         parameterizations: tuple[BindingParameterization, ...],
         applicability_key: str, evidence_profile_id: str,
         cost_model_id: str, execution_profile_id: str,
+        transformation_authority: TransformationAuthority | None = None,
+        acquisition_authority: AcquisitionAuthority | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "schema": "stage2-capability-spec-v1",
         "capability_id": capability_id,
         "capability_version": capability_version,
@@ -331,6 +722,11 @@ def _capability_payload(
         "cost_model_id": cost_model_id,
         "execution_profile_id": execution_profile_id,
     }
+    if transformation_authority is not None:
+        result["transformation_authority"] = transformation_authority.to_dict()
+    if acquisition_authority is not None:
+        result["acquisition_authority"] = acquisition_authority.to_dict()
+    return result
 
 
 @dataclass(frozen=True)
@@ -370,6 +766,8 @@ class BoundInvocation:
     evidence_profile_id: str
     cost_model_id: str
     execution_profile_id: str
+    transformation_authority: TransformationAuthority | None = None
+    acquisition_authority: AcquisitionAuthority | None = None
 
     def __post_init__(self) -> None:
         _digest(self.invocation_key, "invocation_key")
@@ -383,6 +781,14 @@ class BoundInvocation:
             raise TypeError("bound implementation is invalid")
         if not isinstance(self.binder, BinderRef):
             raise TypeError("bound binder is invalid")
+        if (self.transformation_authority is not None
+                and not isinstance(
+                    self.transformation_authority, TransformationAuthority)):
+            raise TypeError("bound transformation authority is invalid")
+        if (self.acquisition_authority is not None
+                and not isinstance(
+                    self.acquisition_authority, AcquisitionAuthority)):
+            raise TypeError("bound acquisition authority is invalid")
         object.__setattr__(self, "parameters", freeze_json(self.parameters))
         object.__setattr__(self, "metric_estimates",
                            freeze_json(self.metric_estimates))
@@ -401,6 +807,32 @@ class BoundInvocation:
             raise ValueError("bound invocation has duplicate input ports")
         if len({value.port_id for value in self.outputs}) != len(self.outputs):
             raise ValueError("bound invocation has duplicate output ports")
+        reserved_transform = _is_reserved_transformation_operation(
+            self.implementation.operation_key)
+        if reserved_transform and self.transformation_authority is None:
+            raise ValueError(
+                "reserved transform.* invocation lacks authenticated "
+                "TransformationAuthority")
+        if not reserved_transform and self.transformation_authority is not None:
+            raise ValueError(
+                "transformation authority cannot authorize a non-transform invocation")
+        if reserved_transform:
+            from transformations.model import (
+                verify_bound_transformation_authority,
+            )
+            verify_bound_transformation_authority(self)
+        reserved_acquisition = _is_reserved_acquisition(
+            self.implementation.operation_key, self.binder.binder_key)
+        if reserved_acquisition and self.acquisition_authority is None:
+            raise ValueError(
+                "reserved acquisition invocation lacks authenticated "
+                "AcquisitionAuthority")
+        if not reserved_acquisition and self.acquisition_authority is not None:
+            raise ValueError(
+                "acquisition authority cannot authorize a non-acquisition invocation")
+        if reserved_acquisition:
+            from acquisition.lowering import verify_bound_acquisition_authority
+            verify_bound_acquisition_authority(self)
         if self.invocation_key != self.expected_key():
             raise ValueError("bound invocation identity does not verify")
 
@@ -422,18 +854,26 @@ class BoundInvocation:
             # two distinct invocations to mint the same unchanged-port use ID.
             "inputs": [value.to_dict() for value in spec.input_ports],
             "outputs": [value.to_dict() for value in spec.output_ports],
+            **({"transformation_authority":
+                spec.transformation_authority.to_dict()}
+               if spec.transformation_authority is not None else {}),
+            **({"acquisition_authority":
+                spec.acquisition_authority.to_dict()}
+               if spec.acquisition_authority is not None else {}),
         })
         inputs = tuple(value.bind(binding_seed) for value in spec.input_ports)
         outputs = tuple(BoundOutputPort(value.port_id, value.descriptor)
                         for value in spec.output_ports)
         payload = _invocation_payload(
             spec.capability_id, spec.capability_version, spec.implementation,
-            spec.binder, parameters, inputs, outputs)
+            spec.binder, parameters, inputs, outputs,
+            spec.transformation_authority, spec.acquisition_authority)
         return cls(
             strict_hash(payload), spec.capability_id, spec.capability_version,
             spec.implementation, spec.binder, parameters, inputs, outputs,
             parameterization.metric_estimates, spec.evidence_profile_id,
             spec.cost_model_id, spec.execution_profile_id,
+            spec.transformation_authority, spec.acquisition_authority,
         )
 
     def expected_key(self) -> str:
@@ -442,7 +882,8 @@ class BoundInvocation:
         return strict_hash(_invocation_payload(
             self.capability_id, self.capability_version,
             self.implementation, self.binder, self.parameters,
-            self.input_uses, self.outputs))
+            self.input_uses, self.outputs, self.transformation_authority,
+            self.acquisition_authority))
 
     @property
     def record_id(self) -> str:
@@ -460,7 +901,7 @@ class BoundInvocation:
             raise KeyError(port_id) from exc
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "invocation_key": self.invocation_key,
             "capability_id": self.capability_id,
             "capability_version": self.capability_version,
@@ -474,12 +915,22 @@ class BoundInvocation:
             "cost_model_id": self.cost_model_id,
             "execution_profile_id": self.execution_profile_id,
         }
+        if self.transformation_authority is not None:
+            result["transformation_authority"] = (
+                self.transformation_authority.to_dict())
+        if self.acquisition_authority is not None:
+            result["acquisition_authority"] = (
+                self.acquisition_authority.to_dict())
+        return result
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "BoundInvocation":
-        raw = require_object_fields(
-            value, {field.name for field in dataclasses.fields(cls)},
-            "BoundInvocation")
+        expected = {field.name for field in dataclasses.fields(cls)}
+        for optional in (
+                "transformation_authority", "acquisition_authority"):
+            if optional not in value:
+                expected.remove(optional)
+        raw = require_object_fields(value, expected, "BoundInvocation")
         raw["implementation"] = ImplementationRef.from_dict(raw["implementation"])
         raw["binder"] = BinderRef.from_dict(raw["binder"])
         for name, parser in (("input_uses", RequirementUse.from_dict),
@@ -487,6 +938,12 @@ class BoundInvocation:
             if not isinstance(raw[name], list):
                 raise ValueError(f"BoundInvocation.{name} must be an array")
             raw[name] = tuple(parser(item) for item in raw[name])
+        if "transformation_authority" in raw:
+            raw["transformation_authority"] = TransformationAuthority.from_dict(
+                raw["transformation_authority"])
+        if "acquisition_authority" in raw:
+            raw["acquisition_authority"] = AcquisitionAuthority.from_dict(
+                raw["acquisition_authority"])
         return cls(**raw)
 
 
@@ -495,8 +952,10 @@ def _invocation_payload(
         implementation: ImplementationRef, binder: BinderRef,
         parameters: dict[str, Any], input_uses: tuple[RequirementUse, ...],
         outputs: tuple[BoundOutputPort, ...],
+        transformation_authority: TransformationAuthority | None = None,
+        acquisition_authority: AcquisitionAuthority | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "schema": "stage2-bound-invocation-v1",
         "capability_id": capability_id,
         "capability_version": capability_version,
@@ -506,6 +965,11 @@ def _invocation_payload(
         "input_uses": [value.to_dict() for value in input_uses],
         "outputs": [value.to_dict() for value in outputs],
     }
+    if transformation_authority is not None:
+        result["transformation_authority"] = transformation_authority.to_dict()
+    if acquisition_authority is not None:
+        result["acquisition_authority"] = acquisition_authority.to_dict()
+    return result
 
 
 @dataclass(frozen=True)

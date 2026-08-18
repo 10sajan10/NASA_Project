@@ -25,6 +25,7 @@ from .milp import (
     MilpSolveOptions,
     MilpStatus,
     ProducerSelectionRef,
+    SatisfactionArcSelectionRef,
     SelectionConstraints,
     solve_milp,
 )
@@ -35,7 +36,15 @@ from .service import (
     ResolutionStatus,
     WorkflowResolver,
 )
-from .upstream import UpstreamCompleteness
+from .upstream import (
+    DiscoveryCertificate,
+    DiscoveryLayerCertificate,
+    DiscoveryLayerScope,
+    DiscoveryLimitActivation,
+    DiscoveryLimitSetting,
+    DiscoveryUniverseContract,
+    UpstreamCompleteness,
+)
 from .validator import (
     ArtifactCommitAttestation,
     ProofReplayContext,
@@ -54,8 +63,14 @@ __all__ = [
     "BackReference",
     "BackReferenceKind",
     "DeploymentOption",
+    "DiscoveryCertificate",
+    "DiscoveryLayerCertificate",
+    "DiscoveryLayerScope",
     "DiscoveryLimitCode",
+    "DiscoveryLimitActivation",
     "DiscoveryLimitReason",
+    "DiscoveryLimitSetting",
+    "DiscoveryUniverseContract",
     "DiscoveryLimits",
     "DiscoveryRejection",
     "DiscoveryTimings",
@@ -69,6 +84,7 @@ __all__ = [
     "PlanningMetrics",
     "PlanningBenchmarkProfile",
     "ProducerSelectionRef",
+    "SatisfactionArcSelectionRef",
     "ProofReplayContext",
     "ResolutionOutcome",
     "ResolutionStatus",

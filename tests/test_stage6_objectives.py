@@ -23,7 +23,7 @@ from objectives import (
     assess_comparability,
 )
 from plans import ProducerKind
-from resolution import ProducerSelectionRef
+from resolution import ProducerSelectionRef, SatisfactionArcSelectionRef
 
 METRIC = "example.metric.error"
 
@@ -226,8 +226,13 @@ def test_decisions_round_trip():
 
 
 def _alternative(name: str, cost: int, admissible: bool = True):
+    producer = _producer(name)
     return SourceAlternative(
-        producer=_producer(name), capability_id=name, admissible=admissible,
+        producer=producer,
+        satisfaction=SatisfactionArcSelectionRef(
+            "contested-use", producer.producer_kind, producer.producer_id,
+            "result"),
+        capability_id=name, admissible=admissible,
         plan_id=("p" * 64) if admissible else None,
         cost_units=cost if admissible else None,
         resolution_status="READY" if admissible else "UNSATISFIABLE",
@@ -240,7 +245,8 @@ def test_a_report_never_claims_a_ranking_or_nondominance():
         concept_id="c", metric_definition_id=METRIC,
         alternatives=(_alternative("a", 5), _alternative("b", 8)),
         comparability=assess_comparability(
-            (_reading("a"), _reading("b", "0.9")), METRIC))
+            (_reading("a"), _reading("b", "0.9")), METRIC),
+        planning_context_id="c" * 64)
     assert report.ranking_complete is False
     assert report.nondominance_claimed is False
     assert report.report_id == report.expected_id()
@@ -252,7 +258,8 @@ def test_a_report_round_trips_and_rejects_forged_ranking_claims():
         concept_id="c", metric_definition_id=METRIC,
         alternatives=(_alternative("a", 5), _alternative("b", 8)),
         comparability=assess_comparability(
-            (_reading("a"), _reading("b", "0.9")), METRIC))
+            (_reading("a"), _reading("b", "0.9")), METRIC),
+        planning_context_id="c" * 64)
     assert ChoiceRequiredReport.from_dict(report.to_dict()) == report
 
     forged = report.to_dict()
@@ -264,6 +271,9 @@ def test_a_report_round_trips_and_rejects_forged_ranking_claims():
 def test_an_inadmissible_alternative_must_explain_itself():
     with pytest.raises(ValueError, match="must explain itself"):
         SourceAlternative(
-            producer=_producer(), capability_id="x", admissible=False,
+            producer=_producer(),
+            satisfaction=SatisfactionArcSelectionRef(
+                "contested-use", ProducerKind.INVOCATION, "inv-1", "result"),
+            capability_id="x", admissible=False,
             plan_id=None, cost_units=None, resolution_status="UNSATISFIABLE",
             reading=None, detail="")

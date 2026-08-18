@@ -60,7 +60,8 @@ def _run_to_completion(store: PartitionStore, fixture: fx.Stage7Fixture,
                 (key, MemberOutcome.COMMITTED)
                 for key in result.committed_keys())
         # One flush per batch rather than one per partition.
-        committed += store.record_outcomes(controller.collection_id, outcomes)
+        committed += store._record_outcomes_for_test_fixture(
+            controller.collection_id, outcomes)
     state = controller.state()
     return {
         "packets": packets,
@@ -118,7 +119,7 @@ def run_demo(runtime_root: Path | str) -> dict[str, Any]:
     first.top_up()
     # Commit what was admitted so in-flight falls below the low watermark;
     # otherwise a correct controller admits nothing and resumption is untested.
-    first_store.record_outcomes(first.collection_id, [
+    first_store._record_outcomes_for_test_fixture(first.collection_id, [
         (key, MemberOutcome.COMMITTED)
         for key, _index in first_store.iter_admitted(
             first.collection_id, policy.high_watermark)])
@@ -180,16 +181,16 @@ def run_demo(runtime_root: Path | str) -> dict[str, Any]:
          else MemberOutcome.FAILED)
         for index, key in enumerate(keys)))
     for key in mixed.committed_keys():
-        partial_store.record_outcome(
+        partial_store._record_outcome_for_test_fixture(
             partial.collection_id, key, MemberOutcome.COMMITTED)
     for key in mixed.retryable_keys(retry_safe=fixture.template.retry_safe):
-        partial_store.record_outcome(
+        partial_store._record_outcome_for_test_fixture(
             partial.collection_id, key, MemberOutcome.FAILED)
     partial_state = partial_store.state(partial.collection_id)
 
     # A committed member survives a later duplicate result claiming failure.
     survivor = mixed.committed_keys()[0]
-    partial_store.record_outcome(
+    partial_store._record_outcome_for_test_fixture(
         partial.collection_id, survivor, MemberOutcome.FAILED)
     survived = partial_store.state(partial.collection_id).committed == \
         partial_state.committed

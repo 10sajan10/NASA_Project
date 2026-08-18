@@ -41,10 +41,10 @@ def catalog(tmp_path):
 
 def _cascade(catalog):
     """ERA5 temperature -> fire model perturbs it -> impacts model consumes."""
-    baseline = catalog.commit_entry(CubeEntry.create(
+    baseline = catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="temperature", kind="static", producer="era5",
         content_sha256=_sha("era5-baseline"), grid=_grid()))
-    perturbed = catalog.commit_entry(CubeEntry.create(
+    perturbed = catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="temperature", kind="static", producer="wrf_sfire",
         content_sha256=_sha("fire-perturbed"), grid=_grid(),
         inputs=(EntryInput("temperature", baseline.entry_id),)))
@@ -78,7 +78,7 @@ def test_the_unperturbed_value_is_still_askable(catalog):
 def test_write_order_does_not_decide_the_answer(catalog):
     """Committing the baseline last must not make it win."""
     _, perturbed = _cascade(catalog)
-    catalog.commit_entry(CubeEntry.create(
+    catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="temperature", kind="static", producer="era5-refetch",
         content_sha256=_sha("era5-again"), grid=_grid()))
     assert catalog.resolve("temperature").entry_id == perturbed.entry_id
@@ -86,7 +86,7 @@ def test_write_order_does_not_decide_the_answer(catalog):
 
 def test_a_consumer_can_reconstruct_what_it_consumed(catalog):
     baseline, perturbed = _cascade(catalog)
-    impact = catalog.commit_entry(CubeEntry.create(
+    impact = catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="population_affected", kind="static", producer="impacts",
         content_sha256=_sha("impact"), grid=_grid(),
         inputs=(EntryInput("temperature", perturbed.entry_id),)))
@@ -100,7 +100,7 @@ def test_a_consumer_can_reconstruct_what_it_consumed(catalog):
 
 def test_committing_the_same_derivation_twice_is_one_entry(catalog):
     baseline, _ = _cascade(catalog)
-    again = catalog.commit_entry(CubeEntry.create(
+    again = catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="temperature", kind="static", producer="era5",
         content_sha256=_sha("era5-baseline"), grid=_grid()))
     assert again.entry_id == baseline.entry_id
@@ -124,7 +124,7 @@ def test_an_entry_id_cannot_be_forged():
 
 def test_an_edge_cannot_point_at_nothing(catalog):
     with pytest.raises(EntryNotFound, match="cannot point at nothing"):
-        catalog.commit_entry(CubeEntry.create(
+        catalog._commit_entry_for_test_fixture(CubeEntry.create(
             concept="temperature", kind="static", producer="ghost",
             content_sha256=_sha("t"),
             inputs=(EntryInput("temperature", _sha("missing")),)))
@@ -141,7 +141,7 @@ def test_an_entry_is_current_when_its_inputs_are(catalog):
 
 def test_a_deeper_input_makes_a_consumer_stale(catalog):
     baseline, perturbed = _cascade(catalog)
-    impact = catalog.commit_entry(CubeEntry.create(
+    impact = catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="population_affected", kind="static", producer="impacts",
         content_sha256=_sha("impact"),
         inputs=(EntryInput("temperature", baseline.entry_id),)))
@@ -158,7 +158,7 @@ def test_refetching_identical_bytes_does_not_invalidate_downstream(catalog):
     file that did not change.
     """
     _, perturbed = _cascade(catalog)
-    catalog.commit_entry(CubeEntry.create(
+    catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="temperature", kind="static", producer="era5",
         content_sha256=_sha("era5-baseline"), grid=_grid()))
     assert not catalog.is_entry_stale(perturbed.entry_id)
@@ -182,7 +182,7 @@ def test_a_perturbing_model_is_not_stale_against_its_own_output(catalog):
 
 def test_dependents_are_transitive(catalog):
     baseline, perturbed = _cascade(catalog)
-    impact = catalog.commit_entry(CubeEntry.create(
+    impact = catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="population_affected", kind="static", producer="impacts",
         content_sha256=_sha("impact"),
         inputs=(EntryInput("temperature", perturbed.entry_id),)))
@@ -195,12 +195,12 @@ def test_dependents_are_transitive(catalog):
 def test_a_second_perturbation_makes_the_first_consumer_stale(catalog):
     """Two fire models in sequence: the impacts model must notice."""
     baseline, perturbed = _cascade(catalog)
-    impact = catalog.commit_entry(CubeEntry.create(
+    impact = catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="population_affected", kind="static", producer="impacts",
         content_sha256=_sha("impact"),
         inputs=(EntryInput("temperature", perturbed.entry_id),)))
     assert not catalog.is_entry_stale(impact.entry_id)
-    catalog.commit_entry(CubeEntry.create(
+    catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="temperature", kind="static", producer="smoke_model",
         content_sha256=_sha("smoke-perturbed"), grid=_grid(),
         inputs=(EntryInput("temperature", perturbed.entry_id),)))
@@ -213,7 +213,7 @@ def test_a_second_perturbation_makes_the_first_consumer_stale(catalog):
 def test_an_entry_keeps_its_own_grid(catalog):
     """A Lambert intermediate stays Lambert; nothing is reprojected to store."""
     lambert = _grid(cell=90.0, crs="WRF-LCC:lat_1=32.78:lon_0=-96.8")
-    entry = catalog.commit_entry(CubeEntry.create(
+    entry = catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="arrival_s", kind="static", producer="wrf_sfire",
         content_sha256=_sha("tign"), grid=lambert))
     stored = catalog.entry(entry.entry_id)
@@ -222,10 +222,10 @@ def test_an_entry_keeps_its_own_grid(catalog):
 
 
 def test_two_entries_of_one_concept_may_differ_in_grid(catalog):
-    catalog.commit_entry(CubeEntry.create(
+    catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="temperature", kind="static", producer="era5",
         content_sha256=_sha("a"), grid=_grid(cell=900.0)))
-    catalog.commit_entry(CubeEntry.create(
+    catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="temperature", kind="static", producer="wrf",
         content_sha256=_sha("b"),
         grid=_grid(cell=90.0, crs="WRF-LCC:lat_1=32.78")))
@@ -234,7 +234,7 @@ def test_two_entries_of_one_concept_may_differ_in_grid(catalog):
 
 
 def test_an_entry_may_declare_no_grid(catalog):
-    entry = catalog.commit_entry(CubeEntry.create(
+    entry = catalog._commit_entry_for_test_fixture(CubeEntry.create(
         concept="scalar_index", kind="static", producer="calc",
         content_sha256=_sha("s")))
     assert catalog.entry(entry.entry_id).grid is None
@@ -245,7 +245,7 @@ def test_an_entry_may_declare_no_grid(catalog):
 
 def test_resolution_is_deterministic_across_ties(catalog):
     for index in range(4):
-        catalog.commit_entry(CubeEntry.create(
+        catalog._commit_entry_for_test_fixture(CubeEntry.create(
             concept="temperature", kind="static", producer=f"p{index}",
             content_sha256=_sha(f"v{index}"), grid=_grid()))
     first = catalog.resolve("temperature").entry_id
@@ -277,7 +277,7 @@ def test_the_schema_is_v3_and_the_old_tables_survive(catalog):
 def test_reopening_an_existing_cube_keeps_its_entries(tmp_path):
     path = tmp_path / "catalog.duckdb"
     first = Catalog(path)
-    entry = first.commit_entry(CubeEntry.create(
+    entry = first._commit_entry_for_test_fixture(CubeEntry.create(
         concept="temperature", kind="static", producer="era5",
         content_sha256=_sha("era5"), grid=_grid()))
     first.close()

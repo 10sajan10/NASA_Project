@@ -50,7 +50,15 @@ from resolution.hypergraph import (
     ArtifactAvailabilitySnapshot,
     ArtifactCommitStatus,
 )
-from resolution.milp import SelectionConstraints as SolverSelectionConstraints
+from resolution.milp import (
+    SatisfactionArcSelectionRef,
+    SelectionConstraints as SolverSelectionConstraints,
+)
+from transformations.model import verify_bound_transformation_authority
+from acquisition.lowering import (
+    ACQUISITION_OPERATION_KEY,
+    verify_bound_acquisition_authority,
+)
 
 
 class ValidationCode(str, Enum):
@@ -70,6 +78,8 @@ class ValidationCode(str, Enum):
         "REQUIREMENT_USE_PROJECTION_MISMATCH")
     INVOCATION_RECORD_MISSING = "INVOCATION_RECORD_MISSING"
     INVOCATION_PROJECTION_MISMATCH = "INVOCATION_PROJECTION_MISMATCH"
+    TRANSFORMATION_AUTHORITY_INVALID = "TRANSFORMATION_AUTHORITY_INVALID"
+    ACQUISITION_AUTHORITY_INVALID = "ACQUISITION_AUTHORITY_INVALID"
     ARTIFACT_RECORD_MISSING = "ARTIFACT_RECORD_MISSING"
     SELECTED_PRODUCER_UNKNOWN = "SELECTED_PRODUCER_UNKNOWN"
     SATISFACTION_MISSING = "SATISFACTION_MISSING"
@@ -126,6 +136,9 @@ class ValidationCode(str, Enum):
     INCLUDE_CONSTRAINT_UNSATISFIED = "INCLUDE_CONSTRAINT_UNSATISFIED"
     EXCLUDED_PRODUCER_SELECTED = "EXCLUDED_PRODUCER_SELECTED"
     CONSTRAINT_PRODUCER_UNKNOWN = "CONSTRAINT_PRODUCER_UNKNOWN"
+    CONSTRAINT_SATISFACTION_UNKNOWN = "CONSTRAINT_SATISFACTION_UNKNOWN"
+    REQUIRED_SATISFACTION_UNSATISFIED = (
+        "REQUIRED_SATISFACTION_UNSATISFIED")
     SELECTION_SIGNATURE_MISMATCH = "SELECTION_SIGNATURE_MISMATCH"
     CYCLE_DETECTED = "CYCLE_DETECTED"
     UNGROUNDED_DERIVATION = "UNGROUNDED_DERIVATION"
@@ -268,6 +281,7 @@ class SelectionConstraints:
     exclude_invocation_ids: tuple[str, ...] = ()
     include_artifact_leaf_ids: tuple[str, ...] = ()
     exclude_artifact_leaf_ids: tuple[str, ...] = ()
+    required_satisfactions: tuple[SatisfactionArcSelectionRef, ...] = ()
     require_complete_universe: bool = True
 
     def __post_init__(self) -> None:
@@ -285,6 +299,14 @@ class SelectionConstraints:
                 or set(self.include_artifact_leaf_ids)
                 & set(self.exclude_artifact_leaf_ids)):
             raise ValueError("the same producer cannot be included and excluded")
+        if (not isinstance(self.required_satisfactions, tuple)
+                or not all(isinstance(value, SatisfactionArcSelectionRef)
+                           for value in self.required_satisfactions)):
+            raise TypeError(
+                "required satisfactions must be typed immutable references")
+        object.__setattr__(
+            self, "required_satisfactions",
+            tuple(sorted(set(self.required_satisfactions))))
         if type(self.require_complete_universe) is not bool:
             raise TypeError("require_complete_universe must be bool")
 
@@ -327,6 +349,7 @@ def _normalize_constraints(
         exclude_invocation_ids=tuple(excluded_invocations),
         include_artifact_leaf_ids=tuple(included_leaves),
         exclude_artifact_leaf_ids=tuple(excluded_leaves),
+        required_satisfactions=constraints.required_satisfactions,
     )
 
 
@@ -873,6 +896,39 @@ def _validate_selected_producer_records(
                 "selected invocation has no typed bound record",
             )
             continue
+        operation_key = invocation.implementation.operation_key
+        if operation_key.startswith("transform."):
+            try:
+                verify_bound_transformation_authority(invocation)
+            except (TypeError, ValueError) as exc:
+                blockers.add(
+                    ValidationCode.TRANSFORMATION_AUTHORITY_INVALID,
+                    invocation_id,
+                    "selected transformation authority failed independent replay",
+                    {"error": str(exc)},
+                )
+        elif invocation.transformation_authority is not None:
+            blockers.add(
+                ValidationCode.TRANSFORMATION_AUTHORITY_INVALID,
+                invocation_id,
+                "non-transform invocation carries transformation authority",
+            )
+        if operation_key == ACQUISITION_OPERATION_KEY:
+            try:
+                verify_bound_acquisition_authority(invocation)
+            except (TypeError, ValueError) as exc:
+                blockers.add(
+                    ValidationCode.ACQUISITION_AUTHORITY_INVALID,
+                    invocation_id,
+                    "selected acquisition authority failed independent replay",
+                    {"error": str(exc)},
+                )
+        elif invocation.acquisition_authority is not None:
+            blockers.add(
+                ValidationCode.ACQUISITION_AUTHORITY_INVALID,
+                invocation_id,
+                "non-acquisition invocation carries acquisition authority",
+            )
         expected_inputs = tuple(sorted(
             value.requirement_use_id for value in invocation.input_uses))
         expected_outputs = tuple(sorted(
@@ -1825,6 +1881,34 @@ def _validate_cost_and_constraints(
             ValidationCode.EXCLUDED_PRODUCER_SELECTED,
             producer_id,
             "excluded artifact leaf was selected",
+        )
+    universe_satisfactions = {
+        SatisfactionArcSelectionRef.from_arc(value)
+        for value in problem.satisfaction_arcs
+    }
+    selected_satisfactions = {
+        SatisfactionArcSelectionRef(
+            binding.use_id, output.producer_kind, output.producer_id,
+            output.output_port_id)
+        for binding in plan.satisfactions
+        if binding.kind is SatisfactionKind.PRODUCERS
+        for output in binding.outputs
+    }
+    for reference in sorted(
+            set(constraints.required_satisfactions) - universe_satisfactions):
+        blockers.add(
+            ValidationCode.CONSTRAINT_SATISFACTION_UNKNOWN,
+            reference.use_id,
+            "hard satisfaction constraint names an unknown candidate arc",
+            {"constraint": reference.to_dict()},
+        )
+    for reference in sorted(
+            set(constraints.required_satisfactions) - selected_satisfactions):
+        blockers.add(
+            ValidationCode.REQUIRED_SATISFACTION_UNSATISFIED,
+            reference.use_id,
+            "required producer output did not satisfy the constrained use",
+            {"constraint": reference.to_dict()},
         )
     return cost
 

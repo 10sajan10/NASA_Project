@@ -144,13 +144,22 @@ result.retryable_keys(retry_safe=True)   # only the uncommitted ones
 result.retryable_keys(retry_safe=False)  # () — a human decides
 ```
 
-Those retryable keys are now *actionable*. `record_packet_result` writes a
-durable attempt row and returns a retry-safe failure below the attempt ceiling
-to `ADMITTED`, which is what makes it eligible for a new packet. Reaching the
-ceiling, or a template that is not retry-safe, is terminal.
+Those retryable keys are now *actionable*, but a caller may not assert the
+result. Production completion reconstructs the exact bound RuntimeStore run,
+tasks, scientific input receipts, validation records, and artifact commits,
+then derives the `PacketResult` internally. A retry-safe failure below the
+immutable template ceiling returns to `ADMITTED`; reaching the ceiling or a
+non-retry-safe template is terminal.
 
 A committed partition is never un-committed, so a duplicate or late packet
 result cannot destroy work that already landed.
+
+Packet submission also has a durable run/plan/fence intent. Expiry alone never
+authorizes replacement. If the exact runtime run is terminal, its result is
+still derived after expiry. If it has zero attempts, commits, leases, and task
+attempt counts, the store acquires the exclusive runtime controller lock,
+cancels that never-launched run, and releases the member fence without
+consuming attempt sequence. Any uncertain launch evidence remains fenced.
 
 ## A partial result is not a whole one
 
@@ -186,23 +195,23 @@ runtime_root=$(mktemp -d /tmp/nasa-stage7-demo.XXXXXX)
   policy including the fraction round-up.
 - `tests/test_stage7_admission.py` — crash injection at all three transaction
   points, repeated-crash draining, idempotent re-admission, restart resumption,
-  watermark behaviour, committed-is-final, and the 10^4 demonstration.
+  watermark behaviour, committed-is-final, runtime-derived packet completion,
+  expired never-launched reconciliation, late terminal recovery, and the 10^4
+  demonstration.
 
 ## What this does not do
 
-- **Partitions execute, but they do not yet differ.** `compile_packet` turns a
-  packet into one Stage-1 task per partition and `execute_packet` runs it,
-  feeding real per-member outcomes back into the store. What is missing is
-  per-partition *input binding*: every partition of a template runs the same
-  resolved invocation, so this executes real science identically across the
-  space rather than tiling a dataset across it. That binding is the
-  acquisition bridge and is not built.
+- **Partition inputs are bounded, not general.** `PartitionInputManifest`
+  binds a committed artifact to each exact invocation port and logical task;
+  Stage 1 independently resolves its artifact/recipe/content receipt. The
+  bridge currently supports one committed artifact per runtime port, not
+  multi-cardinality inputs, arbitrary ArtifactLeaf plans, rotated/curvilinear
+  fields, or evidence-profile-bound requirement sets.
 - **The 10^4 figures measure the control plane, not 10^4 executions.** Running
   ten thousand subprocesses is not what those numbers show; the executed slice
   in the demo is eight partitions.
-- **A template whose invocation has unbound inputs refuses to execute.** That
-  is deliberate — inventing inputs is exactly what this stage must not do — but
-  it means only input-free invocations are partitionable today.
+- **A template whose invocation inputs are not exactly bound still refuses to
+  execute.** Inventing or substituting partition inputs remains forbidden.
 - **The legacy eager tiling is untouched.** The roadmap says to remove eager
   `list(tile_iter)` behaviour "from the scalable path". The scalable path here
   is new and lazy by construction; `engine/tiled.py` remains the frozen Stage-0

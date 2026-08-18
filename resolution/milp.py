@@ -26,7 +26,12 @@ from composition.oracle import (
     RequirementUseNode,
     SatisfactionArc,
 )
-from engine.runtime.identity import freeze_json, strict_copy, strict_hash
+from engine.runtime.identity import (
+    freeze_json,
+    require_object_fields,
+    strict_copy,
+    strict_hash,
+)
 from plans import (
     CandidateDerivationPlan,
     CompatibilityProofRecord,
@@ -75,6 +80,69 @@ class ProducerSelectionRef:
             "producer_id": self.producer_id,
         }
 
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ProducerSelectionRef":
+        raw = require_object_fields(
+            value, {"producer_kind", "producer_id"},
+            "ProducerSelectionRef")
+        return cls(ProducerKind(raw["producer_kind"]), raw["producer_id"])
+
+
+@dataclass(frozen=True, order=True)
+class SatisfactionArcSelectionRef:
+    """One exact producer-output satisfaction of one requirement use.
+
+    Producer presence is intentionally not enough.  A producer can already be
+    selected to satisfy another port (or contribute another output), while a
+    different producer satisfies the scientifically contested use.  This
+    four-part key is unique in :class:`composition.oracle.OracleProblem` and
+    therefore names the actual decision edge the selector must take.
+    """
+
+    use_id: str
+    producer_kind: ProducerKind
+    producer_id: str
+    output_port_id: str
+
+    def __post_init__(self) -> None:
+        _text(self.use_id, "satisfaction constraint requirement-use identity")
+        if not isinstance(self.producer_kind, ProducerKind):
+            raise TypeError(
+                "satisfaction constraint requires typed ProducerKind")
+        _text(self.producer_id, "satisfaction constraint producer identity")
+        _text(self.output_port_id,
+              "satisfaction constraint output-port identity")
+
+    @classmethod
+    def from_arc(cls, arc: SatisfactionArc) -> "SatisfactionArcSelectionRef":
+        if not isinstance(arc, SatisfactionArc):
+            raise TypeError("satisfaction selection requires a SatisfactionArc")
+        return cls(
+            arc.use_id, arc.producer_kind, arc.producer_id,
+            arc.output_port_id)
+
+    @property
+    def producer(self) -> ProducerSelectionRef:
+        return ProducerSelectionRef(self.producer_kind, self.producer_id)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "use_id": self.use_id,
+            "producer_kind": self.producer_kind.value,
+            "producer_id": self.producer_id,
+            "output_port_id": self.output_port_id,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "SatisfactionArcSelectionRef":
+        raw = require_object_fields(
+            value,
+            {"use_id", "producer_kind", "producer_id", "output_port_id"},
+            "SatisfactionArcSelectionRef")
+        return cls(
+            raw["use_id"], ProducerKind(raw["producer_kind"]),
+            raw["producer_id"], raw["output_port_id"])
+
 
 @dataclass(frozen=True)
 class SelectionConstraints:
@@ -83,6 +151,7 @@ class SelectionConstraints:
     include: tuple[ProducerSelectionRef, ...] = ()
     exclude: tuple[ProducerSelectionRef, ...] = ()
     maximum_cost_units: int | None = None
+    required_satisfactions: tuple[SatisfactionArcSelectionRef, ...] = ()
 
     def __post_init__(self) -> None:
         for values, label in ((self.include, "included producers"),
@@ -95,6 +164,19 @@ class SelectionConstraints:
                 raise ValueError(f"{label} must be unique and canonically ordered")
         if set(self.include) & set(self.exclude):
             raise ValueError("one producer cannot be both included and excluded")
+        if (not isinstance(self.required_satisfactions, tuple)
+                or not all(isinstance(value, SatisfactionArcSelectionRef)
+                           for value in self.required_satisfactions)
+                or self.required_satisfactions
+                != tuple(sorted(self.required_satisfactions))
+                or len(self.required_satisfactions)
+                != len(set(self.required_satisfactions))):
+            raise ValueError(
+                "required satisfactions must be unique and canonically ordered")
+        if ({value.producer for value in self.required_satisfactions}
+                & set(self.exclude)):
+            raise ValueError(
+                "a required satisfaction cannot use an excluded producer")
         if self.maximum_cost_units is not None:
             _nonnegative_integer(self.maximum_cost_units, "maximum cost")
             if self.maximum_cost_units > _MAX_EXACT_FLOAT_INTEGER:
@@ -104,11 +186,14 @@ class SelectionConstraints:
     def bind(
             cls, *, include: Iterable[ProducerSelectionRef] = (),
             exclude: Iterable[ProducerSelectionRef] = (),
+            required_satisfactions: Iterable[
+                SatisfactionArcSelectionRef] = (),
             maximum_cost_units: int | None = None,
     ) -> "SelectionConstraints":
         return cls(
             include=tuple(sorted(include)),
             exclude=tuple(sorted(exclude)),
+            required_satisfactions=tuple(sorted(required_satisfactions)),
             maximum_cost_units=maximum_cost_units,
         )
 
@@ -116,8 +201,32 @@ class SelectionConstraints:
         return {
             "include": [value.to_dict() for value in self.include],
             "exclude": [value.to_dict() for value in self.exclude],
+            "required_satisfactions": [
+                value.to_dict() for value in self.required_satisfactions],
             "maximum_cost_units": self.maximum_cost_units,
         }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "SelectionConstraints":
+        raw = require_object_fields(
+            value,
+            {"include", "exclude", "required_satisfactions",
+             "maximum_cost_units"},
+            "SelectionConstraints")
+        for field_name in ("include", "exclude", "required_satisfactions"):
+            if not isinstance(raw[field_name], list):
+                raise ValueError(
+                    f"SelectionConstraints.{field_name} must be an array")
+        return cls.bind(
+            include=(ProducerSelectionRef.from_dict(item)
+                     for item in raw["include"]),
+            exclude=(ProducerSelectionRef.from_dict(item)
+                     for item in raw["exclude"]),
+            required_satisfactions=(
+                SatisfactionArcSelectionRef.from_dict(item)
+                for item in raw["required_satisfactions"]),
+            maximum_cost_units=raw["maximum_cost_units"],
+        )
 
 
 @dataclass(frozen=True, order=True)
@@ -209,6 +318,14 @@ class MilpSelectionProblem:
             raise ValueError("include constraint references an unknown producer")
         if not set(self.constraints.exclude).issubset(known):
             raise ValueError("exclude constraint references an unknown producer")
+        known_satisfactions = {
+            SatisfactionArcSelectionRef.from_arc(value)
+            for value in self.graph.satisfaction_arcs
+        }
+        if not set(self.constraints.required_satisfactions).issubset(
+                known_satisfactions):
+            raise ValueError(
+                "required satisfaction references an unknown graph arc")
         if strict_hash(self._identity_payload()) != self.selection_problem_id:
             raise ValueError("selection problem identity does not verify")
 
@@ -596,9 +713,12 @@ def _build_model(request: MilpSelectionProblem) -> _LinearModel:
     for use in graph.uses:
         model.use_index[use.use_id] = model.variable(
             f"active-use:{use.use_id}")
+    required_satisfactions = set(request.constraints.required_satisfactions)
     for arc in graph.satisfaction_arcs:
+        required = SatisfactionArcSelectionRef.from_arc(arc)
         model.arc_index[arc.arc_id] = model.variable(
-            f"satisfaction:{arc.arc_id}")
+            f"satisfaction:{arc.arc_id}",
+            lower=1.0 if required in required_satisfactions else 0.0)
     for use in graph.uses:
         if use.default_id is not None:
             binding = _nonproducer_choice(use, SatisfactionKind.DEFAULT)
@@ -1028,6 +1148,18 @@ def _semantic_errors(
         elif not use.optional:
             errors.append(f"required use {use_id} was omitted")
 
+    selected_satisfactions = {
+        SatisfactionArcSelectionRef(
+            binding.use_id, output.producer_kind, output.producer_id,
+            output.output_port_id)
+        for binding in plan.satisfactions
+        if binding.kind is SatisfactionKind.PRODUCERS
+        for output in binding.outputs
+    }
+    if not set(request.constraints.required_satisfactions).issubset(
+            selected_satisfactions):
+        errors.append("required satisfaction arc is absent")
+
     for _output, use_ids in output_uses.items():
         if len(set(use_ids)) > 1 and any(
                 not use_by_id[value].shareable for value in use_ids):
@@ -1109,12 +1241,15 @@ def _static_blockers(request: MilpSelectionProblem) -> tuple[SelectionBlocker, .
     for arc in graph.satisfaction_arcs:
         if arc.use_id in arcs_by_use:
             arcs_by_use[arc.use_id].append(arc)
-    for ref in request.constraints.include:
+    required_producers = {
+        value.producer for value in request.constraints.required_satisfactions
+    }
+    for ref in sorted(set(request.constraints.include) | required_producers):
         if ref.producer_kind is ProducerKind.ARTIFACT_LEAF:
             if not leaf_by_id[ref.producer_id].committed:
                 values.append(SelectionBlocker(
                     "ARTIFACT_NOT_COMMITTED", ref.producer_id,
-                    "an explicitly included artifact is not committed"))
+                    "an explicitly required artifact is not committed"))
         else:
             invocation = invocation_by_id[ref.producer_id]
             feasible = [value for value in options_by_invocation[ref.producer_id]
@@ -1124,13 +1259,13 @@ def _static_blockers(request: MilpSelectionProblem) -> tuple[SelectionBlocker, .
                     ref.producer_id] for code in value.blocker_codes})
                 values.append(SelectionBlocker(
                     "DEPLOYMENT_INFEASIBLE", ref.producer_id,
-                    "an explicitly included invocation has no feasible "
+                    "an explicitly required invocation has no feasible "
                     "frozen deployment class",
                     {"site_blocker_codes": codes}))
             if not invocation.input_use_ids and not invocation.zero_input_source:
                 values.append(SelectionBlocker(
                     "UNGROUNDED_INVOCATION", ref.producer_id,
-                    "an explicitly included zero-input invocation is not a source"))
+                    "an explicitly required zero-input invocation is not a source"))
     if request.constraints.maximum_cost_units is not None:
         values.append(SelectionBlocker(
             "COST_BUDGET", request.selection_problem_id,
@@ -1447,6 +1582,7 @@ __all__ = [
     "MilpSolveOptions",
     "MilpStatus",
     "ProducerSelectionRef",
+    "SatisfactionArcSelectionRef",
     "SelectionBlocker",
     "SelectionConstraints",
     "solve_milp",

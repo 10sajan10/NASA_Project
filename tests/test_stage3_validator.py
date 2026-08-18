@@ -33,6 +33,10 @@ from resolution.validator import (
     ValidationCode,
     validate_selected_plan,
 )
+from resolution.milp import (
+    SatisfactionArcSelectionRef,
+    SelectionConstraints as MilpSelectionConstraints,
+)
 from stage2.demo import build_demo_plan
 from stage2.demo import (
     _add_spec,
@@ -111,6 +115,34 @@ def test_validator_accumulates_budget_policy_and_completeness_blockers():
     assert report.blocker_tree is not None
     assert report.blocker_tree.complete
     assert report.blocker_tree.logic == "ALL"
+
+
+def test_validator_independently_replays_exact_satisfaction_constraints():
+    demo = build_demo_plan()
+    selected = {
+        (binding.use_id, output.producer_kind, output.producer_id,
+         output.output_port_id)
+        for binding in demo.bound_plan.candidate_plan.satisfactions
+        if binding.kind is SatisfactionKind.PRODUCERS
+        for output in binding.outputs
+    }
+    unselected_arc = next(
+        arc for arc in demo.oracle_problem.satisfaction_arcs
+        if (arc.use_id, arc.producer_kind, arc.producer_id,
+            arc.output_port_id) not in selected)
+    constraint = SatisfactionArcSelectionRef.from_arc(unselected_arc)
+
+    report = validate_selected_plan(
+        demo.bound_plan.candidate_plan,
+        demo.oracle_problem,
+        constraints=MilpSelectionConstraints.bind(
+            required_satisfactions=(constraint,)),
+        **_demo_validation_arguments(demo),
+    )
+
+    assert not report.valid
+    assert ValidationCode.REQUIRED_SATISFACTION_UNSATISFIED in {
+        value.code for value in report.blockers}
 
 
 def test_validator_rejects_an_unbound_deployment_choice():

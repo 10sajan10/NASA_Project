@@ -43,10 +43,11 @@ CONCEPT = "example.fire.arrival"
 
 
 def _grid(shape, cell, *, crs="EPSG:32614", origin=(0.0, 9000.0)):
+    """Grid from outer upper-left edge; descriptor stores first centre."""
     return GridDescriptor(
         crs, ("easting", "northing"), shape,
-        (repr(float(cell)), "0", repr(float(origin[0])),
-         "0", repr(-float(cell)), repr(float(origin[1]))),
+        (repr(float(cell)), "0", repr(float(origin[0] + cell / 2)),
+         "0", repr(-float(cell)), repr(float(origin[1] - cell / 2))),
         SpatialScale(repr(float(cell)), repr(float(cell)), "m"))
 
 
@@ -57,13 +58,14 @@ def _descriptor(grid, *, units="s", origin=OriginClass.SYNTHETIC):
         representation="application/json",
         units=units,
         spatial_support=BBoxSupport(
-            "EPSG:32614", ("x", "y"), ("0", "0", "9000", "9000")),
+            grid.crs, grid.axis_order, grid.support_bounds),
         temporal_support=TemporalSupport(TemporalKind.TIME_INVARIANT),
         vertical_support=None,
         grid=grid,
         native_resolution=None,
         origin=origin,
         missingness=Missingness(MissingnessStatus.COMPLETE),
+        component_names=("value",),
     )
 
 
@@ -115,7 +117,9 @@ def test_a_well_formed_block_aggregation_binds():
     assert spec.kind is TransformationKind.SPATIAL_BLOCK_AGGREGATE
     assert spec.semantic_rule_id == "semantic:block-aggregation-registry-v1"
     assert spec.scientific_assumption_ids == (
-        "partition:exact-integer-block-cover-v1",)
+        "grid:sample-centres-axis-aligned-v1",
+        "partition:exact-integer-block-cover-v1",
+    )
     assert spec.spec_id == spec.expected_id()
 
 
@@ -152,7 +156,7 @@ def test_cell_sizes_must_agree_with_the_block_factors():
 
 
 def test_an_offset_lattice_is_refused():
-    with pytest.raises(ValueError, match="shared origin"):
+    with pytest.raises(ValueError, match="exact block centre"):
         _spec(result_grid=_grid((3, 3), 300.0, origin=(50.0, 9000.0)))
 
 
@@ -162,8 +166,9 @@ def test_an_offset_lattice_is_refused():
 def _field(values):
     size = len(values)
     return {
-        "schema": "field-json-v1",
+        "schema": "field-json-v2",
         "crs": "EPSG:32614",
+        "axis_order": ["easting", "northing"],
         "x": [float(index) for index in range(size)],
         "y": [float(index) for index in range(size)],
         "time": ["2019-09-04T12:00:00Z"],
@@ -197,6 +202,18 @@ def test_a_fraction_takes_the_plain_mean_over_an_exact_cover():
     result = _run({"block_x": 2, "block_y": 2,
                    "aggregation": "AREAL_FRACTION_MEAN"}, _field(values))
     assert result["components"]["value"][0] == [[0.5, 1.0], [0.0, 0.25]]
+
+
+def test_decimal_block_centres_match_the_exact_descriptor_lattice():
+    field = _field([[1.0, 2.0, 3.0, 4.0],
+                    [5.0, 6.0, 7.0, 8.0]])
+    field["x"] = [0.1, 0.2, 0.3, 0.4]
+    field["y"] = [1.1, 1.2]
+    result = _run({"block_x": 2, "block_y": 2,
+                   "aggregation": "AREAL_FRACTION_MEAN"}, field)
+
+    assert result["x"] == [0.15, 0.35]
+    assert result["y"] == [1.15]
 
 
 def test_a_category_takes_the_majority_and_never_an_average():

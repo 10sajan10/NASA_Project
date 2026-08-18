@@ -33,6 +33,7 @@ from .milp import (
     solve_milp,
 )
 from .projection import project_oracle_problem
+from .upstream import DiscoveryCertificate, DiscoveryUniverseContract
 from .validator import (
     ProofReplayContext,
     SelectedPlanValidationReport,
@@ -88,21 +89,32 @@ class ResolutionOutcome:
     require_proven_optimal: bool
     eligible_for_binding: bool
     metrics: PlanningMetrics
-    # Truncation reported by discovery that ran *before* this resolver and
-    # produced its catalog (Stage-4 transformation closure, later Stage-5
-    # remote search).  Empty means no upstream limit fired.
-    upstream_limit_codes: tuple[str, ...] = ()
+    discovery_certificate: DiscoveryCertificate
+    discovery_universe: DiscoveryUniverseContract
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ResolutionStatus):
             raise TypeError("resolution status must be ResolutionStatus")
-        if (not isinstance(self.upstream_limit_codes, tuple)
-                or any(not isinstance(value, str) or not value.strip()
-                       for value in self.upstream_limit_codes)
-                or self.upstream_limit_codes
-                != tuple(sorted(set(self.upstream_limit_codes)))):
+        if not isinstance(self.discovery_certificate, DiscoveryCertificate):
+            raise TypeError("resolution needs a typed discovery certificate")
+        if not isinstance(self.discovery_universe, DiscoveryUniverseContract):
+            raise TypeError("resolution needs a typed discovery universe")
+        if (self.discovery_certificate.subject_catalog_id
+                != self.hypergraph.catalog_id):
             raise ValueError(
-                "upstream limit codes must be unique, sorted, non-empty text")
+                "resolution certificate covers another capability catalog")
+        self.discovery_universe.verify_coverage(self.discovery_certificate)
+        snapshots = {
+            item.name: item.snapshot_id
+            for item in self.selector_problem.snapshot_refs}
+        if snapshots.get("discovery_certificate") \
+                != self.discovery_certificate.certificate_id:
+            raise ValueError(
+                "selector problem does not bind the discovery certificate")
+        if snapshots.get("discovery_universe") \
+                != self.discovery_universe.universe_id:
+            raise ValueError(
+                "selector problem does not bind the discovery universe")
         if type(self.require_proven_optimal) is not bool:
             raise TypeError("require_proven_optimal must be bool")
         if type(self.eligible_for_binding) is not bool:
@@ -118,7 +130,7 @@ class ResolutionOutcome:
 
     def _identity_payload(self) -> dict[str, Any]:
         return {
-            "schema": "stage3-resolution-outcome-v1",
+            "schema": "stage8r-resolution-outcome-v3",
             "status": self.status.value,
             "hypergraph_id": self.hypergraph.graph_id,
             "selector_problem_id": self.selector_problem.problem_id,
@@ -137,12 +149,14 @@ class ResolutionOutcome:
                 self.validation.report_id if self.validation else None),
             "require_proven_optimal": self.require_proven_optimal,
             "eligible_for_binding": self.eligible_for_binding,
-            "upstream_limit_codes": list(self.upstream_limit_codes),
+            "discovery_certificate_id":
+                self.discovery_certificate.certificate_id,
+            "discovery_universe_id": self.discovery_universe.universe_id,
         }
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema": "stage3-resolution-outcome-v1",
+            "schema": "stage8r-resolution-outcome-v3",
             "resolution_id": self.resolution_id,
             "status": self.status.value,
             "hypergraph_id": self.hypergraph.graph_id,
@@ -158,8 +172,12 @@ class ResolutionOutcome:
                 # conjunction cannot be inverted, and the limit codes below
                 # already name every truncation that actually fired.
                 "complete": self.selection.discovery_complete,
+                "claim_scope":
+                    "DECLARED_CERTIFICATE_COVERED_UNIVERSE",
                 "graph_expansion_complete": self.hypergraph.discovery_complete,
                 "upstream_limit_codes": list(self.upstream_limit_codes),
+                "certificate": self.discovery_certificate.to_dict(),
+                "universe": self.discovery_universe.to_dict(),
                 "requirements": len(self.hypergraph.requirement_nodes),
                 "uses": len(self.hypergraph.use_nodes),
                 "invocations": len(self.hypergraph.invocation_nodes),
@@ -204,6 +222,11 @@ class ResolutionOutcome:
             "metrics": self.metrics.to_dict(),
         }
 
+    @property
+    def upstream_limit_codes(self) -> tuple[str, ...]:
+        """Compatibility report derived from the authenticated certificate."""
+        return self.discovery_certificate.limit_codes
+
 
 class WorkflowResolver:
     """Resolve typed requirements against frozen catalogs and snapshots.
@@ -218,43 +241,76 @@ class WorkflowResolver:
         catalog: CapabilityCatalog,
         deployment_snapshot: DeploymentCapabilitySnapshot,
         *,
+        discovery_certificate: DiscoveryCertificate,
+        discovery_universe: DiscoveryUniverseContract,
+        discovery_replays: Iterable[object] = (),
         artifact_leaves: Iterable[ArtifactLeaf] = (),
         availability_snapshot: ArtifactAvailabilitySnapshot | None = None,
         evidence_snapshot: EvidenceSnapshot | None = None,
         discovery_limits: DiscoveryLimits = DiscoveryLimits(),
-        upstream_discovery_complete: bool = True,
-        upstream_limit_codes: Iterable[str] = (),
     ) -> None:
         if not isinstance(catalog, CapabilityCatalog):
             raise TypeError("catalog must be CapabilityCatalog")
         if not isinstance(deployment_snapshot, DeploymentCapabilitySnapshot):
             raise TypeError(
                 "deployment_snapshot must be DeploymentCapabilitySnapshot")
-        if type(upstream_discovery_complete) is not bool:
-            raise TypeError("upstream_discovery_complete must be bool")
-        codes = tuple(upstream_limit_codes)
-        if any(not isinstance(value, str) or not value.strip()
-               for value in codes):
-            raise TypeError("upstream limit codes must be non-empty text")
-        if upstream_discovery_complete and codes:
+        if not isinstance(discovery_certificate, DiscoveryCertificate):
+            raise TypeError(
+                "discovery_certificate must be DiscoveryCertificate")
+        if not isinstance(discovery_universe, DiscoveryUniverseContract):
+            raise TypeError(
+                "discovery_universe must be DiscoveryUniverseContract")
+        if discovery_certificate.subject_catalog_id != catalog.catalog_id:
             raise ValueError(
-                "complete upstream discovery cannot report limit codes")
-        if not upstream_discovery_complete and not codes:
+                "discovery certificate covers another capability catalog")
+        expected_certificate = DiscoveryCertificate.for_catalog(catalog)
+        if discovery_certificate != expected_certificate:
             raise ValueError(
-                "incomplete upstream discovery must name its limit codes")
+                "discovery certificate does not match catalog provenance")
+        discovery_universe.verify_coverage(discovery_certificate)
+        replay_values = tuple(discovery_replays)
+        if discovery_certificate.layers:
+            # Keep the replay boundary closed.  A caller-authored object with
+            # an arbitrary ``verify`` callable is not scientific authority.
+            from acquisition import AcquisitionDiscoveryReplay
+            from transformations import TransformationDiscoveryReplay
+
+            allowed = (AcquisitionDiscoveryReplay,
+                       TransformationDiscoveryReplay)
+            if not all(isinstance(item, allowed) for item in replay_values):
+                raise TypeError(
+                    "discovery_replays must contain closed typed replay values")
+            unmatched = list(discovery_certificate.layers)
+            for replay in replay_values:
+                candidates = [layer for layer in unmatched
+                              if layer.layer_kind == (
+                                  "ACQUISITION_EXPANSION"
+                                  if isinstance(replay, AcquisitionDiscoveryReplay)
+                                  else "TRANSFORMATION_EXPANSION")]
+                if len(candidates) != 1:
+                    raise ValueError(
+                        "discovery replay does not map uniquely to a catalog layer")
+                layer = candidates[0]
+                replay.verify(catalog, layer)
+                unmatched.remove(layer)
+            if unmatched:
+                raise ValueError(
+                    "every discovered catalog layer requires independent replay")
+        elif replay_values:
+            raise ValueError(
+                "an authored catalog cannot take discovery replay evidence")
         self.catalog = catalog
         self.deployment_snapshot = deployment_snapshot
         self.artifact_leaves = tuple(artifact_leaves)
         self.availability_snapshot = availability_snapshot
         self.evidence_snapshot = evidence_snapshot
         self.discovery_limits = discovery_limits
-        # Discovery performed before this resolver — Stage-4 transformation
-        # closure today, Stage-5 remote metadata search later — may itself be
-        # truncated.  A selection that is optimal over a catalog which is
-        # missing candidates is not globally optimal, so upstream truncation
-        # has to reach the same completeness flag the graph builder feeds.
-        self.upstream_discovery_complete = upstream_discovery_complete
-        self.upstream_limit_codes = tuple(sorted(set(codes)))
+        # The certificate is reconstructed from catalog provenance above. The
+        # required universe is deliberately not: it is the independent record
+        # of what discovery planning intended to cover.
+        self.discovery_certificate = discovery_certificate
+        self.discovery_universe = discovery_universe
+        self.discovery_replays = replay_values
 
     def resolve(
         self,
@@ -284,17 +340,22 @@ class WorkflowResolver:
         graph_ns = perf_counter_ns() - graph_started
 
         projection_started = perf_counter_ns()
-        selector_problem = project_oracle_problem(graph)
+        selector_problem = project_oracle_problem(
+            graph,
+            discovery_certificate_id=
+                self.discovery_certificate.certificate_id,
+            discovery_universe_id=self.discovery_universe.universe_id,
+        )
         projection_ns = perf_counter_ns() - projection_started
 
         discovery_complete = (
-            graph.discovery_complete and self.upstream_discovery_complete)
+            graph.discovery_complete and self.discovery_certificate.complete)
         selection_request = MilpSelectionProblem.bind(
             selector_problem,
             discovery_complete=discovery_complete,
             discovery_limit_codes=(
                 tuple(value.code.value for value in graph.limit_reasons)
-                + self.upstream_limit_codes),
+                + self.discovery_certificate.limit_codes),
             deployment_options=_deployment_options(graph),
             constraints=request_constraints,
         )
@@ -362,7 +423,8 @@ class WorkflowResolver:
             "require_proven_optimal": require_proven_optimal,
             "eligible_for_binding": eligible,
             "metrics": metrics,
-            "upstream_limit_codes": self.upstream_limit_codes,
+            "discovery_certificate": self.discovery_certificate,
+            "discovery_universe": self.discovery_universe,
         }
         for name, value in identity_values.items():
             object.__setattr__(provisional, name, value)
@@ -477,6 +539,7 @@ def _validator_constraints(
         exclude_invocation_ids=excluded_invocations,
         include_artifact_leaf_ids=included_leaves,
         exclude_artifact_leaf_ids=excluded_leaves,
+        required_satisfactions=value.required_satisfactions,
         # Completeness is an execution-policy gate on ResolutionOutcome.  The
         # validator must still establish structural safety for a timeout or
         # truncated-discovery incumbent.

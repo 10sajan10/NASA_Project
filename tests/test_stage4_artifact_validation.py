@@ -15,11 +15,14 @@ DESCRIPTOR_ID = "d" * 64
 
 def _configuration(*, temporal=None):
     return {
-        "kind": "field_json_v1",
+        "kind": "field_json_v2",
         "descriptor_id": DESCRIPTOR_ID,
         "crs": "EPSG:4326",
+        "grid_affine_convention": "sample-centres-axis-aligned-v1",
+        "grid_axis_order": ["longitude", "latitude"],
         "grid_shape": [2, 2],
         "grid_affine": ["1", "0", "0", "0", "1", "10"],
+        "grid_support_bounds": ["-0.5", "9.5", "1.5", "11.5"],
         "temporal": temporal or {
             "kind": "TIME_INVARIANT",
             "start": None,
@@ -32,8 +35,9 @@ def _configuration(*, temporal=None):
 
 def _field():
     return {
-        "schema": "field-json-v1",
+        "schema": "field-json-v2",
         "crs": "EPSG:4326",
+        "axis_order": ["longitude", "latitude"],
         "x": [0.0, 1.0],
         "y": [10.0, 11.0],
         "time": ["TIME_INVARIANT"],
@@ -69,8 +73,8 @@ def test_valid_field_is_semantically_validated_before_commit(tmp_path):
                 "WHERE attempt_id IN (SELECT attempt_id FROM attempts "
                 "WHERE run_id=?)", (run_id,),
             ).fetchone()
-        assert validator_id == "stage4.field-json@1"
-        assert '"field_json_v1":true' in report
+        assert validator_id == "stage8r.field-json@2"
+        assert '"field_json_v2":true' in report
 
 
 @pytest.mark.parametrize("mutation", [
@@ -121,3 +125,40 @@ def test_series_field_must_match_exact_half_open_descriptor_lattice(tmp_path):
     with WorkflowController(tmp_path / "bad") as controller:
         run_id = controller.create_run(bad_graph)
         assert controller.run_until_terminal(run_id) is RunState.FAILED
+
+
+def test_north_up_signed_y_grid_commits_with_exact_sample_centres(tmp_path):
+    configuration = _configuration()
+    configuration["grid_affine"] = ["1", "0", "0", "0", "-1", "10"]
+    configuration["grid_support_bounds"] = ["-0.5", "8.5", "1.5", "10.5"]
+    value = _field()
+    value["y"] = [10.0, 9.0]
+
+    graph = _graph(value, configuration=configuration)
+    with WorkflowController(tmp_path) as controller:
+        run_id = controller.create_run(graph)
+        assert controller.run_until_terminal(run_id) is RunState.SUCCEEDED
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda config: config.update(
+            grid_affine_convention="pixel-corners-unspecified"),
+        lambda config: config.update(grid_axis_order=["latitude", "longitude"]),
+        lambda config: config.update(
+            grid_support_bounds=["0", "9", "2", "12"]),
+        lambda config: config.update(
+            grid_affine=["1", "0.1", "0", "0", "1", "10"]),
+    ],
+)
+def test_grid_contract_mismatch_fails_before_publication(
+        tmp_path, mutation):
+    configuration = _configuration()
+    mutation(configuration)
+    graph = _graph(_field(), configuration=configuration)
+    with WorkflowController(tmp_path) as controller:
+        run_id = controller.create_run(graph)
+        assert controller.run_until_terminal(run_id) is RunState.FAILED
+        assert controller.store.task_state(
+            run_id, graph.tasks[0].task_id) is TaskState.INVALID_OUTPUT

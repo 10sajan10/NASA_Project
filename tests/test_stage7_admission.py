@@ -8,6 +8,7 @@ the partition space.
 """
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from partitions import (
     PartitionAxis,
     PartitionSetSpec,
     PartitionStore,
+    PartitionRetryPolicy,
     PartitionTaskTemplate,
 )
 
@@ -40,11 +42,13 @@ def _spec(tiles: int = 10, windows: int = 10) -> PartitionSetSpec:
     ))
 
 
-def _template() -> PartitionTaskTemplate:
+def _template(**policy) -> PartitionTaskTemplate:
     # A real resolved invocation, not a restated one: the template must carry
     # the science the resolver actually chose.
     from stage7.fixtures import resolve_one_selection
-    return PartitionTaskTemplate.bind(resolve_one_selection(), retry_safe=True)
+    if not policy:
+        policy = {"retry_safe": True}
+    return PartitionTaskTemplate.bind(resolve_one_selection(), **policy)
 
 
 def _manifest(spec: PartitionSetSpec,
@@ -183,7 +187,7 @@ def test_a_restarted_controller_resumes_the_persisted_cursor(tmp_path):
     first = BoundedAdmissionController(
         first_store, manifest, spec, template, policy=policy)
     first.top_up()
-    first_store.record_outcomes(first.collection_id, [
+    first_store._record_outcomes_for_test_fixture(first.collection_id, [
         (key, MemberOutcome.COMMITTED) for key, _index
         in first_store.iter_admitted(first.collection_id, 40)])
     cursor = first_store.cursor(manifest.collection_id).next_index
@@ -232,7 +236,7 @@ def test_top_up_refills_only_after_falling_to_the_low_watermark(workspace):
     controller.top_up()
     # Commit down to the low watermark.
     for key, _index in list(store.iter_admitted(controller.collection_id, 12)):
-        store.record_outcome(controller.collection_id, key,
+        store._record_outcome_for_test_fixture(controller.collection_id, key,
                              MemberOutcome.COMMITTED)
     assert store.in_flight(controller.collection_id) == 4
     assert controller.top_up().admitted == 12
@@ -260,7 +264,7 @@ def test_the_whole_space_drains_within_the_watermark(tmp_path):
                 seen.add(member.partition_index)
                 outcomes.append(
                     (member.logical_task_key, MemberOutcome.COMMITTED))
-        store.record_outcomes(controller.collection_id, outcomes)
+        store._record_outcomes_for_test_fixture(controller.collection_id, outcomes)
 
     assert len(seen) == spec.total          # every partition, exactly once
     assert peak_in_flight <= policy.high_watermark
@@ -271,10 +275,10 @@ def test_a_committed_partition_is_never_un_committed(workspace):
     store, manifest, spec, template = workspace
     store.admit_window(manifest.collection_id, spec, template, 4)
     key, _index = next(iter(store.iter_admitted(manifest.collection_id, 1)))
-    assert store.record_outcome(manifest.collection_id, key,
+    assert store._record_outcome_for_test_fixture(manifest.collection_id, key,
                                 MemberOutcome.COMMITTED)
     # A duplicate or late packet result claiming failure must not win.
-    assert not store.record_outcome(manifest.collection_id, key,
+    assert not store._record_outcome_for_test_fixture(manifest.collection_id, key,
                                     MemberOutcome.FAILED)
     assert store.state(manifest.collection_id).committed == 1
     assert store.state(manifest.collection_id).failed == 0
@@ -285,9 +289,10 @@ def test_a_partial_collection_is_not_complete(workspace):
     store.admit_window(manifest.collection_id, spec, template, spec.total)
     keys = [key for key, _ in store.iter_admitted(
         manifest.collection_id, spec.total)]
-    store.record_outcomes(manifest.collection_id, [
+    store._record_outcomes_for_test_fixture(manifest.collection_id, [
         (key, MemberOutcome.COMMITTED) for key in keys[:-1]])
-    store.record_outcome(manifest.collection_id, keys[-1], MemberOutcome.FAILED)
+    store._record_outcome_for_test_fixture(
+        manifest.collection_id, keys[-1], MemberOutcome.FAILED)
     state = store.state(manifest.collection_id)
     assert state.committed == spec.total - 1
     assert not state.satisfies(manifest)
@@ -374,6 +379,19 @@ def _one_packet(store, controller):
     return controller.next_packets(limit=4)[0]
 
 
+def _registered_attempt(store, manifest, packet, number, fence, **kwargs):
+    """Use the same durable pre-submission authority as a real executor."""
+    return store.register_packet_attempt(
+        manifest.collection_id,
+        packet,
+        fence_token=fence,
+        runtime_run_id=f"fixture-run-{fence}",
+        runtime_plan_id="f" * 64,
+        expected_attempt_number=number,
+        **kwargs,
+    )
+
+
 def test_a_failed_retry_safe_member_comes_back_for_another_attempt(tmp_path):
     from partitions import PacketAttempt, PacketResult
     spec, template = _spec(2, 2), _template()
@@ -386,13 +404,13 @@ def test_a_failed_retry_safe_member_comes_back_for_another_attempt(tmp_path):
     packet = _one_packet(store, controller)
     failing = packet.logical_task_keys[0]
 
-    attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
+    attempt = _registered_attempt(
+        store, manifest, packet, 1, "fence-1")
     result = PacketResult.bind(attempt, packet, tuple(
         (key, MemberOutcome.FAILED if key == failing else
          MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
-    decision = store.record_packet_result(
-        manifest.collection_id, packet, attempt, result,
-        retry_safe=True, max_attempts=3)
+    decision = store._record_packet_result_for_test_fixture(
+        manifest.collection_id, packet, attempt, result)
 
     assert decision.requeued == (failing,)
     assert decision.exhausted == ()
@@ -418,15 +436,18 @@ def test_retries_stop_at_the_attempt_ceiling(tmp_path):
     failing = packet.logical_task_keys[0]
 
     decision = None
-    for number in (1, 2, 3):
-        attempt = PacketAttempt.bind(packet, number,
-                                     fence_token=f"fence-{number}")
+    for number, packet_attempt_number in enumerate((1, 1, 2), start=1):
+        if number > 1:
+            packet = controller.next_packets(limit=4)[0]
+            assert packet.logical_task_keys == (failing,)
+        attempt = _registered_attempt(
+            store, manifest, packet, packet_attempt_number,
+            f"fence-{number}")
         result = PacketResult.bind(attempt, packet, tuple(
             (key, MemberOutcome.FAILED if key == failing else
              MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
-        decision = store.record_packet_result(
-            manifest.collection_id, packet, attempt, result,
-            retry_safe=True, max_attempts=3)
+        decision = store._record_packet_result_for_test_fixture(
+            manifest.collection_id, packet, attempt, result)
 
     assert decision.exhausted == (failing,)
     assert store.attempt_count(manifest.collection_id, failing) == 3
@@ -440,7 +461,8 @@ def test_retries_stop_at_the_attempt_ceiling(tmp_path):
 
 def test_a_non_retry_safe_failure_is_terminal_immediately(tmp_path):
     from partitions import PacketAttempt, PacketResult
-    spec, template = _spec(2, 2), _template()
+    spec, template = _spec(2, 2), _template(
+        retry_policy=PartitionRetryPolicy(False, 1))
     store = PartitionStore(tmp_path / "p.sqlite3")
     manifest = _manifest(spec, template)
     controller = BoundedAdmissionController(
@@ -450,20 +472,80 @@ def test_a_non_retry_safe_failure_is_terminal_immediately(tmp_path):
     packet = _one_packet(store, controller)
     failing = packet.logical_task_keys[0]
 
-    attempt = PacketAttempt.bind(packet, 1, fence_token="fence-1")
+    attempt = _registered_attempt(
+        store, manifest, packet, 1, "fence-1")
     result = PacketResult.bind(attempt, packet, tuple(
         (key, MemberOutcome.FAILED if key == failing else
          MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
-    decision = store.record_packet_result(
-        manifest.collection_id, packet, attempt, result,
-        retry_safe=False, max_attempts=3)
+    decision = store._record_packet_result_for_test_fixture(
+        manifest.collection_id, packet, attempt, result)
 
     # Re-running a non-idempotent operation is a human decision, not a default.
     assert decision.requeued == ()
     assert decision.exhausted == (failing,)
 
 
-def test_a_committed_member_survives_a_late_duplicate_result(tmp_path):
+def test_caller_cannot_widen_registered_retry_safety(tmp_path):
+    """Result ingestion derives policy from immutable collection state."""
+    from partitions import PacketAttempt, PacketResult
+    spec = _spec(2, 2)
+    template = _template(
+        retry_policy=PartitionRetryPolicy(False, 1))
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    attempt = _registered_attempt(
+        store, manifest, packet, 1, "unsafe-widen")
+    failed = PacketResult.bind(attempt, packet, tuple(
+        (key, MemberOutcome.FAILED) for key in packet.logical_task_keys))
+
+    decision = store._record_packet_result_for_test_fixture(
+        manifest.collection_id, packet, attempt, failed,
+        retry_safe=True, max_attempts=100)
+    assert decision.requeued == ()
+    assert set(decision.exhausted) == set(packet.logical_task_keys)
+    assert controller.next_packets(limit=4) == ()
+
+
+def test_caller_cannot_widen_registered_attempt_ceiling(tmp_path):
+    from partitions import PacketAttempt, PacketResult
+    spec = _spec(2, 2)
+    template = _template(
+        retry_policy=PartitionRetryPolicy(True, 2))
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+
+    first = _registered_attempt(
+        store, manifest, packet, 1, "ceiling-1")
+    failed_first = PacketResult.bind(first, packet, tuple(
+        (key, MemberOutcome.FAILED) for key in packet.logical_task_keys))
+    first_decision = store._record_packet_result_for_test_fixture(
+        manifest.collection_id, packet, first, failed_first,
+        max_attempts=20)
+    assert set(first_decision.requeued) == set(packet.logical_task_keys)
+
+    second = _registered_attempt(
+        store, manifest, packet, 2, "ceiling-2")
+    failed_second = PacketResult.bind(second, packet, tuple(
+        (key, MemberOutcome.FAILED) for key in packet.logical_task_keys))
+    second_decision = store._record_packet_result_for_test_fixture(
+        manifest.collection_id, packet, second, failed_second,
+        max_attempts=20)
+    assert second_decision.requeued == ()
+    assert set(second_decision.exhausted) == set(packet.logical_task_keys)
+
+
+def test_registered_retry_policy_tamper_fails_closed(tmp_path):
+    """The store re-verifies its serialized template before each decision."""
     from partitions import PacketAttempt, PacketResult
     spec, template = _spec(2, 2), _template()
     store = PartitionStore(tmp_path / "p.sqlite3")
@@ -473,26 +555,398 @@ def test_a_committed_member_survives_a_late_duplicate_result(tmp_path):
         policy=AdmissionPolicy(window_size=4, low_watermark=1,
                                high_watermark=4))
     packet = _one_packet(store, controller)
+    attempt = _registered_attempt(
+        store, manifest, packet, 1, "tampered-policy")
+    failed = PacketResult.bind(attempt, packet, tuple(
+        (key, MemberOutcome.FAILED) for key in packet.logical_task_keys))
 
-    first = PacketAttempt.bind(packet, 1, fence_token="fence-1")
-    store.record_packet_result(
+    forged = template.to_dict()
+    forged["retry_policy"]["max_attempts"] = 300
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE collections SET template_json=? WHERE collection_id=?",
+            (json.dumps(forged, sort_keys=True, separators=(",", ":")),
+             manifest.collection_id))
+
+    with pytest.raises(ValueError, match="identity does not verify"):
+        store._record_packet_result_for_test_fixture(
+            manifest.collection_id, packet, attempt, failed)
+    assert all(store.attempt_count(manifest.collection_id, key) == 0
+               for key in packet.logical_task_keys)
+
+
+def test_committed_members_cannot_be_resubmitted(tmp_path):
+    from partitions import (
+        PacketAttemptAuthorityError,
+        PacketResult,
+    )
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+
+    first = _registered_attempt(
+        store, manifest, packet, 1, "fence-1")
+    store._record_packet_result_for_test_fixture(
         manifest.collection_id, packet, first,
         PacketResult.bind(first, packet, tuple(
             (key, MemberOutcome.COMMITTED)
-            for key in packet.logical_task_keys)),
-        retry_safe=True, max_attempts=3)
-    committed = store.state(manifest.collection_id).committed
+            for key in packet.logical_task_keys)))
+    with pytest.raises(PacketAttemptAuthorityError, match="currently admitted"):
+        _registered_attempt(store, manifest, packet, 2, "stale-fence")
+    assert store.state(manifest.collection_id).committed == len(
+        packet.logical_task_keys)
 
-    late = PacketAttempt.bind(packet, 2, fence_token="stale-fence")
-    decision = store.record_packet_result(
-        manifest.collection_id, packet, late,
-        PacketResult.bind(late, packet, tuple(
-            (key, MemberOutcome.FAILED)
-            for key in packet.logical_task_keys)),
-        retry_safe=True, max_attempts=3)
 
-    assert decision.committed == () and decision.requeued == ()
-    assert store.state(manifest.collection_id).committed == committed
+def test_packet_result_replay_is_idempotent_and_conflicts_fail_closed(tmp_path):
+    from partitions import (
+        PacketAttempt, PacketResult, PacketResultConflictError,
+    )
+    spec, template = _spec(2, 2), _template()
+    clock = [10.0]
+    store = PartitionStore(tmp_path / "p.sqlite3", clock=lambda: clock[0])
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    attempt = _registered_attempt(
+        store, manifest, packet, 1, "stable-fence",
+        lease_duration_s=1.0)
+    failed = PacketResult.bind(attempt, packet, tuple(
+        (key, MemberOutcome.FAILED) for key in packet.logical_task_keys))
+
+    clock[0] = 10.5
+    first = store._record_packet_result_for_test_fixture(
+        manifest.collection_id, packet, attempt, failed)
+    # A completed result remains replayable after the former lease horizon.
+    clock[0] = 100.0
+    replay = store._record_packet_result_for_test_fixture(
+        manifest.collection_id, packet, attempt, failed)
+    assert replay == first
+    assert all(store.attempt_count(manifest.collection_id, key) == 1
+               for key in packet.logical_task_keys)
+
+    contradictory = PacketResult.bind(attempt, packet, tuple(
+        (key, MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
+    with pytest.raises(PacketResultConflictError, match="different result"):
+        store._record_packet_result_for_test_fixture(
+            manifest.collection_id, packet, attempt, contradictory)
+    assert store.state(manifest.collection_id).committed == 0
+
+
+def test_not_attempted_does_not_consume_retry_budget(tmp_path):
+    from partitions import PacketAttempt, PacketResult
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    attempt = _registered_attempt(
+        store, manifest, packet, 1, "never-launched")
+    result = PacketResult.bind(attempt, packet, tuple(
+        (key, MemberOutcome.NOT_ATTEMPTED)
+        for key in packet.logical_task_keys))
+
+    decision = store._record_packet_result_for_test_fixture(
+        manifest.collection_id, packet, attempt, result)
+    assert set(decision.requeued) == set(packet.logical_task_keys)
+    assert decision.exhausted == ()
+    for key in packet.logical_task_keys:
+        assert store.attempt_count(manifest.collection_id, key) == 0
+        assert store.attempts_for(manifest.collection_id, key) == ()
+
+    # A provider that never began any member does not advance even the packet
+    # execution sequence. A new fenced submission may still be attempt 1.
+    retried = _registered_attempt(
+        store, manifest, packet, 1, "actually-launched")
+    failed = PacketResult.bind(retried, packet, tuple(
+        (key, MemberOutcome.FAILED) for key in packet.logical_task_keys))
+    store._record_packet_result_for_test_fixture(
+        manifest.collection_id, packet, retried, failed)
+    for key in packet.logical_task_keys:
+        assert store.attempt_count(manifest.collection_id, key) == 1
+
+
+def test_packet_identity_cannot_cross_collection_boundaries(tmp_path):
+    from partitions import PacketAttempt, PacketResult
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    first = _manifest(spec, template)
+    second = CollectionManifest.bind(
+        set_id=spec.set_id, template_id=template.template_id,
+        expected=spec.total, policy=CompletionPolicy.AT_LEAST,
+        minimum_committed=1)
+    first_controller = BoundedAdmissionController(
+        store, first, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    second_controller = BoundedAdmissionController(
+        store, second, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    first_packet = _one_packet(store, first_controller)
+    second_controller.top_up()
+    attempt = PacketAttempt.bind(first_packet, 1, fence_token="collection-a")
+    result = PacketResult.bind(attempt, first_packet, tuple(
+        (key, MemberOutcome.COMMITTED)
+        for key in first_packet.logical_task_keys))
+
+    with pytest.raises(ValueError, match="does not belong to this collection"):
+        store._record_packet_result_for_test_fixture(
+            second.collection_id, first_packet, attempt, result)
+    assert store.state(second.collection_id).committed == 0
+
+
+def test_packet_attempt_number_must_follow_the_durable_sequence(tmp_path):
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    with pytest.raises(ValueError, match="expected 1, observed 99"):
+        store.register_packet_attempt(
+            manifest.collection_id,
+            packet,
+            fence_token="bad-sequence",
+            runtime_run_id="fixture-bad-sequence",
+            runtime_plan_id="f" * 64,
+            expected_attempt_number=99,
+        )
+    for key in packet.logical_task_keys:
+        assert store.attempt_count(manifest.collection_id, key) == 0
+
+
+def test_a_self_minted_attempt_arriving_first_has_no_authority(tmp_path):
+    """Frozen counterexample: a plausible hash is not a submission lease."""
+    from partitions import (
+        PacketAttempt, PacketAttemptAuthorityError, PacketResult,
+    )
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    minted = PacketAttempt.bind(packet, 1, fence_token="caller-invented")
+    result = PacketResult.bind(minted, packet, tuple(
+        (key, MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
+
+    with pytest.raises(PacketAttemptAuthorityError, match="never registered"):
+        store._record_packet_result_for_test_fixture(
+            manifest.collection_id, packet, minted, result)
+
+    # The rejected delivery consumed neither packet sequence nor member budget.
+    registered = _registered_attempt(
+        store, manifest, packet, 1, "controller-issued")
+    assert registered.attempt_number == 1
+    for key in packet.logical_task_keys:
+        assert store.attempt_count(manifest.collection_id, key) == 0
+
+
+def test_a_live_lease_is_idempotent_but_fences_repacketised_members(tmp_path):
+    from partitions import PacketAttemptConflictError, WorkPacket
+    spec, template = _spec(2, 2), _template()
+    clock = [10.0]
+    store = PartitionStore(tmp_path / "p.sqlite3", clock=lambda: clock[0])
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    first = _registered_attempt(
+        store, manifest, packet, 1, "provider-fence")
+    clock[0] = 10.5
+    replay = _registered_attempt(
+        store, manifest, packet, 1, "provider-fence")
+    assert replay == first
+
+    with pytest.raises(PacketAttemptConflictError, match="unexpired"):
+        _registered_attempt(
+            store, manifest, packet, 1, "competing-fence")
+
+    # A caller cannot evade the packet lease by regrouping the same member.
+    subset = WorkPacket.bind(
+        manifest.collection_id, template.template_id, (packet.members[0],))
+    with pytest.raises(PacketAttemptConflictError, match="already belongs"):
+        store.register_packet_attempt(
+            manifest.collection_id, subset,
+            fence_token="repacketised-fence",
+            runtime_run_id="fixture-repacketised",
+            runtime_plan_id="f" * 64)
+
+
+def test_packet_members_are_reconstructed_not_trusted(tmp_path):
+    """Frozen counterexamples for forged partition index and deployment."""
+    from partitions import (
+        PacketAttemptAuthorityError, PacketMember, WorkPacket,
+    )
+    spec, template = _spec(2, 2), _template()
+    store = PartitionStore(tmp_path / "p.sqlite3")
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    member = packet.members[0]
+
+    wrong_index = WorkPacket.bind(
+        manifest.collection_id,
+        template.template_id,
+        (PacketMember(member.logical_task_key, member.partition_index + 1,
+                      member.deployment_binding_id),),
+    )
+    with pytest.raises(PacketAttemptAuthorityError, match="claims partition"):
+        store.register_packet_attempt(
+            manifest.collection_id, wrong_index, fence_token="wrong-index",
+            runtime_run_id="fixture-wrong-index",
+            runtime_plan_id="f" * 64)
+
+    wrong_binding = WorkPacket.bind(
+        manifest.collection_id,
+        template.template_id,
+        (PacketMember(member.logical_task_key, member.partition_index,
+                      "caller-supplied-deployment"),),
+    )
+    with pytest.raises(PacketAttemptAuthorityError, match="forged deployment"):
+        store.register_packet_attempt(
+            manifest.collection_id, wrong_binding, fence_token="wrong-binding",
+            runtime_run_id="fixture-wrong-binding",
+            runtime_plan_id="f" * 64)
+
+    # Neither forged packet created authority for the legitimate packet.
+    attempt = _registered_attempt(
+        store, manifest, packet, 1, "legitimate-binding")
+    assert attempt.attempt_number == 1
+
+
+def test_an_expired_packet_lease_stays_fenced_pending_reconciliation(tmp_path):
+    from partitions import (
+        PacketAttemptAuthorityError,
+        PacketAttemptConflictError,
+        PacketResult,
+    )
+    spec, template = _spec(2, 2), _template()
+    clock = [10.0]
+    store = PartitionStore(tmp_path / "p.sqlite3", clock=lambda: clock[0])
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    expired = _registered_attempt(
+        store, manifest, packet, 1, "old-worker",
+        lease_duration_s=1.0)
+    expired_result = PacketResult.bind(expired, packet, tuple(
+        (key, MemberOutcome.COMMITTED) for key in packet.logical_task_keys))
+
+    clock[0] = 11.0
+    with pytest.raises(PacketAttemptAuthorityError, match="expired"):
+        store._record_packet_result_for_test_fixture(
+            manifest.collection_id, packet, expired, expired_result)
+
+    with pytest.raises(PacketAttemptConflictError, match="reconciled"):
+        _registered_attempt(
+            store, manifest, packet, 1, "replacement-worker",
+            lease_duration_s=10.0)
+    assert all(store.attempt_count(manifest.collection_id, key) == 0
+               for key in packet.logical_task_keys)
+
+
+def test_expired_packet_releases_only_after_exact_run_proves_never_launched(
+        tmp_path):
+    from engine.runtime.state import RuntimeStore
+    from engine.runtime.types import RunState
+    from partitions import PacketAttemptConflictError, compile_packet
+
+    spec, template = _spec(2, 2), _template()
+    clock = [10.0]
+    store = PartitionStore(tmp_path / "p.sqlite3", clock=lambda: clock[0])
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    graph = compile_packet(template, packet)
+    runtime = RuntimeStore(tmp_path / "runtime" / "control" / "runtime.sqlite3")
+    run_id = runtime.create_run(graph)
+    expired = store.register_packet_attempt(
+        manifest.collection_id, packet, fence_token="dead-before-submit",
+        runtime_run_id=run_id, runtime_plan_id=graph.plan_id,
+        lease_duration_s=1.0, expected_attempt_number=1)
+
+    clock[0] = 11.0
+    released = store.reconcile_expired_packet_not_launched(
+        manifest.collection_id, packet, expired, runtime)
+    assert released == packet.logical_task_keys
+    assert runtime.run_state(run_id) is RunState.CANCELLED
+    assert all(store.attempt_count(manifest.collection_id, key) == 0
+               for key in packet.logical_task_keys)
+
+    # No scientific attempt was consumed. A new exact run/fence reuses packet
+    # sequence number 1 rather than being mislabeled as retry 2.
+    replacement_run = runtime.create_run(graph)
+    replacement = store.register_packet_attempt(
+        manifest.collection_id, packet, fence_token="replacement",
+        runtime_run_id=replacement_run, runtime_plan_id=graph.plan_id,
+        lease_duration_s=10.0, expected_attempt_number=1)
+    assert replacement.attempt_number == 1
+    assert replacement.attempt_id != expired.attempt_id
+
+
+def test_never_launched_reconciliation_refuses_while_a_controller_lock_is_live(
+        tmp_path):
+    from engine.runtime.state import ControllerLock, RuntimeStore
+    from partitions import PacketAttemptConflictError, compile_packet
+
+    spec, template = _spec(2, 2), _template()
+    clock = [10.0]
+    store = PartitionStore(tmp_path / "p.sqlite3", clock=lambda: clock[0])
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+    graph = compile_packet(template, packet)
+    runtime = RuntimeStore(tmp_path / "runtime" / "control" / "runtime.sqlite3")
+    run_id = runtime.create_run(graph)
+    expired = store.register_packet_attempt(
+        manifest.collection_id, packet, fence_token="possibly-live",
+        runtime_run_id=run_id, runtime_plan_id=graph.plan_id,
+        lease_duration_s=1.0)
+    clock[0] = 11.0
+
+    lock = ControllerLock(runtime.db_path.parent / "controller.lock")
+    try:
+        with pytest.raises(RuntimeError, match="another WorkflowController"):
+            store.reconcile_expired_packet_not_launched(
+                manifest.collection_id, packet, expired, runtime)
+    finally:
+        lock.close()
+
+    with pytest.raises(PacketAttemptConflictError, match="reconciled"):
+        store.register_packet_attempt(
+            manifest.collection_id, packet, fence_token="unsafe-replacement",
+            runtime_run_id="unsafe", runtime_plan_id=graph.plan_id,
+            lease_duration_s=10.0)
 
 
 # -- real partition execution --------------------------------------------
@@ -569,6 +1023,44 @@ def test_partitions_execute_and_their_real_outcomes_drive_the_store(tmp_path):
     for key in packet.logical_task_keys:
         assert store.attempts_for(manifest.collection_id, key) == (
             (1, "COMMITTED"),)
+
+
+def test_expired_packet_accepts_only_its_exact_terminal_runtime_result(tmp_path):
+    """Lease expiry cannot erase a result already committed by the bound run."""
+    from engine.runtime import RunState, WorkflowController
+    from partitions import compile_packet
+
+    spec, template = _spec(2, 2), _template()
+    clock = [10.0]
+    store = PartitionStore(tmp_path / "p.sqlite3", clock=lambda: clock[0])
+    manifest = _manifest(spec, template)
+    controller = BoundedAdmissionController(
+        store, manifest, spec, template,
+        policy=AdmissionPolicy(window_size=4, low_watermark=1,
+                               high_watermark=4))
+    packet = _one_packet(store, controller)
+
+    with WorkflowController(tmp_path / "runtime") as runtime_controller:
+        graph = compile_packet(template, packet)
+        run_id = runtime_controller.create_run(graph)
+        attempt = store.register_packet_attempt(
+            manifest.collection_id, packet, fence_token="terminal-after-expiry",
+            runtime_run_id=run_id, runtime_plan_id=graph.plan_id,
+            lease_duration_s=1.0)
+        assert runtime_controller.run_until_terminal(run_id) is RunState.SUCCEEDED
+        clock[0] = 11.0
+        decision = store.record_runtime_packet_completion(
+            manifest.collection_id, packet, attempt,
+            runtime_controller.store)
+
+    assert set(decision.committed) == set(packet.logical_task_keys)
+    with store.connect() as connection:
+        intent = connection.execute(
+            "SELECT status,reconciliation_kind FROM packet_attempt_intents "
+            "WHERE collection_id=? AND attempt_id=?",
+            (manifest.collection_id, attempt.attempt_id),
+        ).fetchone()
+    assert intent == ("COMPLETED", "RUNTIME_TERMINAL")
 
 
 def test_a_packet_refuses_a_foreign_template(tmp_path):

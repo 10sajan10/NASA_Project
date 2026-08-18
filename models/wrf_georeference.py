@@ -173,10 +173,12 @@ class WrfGeoreference:
 
 def _grid(crs: str, shape: tuple[int, int], x0: float, y1: float,
           cell: float) -> GridDescriptor:
+    # x0/y1 are outer edges derived above; GridDescriptor's canonical affine
+    # stores the first sample centre in array order.
     return GridDescriptor(
         crs, ("easting", "northing"), (int(shape[0]), int(shape[1])),
-        (repr(float(cell)), "0", repr(float(x0)),
-         "0", repr(-float(cell)), repr(float(y1))),
+        (repr(float(cell)), "0", repr(float(x0 + cell / 2.0)),
+         "0", repr(-float(cell)), repr(float(y1 - cell / 2.0))),
         SpatialScale(repr(float(cell)), repr(float(cell)), "m"))
 
 

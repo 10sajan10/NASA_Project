@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from grid_convention import GRID_AFFINE_CONVENTION
+
 from .identity import (
     ScientificIdentity,
     canonical_crs,
@@ -18,6 +20,21 @@ from .identity import (
     sorted_unique_text,
     timestamp_value,
 )
+
+
+# GridDescriptor's six-value affine is deliberately *not* rasterio's
+# pixel-corner transform.  It maps integer array indexes to sample centres:
+#
+#     x[column] = a * column + c
+#     y[row]    = e * row    + f
+#
+# with b == d == 0 for the rectilinear execution contract.  ``shape`` remains
+# row-major ``(y_count, x_count)`` and ``axis_order`` names the coordinate
+# pair ``(x_axis, y_axis)``.  Signed steps are authoritative, so a conventional
+# north-up array has e < 0.  Spatial-support bounds are the *outer cell edges*,
+# half a step beyond the first and last centres.  Keeping this identifier near
+# the type makes planning, execution and commit validation refer to one named
+# convention rather than three compatible-looking interpretations.
 
 
 class ScaleBasis(str, Enum):
@@ -202,6 +219,77 @@ class GridDescriptor(ScientificIdentity):
     @property
     def grid_id(self) -> str:
         return self.identity
+
+    @property
+    def x_step(self):
+        """Signed x step in CRS units."""
+        return decimal_value(self.affine[0])
+
+    @property
+    def y_step(self):
+        """Signed y step in CRS units (negative for a north-up grid)."""
+        return decimal_value(self.affine[4])
+
+    def require_canonical_affine(self) -> None:
+        """Refuse a grid that the closed field runtime cannot represent.
+
+        ``GridDescriptor`` can still describe a rotated source for discovery
+        and placement diagnostics.  Executable field operations are narrower:
+        they require the named axis-aligned sample-centre convention.  This
+        explicit boundary preserves useful ``ROTATED_OR_SKEWED`` diagnostics
+        while ensuring such a descriptor cannot enter execution accidentally.
+        """
+        values = tuple(decimal_value(item) for item in self.affine)
+        if values[1] != 0 or values[3] != 0:
+            raise ValueError(
+                "canonical field grid must be axis-aligned (affine b=d=0)")
+        if values[0] == 0 or values[4] == 0:
+            raise ValueError("canonical field grid steps must be non-zero")
+        if (decimal_value(self.spacing.x) != abs(values[0])
+                or decimal_value(self.spacing.y) != abs(values[4])):
+            raise ValueError(
+                "grid spacing must equal the absolute signed affine steps")
+
+    def centre_axis(self, axis: str) -> tuple[str, ...]:
+        """Return one exact sample-centre coordinate axis.
+
+        ``axis`` is ``"x"`` or ``"y"``; it selects array columns or rows,
+        not a guessed CRS name.  The semantic names remain in ``axis_order``.
+        """
+        self.require_canonical_affine()
+        if axis == "x":
+            count, step, origin = (
+                self.shape[1], self.x_step, decimal_value(self.affine[2]))
+        elif axis == "y":
+            count, step, origin = (
+                self.shape[0], self.y_step, decimal_value(self.affine[5]))
+        else:
+            raise ValueError("grid axis must be 'x' or 'y'")
+        return tuple(canonical_decimal(origin + step * index)
+                     for index in range(count))
+
+    @property
+    def support_bounds(self) -> tuple[str, str, str, str]:
+        """Outer cell-edge bounds ``(xmin, ymin, xmax, ymax)``."""
+        self.require_canonical_affine()
+        x_first = decimal_value(self.affine[2])
+        y_first = decimal_value(self.affine[5])
+        x_last = x_first + self.x_step * (self.shape[1] - 1)
+        y_last = y_first + self.y_step * (self.shape[0] - 1)
+        x_edges = (x_first - self.x_step / 2, x_last + self.x_step / 2)
+        y_edges = (y_first - self.y_step / 2, y_last + self.y_step / 2)
+        return tuple(canonical_decimal(item) for item in (
+            min(x_edges), min(y_edges), max(x_edges), max(y_edges)))
+
+    def require_support(self, support: BBoxSupport) -> None:
+        """Verify the descriptor support is exactly this grid's cell cover."""
+        if not isinstance(support, BBoxSupport):
+            raise TypeError("grid support must be a typed BBoxSupport")
+        if self.crs != support.crs or self.axis_order != support.axis_order:
+            raise ValueError("grid and spatial support CRS/axes disagree")
+        if self.support_bounds != support.bounds:
+            raise ValueError(
+                "spatial support bounds disagree with sample-centre grid edges")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "GridDescriptor":
@@ -462,8 +550,9 @@ class ArtifactDescriptor(ScientificIdentity):
     ensemble_member: str | None = None
     intrinsic_uncertainty: IntrinsicUncertainty = field(default_factory=lambda: (
         IntrinsicUncertainty.unknown("NOT_REPORTED_BY_PRODUCER")))
+    component_names: tuple[str, ...] = ()
 
-    identity_schema = "artifact-descriptor-v2"
+    identity_schema = "artifact-descriptor-v3"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "concept_id", required_text(
@@ -495,6 +584,13 @@ class ArtifactDescriptor(ScientificIdentity):
         if self.ensemble_member is not None:
             object.__setattr__(self, "ensemble_member", required_text(
                 self.ensemble_member, "ensemble_member"))
+        if (not isinstance(self.component_names, tuple)
+                or any(not isinstance(item, str) or not item.strip()
+                       for item in self.component_names)
+                or self.component_names
+                != tuple(sorted(set(self.component_names)))):
+            raise ValueError(
+                "artifact component names must be unique sorted text")
 
     @property
     def descriptor_id(self) -> str:
@@ -513,6 +609,7 @@ class ArtifactDescriptor(ScientificIdentity):
                 "spatial_support", "temporal_support", "vertical_support",
                 "grid", "native_resolution", "origin", "missingness",
                 "ensemble_member", "intrinsic_uncertainty",
+                "component_names",
             ),
             "ArtifactDescriptor",
         )
@@ -532,4 +629,7 @@ class ArtifactDescriptor(ScientificIdentity):
             ensemble_member=value["ensemble_member"],
             intrinsic_uncertainty=IntrinsicUncertainty.from_dict(
                 value["intrinsic_uncertainty"]),
+            component_names=require_sequence(
+                value["component_names"],
+                "ArtifactDescriptor.component_names"),
         )

@@ -54,6 +54,7 @@ from .placement import (
 from .types import (
     ArtifactDescriptor,
     BBoxSupport,
+    GRID_AFFINE_CONVENTION,
     GridDescriptor,
     IntrinsicUncertainty,
     Missingness,
@@ -76,7 +77,8 @@ __all__ = [
     "EvidenceApplicability", "EvidenceBound", "EvidenceClaim",
     "EstimateUncertainty",
     "EvidenceProfile", "EvidenceRequirement", "EvidenceSnapshot",
-    "EvidenceStatus", "EvidenceSubject", "GridDescriptor",
+    "EvidenceStatus", "EvidenceSubject", "GRID_AFFINE_CONVENTION",
+    "GridDescriptor",
     "IntrinsicUncertainty", "MatchCode",
     "MetricComposition", "MetricDefinition", "MetricEvaluator",
     "MissingPolicy", "Missingness", "MissingnessStatus", "OriginClass",

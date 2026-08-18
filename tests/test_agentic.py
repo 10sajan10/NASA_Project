@@ -64,7 +64,7 @@ def test_catalog_v1_migrates_in_place(tmp_path):
     # v3 adds entries/lineage to a database that never had them, without
     # disturbing the v1 rows above.
     from cube.entries import CubeEntry
-    entry = cat.commit_entry(CubeEntry.create(
+    entry = cat._commit_entry_for_test_fixture(CubeEntry.create(
         concept="dem", kind="static", producer="dem_driver",
         content_sha256="a" * 64))
     assert cat.entry(entry.entry_id).concept == "dem"

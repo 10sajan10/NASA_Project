@@ -22,9 +22,17 @@ from plans import (
     InvocationDeploymentBinding,
     PlanSnapshotRef,
 )
-from resolution import ResolutionOutcome, ResolutionStatus, WorkflowResolver
+from resolution import (
+    DiscoveryLayerScope,
+    DiscoveryUniverseContract,
+    ResolutionOutcome,
+    ResolutionStatus,
+    WorkflowResolver,
+)
 from transformations import (
+    TransformationCatalog,
     TransformationExpansion,
+    TransformationDiscoveryReplay,
     TransformationSearchLimits,
     expand_transform_catalog,
 )
@@ -48,18 +56,27 @@ def build_demo_plan(
     limits: TransformationSearchLimits = TransformationSearchLimits(),
 ) -> Stage4DemoPlan:
     fixture = make_unit_bridge_fixture()
+    transformation_catalog = TransformationCatalog.freeze(
+        fixture.transformations)
+    discovery_universe = DiscoveryUniverseContract.declare(
+        fixture.base_catalog.catalog_id,
+        (DiscoveryLayerScope.bind(
+            "TRANSFORMATION_EXPANSION",
+            source_ids=(transformation_catalog.catalog_id,),
+            limits=limits.to_dict()),),
+    )
     expansion = expand_transform_catalog(
-        fixture.base_catalog, fixture.transformations, limits=limits)
+        fixture.base_catalog, transformation_catalog, limits=limits)
 
-    # Transformation closure is discovery.  If it truncated, the selection
-    # that follows cannot be called globally optimal, so the flag and its
-    # typed reasons are handed to the resolver rather than dropped here.
+    # The certificate binds what closure produced; the separately authored
+    # universe binds what closure was required to cover.
     resolution = WorkflowResolver(
         expansion.augmented_catalog,
         fixture.deployment_snapshot,
-        upstream_discovery_complete=expansion.complete,
-        upstream_limit_codes=tuple(sorted({
-            value.code.value for value in expansion.limit_reasons})),
+        discovery_certificate=expansion.discovery_certificate(),
+        discovery_universe=discovery_universe,
+        discovery_replays=(TransformationDiscoveryReplay.bind(
+            fixture.base_catalog, transformation_catalog, limits=limits),),
     ).resolve(fixture.root_uses)
     if (resolution.status is not ResolutionStatus.READY
             or not resolution.eligible_for_binding

@@ -8,16 +8,20 @@ closed operation/binder registries used by ordinary capabilities.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import math
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable
 
 from capabilities import (
     BinderRef,
     BindingParameterization,
+    BoundInvocation,
+    BoundOutputPort,
     CapabilitySpec,
     DescriptorTemplate,
     ExecutionProfile,
@@ -25,6 +29,7 @@ from capabilities import (
     ParameterField,
     ParameterKind,
     ParameterSchema,
+    TransformationAuthority,
 )
 from capabilities.implementation import _digest, _required_text
 from contracts import (
@@ -38,6 +43,7 @@ from contracts import (
     SpatialRequirement,
     TemporalKind,
     TemporalRequirement,
+    UncertaintyStatus,
     UnknownPolicy,
     ValueConstraint,
     VerticalRequirement,
@@ -91,6 +97,29 @@ class ValueSemantics(str, Enum):
     CATEGORICAL_LABEL = "CATEGORICAL_LABEL"
 
 
+class TransformationLossPolicy(str, Enum):
+    """Closed classification of the scientific information change.
+
+    This is deliberately a policy identifier rather than an inferred property
+    of an operation name.  It travels in the content-addressed transformation
+    contract and therefore cannot be silently relabelled after selection.
+    """
+
+    EXACT_SELECTION = "EXACT_SELECTION"
+    NUMERIC_AFFINE_MAPPING = "NUMERIC_AFFINE_MAPPING"
+    BILINEAR_INTERPOLATION = "BILINEAR_INTERPOLATION"
+    BLOCK_AGGREGATION = "BLOCK_AGGREGATION"
+    NUMERIC_VECTOR_MAPPING = "NUMERIC_VECTOR_MAPPING"
+    DERIVED_OUTPUTS = "DERIVED_OUTPUTS"
+
+
+class UncertaintyPropagationPolicy(str, Enum):
+    """How intrinsic uncertainty must cross a transformation edge."""
+
+    PRESERVE = "PRESERVE"
+    REBIND_OR_MARK_UNKNOWN = "REBIND_OR_MARK_UNKNOWN"
+
+
 #: The one aggregation each value class may be reduced with over a block
 #: partition.  A bijection on purpose: if a field's semantics are declared,
 #: the aggregation follows, and if they are not, no aggregation is admitted.
@@ -138,6 +167,7 @@ _KIND_RULES = MappingProxyType({
         tuple((name, ParameterKind.INTEGER) for name in (
             "x_start", "x_stop", "y_start", "y_stop")),
         "semantic:spatial-index-subset-v1",
+        ("grid:sample-centres-axis-aligned-v1",),
     ),
     TransformationKind.TEMPORAL_SUBSET: _KindRule(
         "transform.temporal_subset.v1", "transform.temporal_subset.bind.v1",
@@ -157,7 +187,8 @@ _KIND_RULES = MappingProxyType({
         ("source",), ("result",),
         (("target_x", ParameterKind.JSON), ("target_y", ParameterKind.JSON)),
         "semantic:rectilinear-bilinear-regrid-v1",
-        ("quantity:continuous-intensive-v1",),
+        ("grid:sample-centres-axis-aligned-v1",
+         "quantity:continuous-intensive-v1"),
     ),
     TransformationKind.REPROJECT_BILINEAR: _KindRule(
         "transform.reproject_bilinear.v1",
@@ -165,12 +196,17 @@ _KIND_RULES = MappingProxyType({
         ("source",), ("result",),
         (
             ("source_crs", ParameterKind.STRING),
+            ("source_axis_order", ParameterKind.JSON),
             ("target_crs", ParameterKind.STRING),
+            ("target_axis_order", ParameterKind.JSON),
             ("target_x", ParameterKind.JSON),
             ("target_y", ParameterKind.JSON),
+            ("pipeline_projjson", ParameterKind.JSON),
         ),
         "semantic:rectilinear-bilinear-reprojection-v1",
-        ("quantity:continuous-intensive-v1",),
+        ("grid:sample-centres-axis-aligned-v1",
+         "quantity:continuous-intensive-v1",
+         "reprojection:projjson-local-best-available-v1"),
     ),
     TransformationKind.SPATIAL_BLOCK_AGGREGATE: _KindRule(
         "transform.spatial_block_aggregate.v1",
@@ -182,7 +218,8 @@ _KIND_RULES = MappingProxyType({
             ("aggregation", ParameterKind.STRING),
         ),
         "semantic:block-aggregation-registry-v1",
-        ("partition:exact-integer-block-cover-v1",),
+        ("grid:sample-centres-axis-aligned-v1",
+         "partition:exact-integer-block-cover-v1"),
     ),
     TransformationKind.VECTOR_ROTATE: _KindRule(
         "transform.vector_rotate.v1", "transform.vector_rotate.bind.v1",
@@ -206,6 +243,40 @@ _KIND_RULES = MappingProxyType({
         ),
     ),
 })
+
+
+_LOSS_POLICY_BY_KIND = MappingProxyType({
+    TransformationKind.UNIT_AFFINE:
+        TransformationLossPolicy.NUMERIC_AFFINE_MAPPING,
+    TransformationKind.SPATIAL_SUBSET:
+        TransformationLossPolicy.EXACT_SELECTION,
+    TransformationKind.TEMPORAL_SUBSET:
+        TransformationLossPolicy.EXACT_SELECTION,
+    TransformationKind.TEMPORAL_ALIGN:
+        TransformationLossPolicy.EXACT_SELECTION,
+    TransformationKind.REGRID_BILINEAR:
+        TransformationLossPolicy.BILINEAR_INTERPOLATION,
+    TransformationKind.REPROJECT_BILINEAR:
+        TransformationLossPolicy.BILINEAR_INTERPOLATION,
+    TransformationKind.SPATIAL_BLOCK_AGGREGATE:
+        TransformationLossPolicy.BLOCK_AGGREGATION,
+    TransformationKind.VECTOR_ROTATE:
+        TransformationLossPolicy.NUMERIC_VECTOR_MAPPING,
+    TransformationKind.VECTOR_UV_TO_SPEED_DIRECTION:
+        TransformationLossPolicy.DERIVED_OUTPUTS,
+})
+
+_UNCERTAINTY_POLICY_BY_KIND = MappingProxyType({
+    kind: (UncertaintyPropagationPolicy.PRESERVE
+           if _LOSS_POLICY_BY_KIND[kind]
+           is TransformationLossPolicy.EXACT_SELECTION
+           else UncertaintyPropagationPolicy.REBIND_OR_MARK_UNKNOWN)
+    for kind in TransformationKind
+})
+
+if (set(_LOSS_POLICY_BY_KIND) != set(TransformationKind)
+        or set(_UNCERTAINTY_POLICY_BY_KIND) != set(TransformationKind)):
+    raise AssertionError("every transformation kind needs closed loss policies")
 
 
 @dataclass(frozen=True)
@@ -315,6 +386,8 @@ class TransformationSpec:
     parameters: dict[str, Any]
     cost_units: int
     semantic_rule_id: str
+    loss_policy: TransformationLossPolicy
+    uncertainty_propagation_policy: UncertaintyPropagationPolicy
     scientific_assumption_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
@@ -327,6 +400,12 @@ class TransformationSpec:
             raise TypeError("transformation execution profile is invalid")
         if not isinstance(self.binder, BinderRef):
             raise TypeError("transformation binder is invalid")
+        if not isinstance(self.loss_policy, TransformationLossPolicy):
+            raise TypeError("transformation loss policy is invalid")
+        if not isinstance(
+                self.uncertainty_propagation_policy,
+                UncertaintyPropagationPolicy):
+            raise TypeError("transformation uncertainty policy is invalid")
         for values, label in (
                 (self.input_ports, "input_ports"),
                 (self.output_ports, "output_ports")):
@@ -370,6 +449,13 @@ class TransformationSpec:
             raise ValueError("transformation output ports disagree with its kind")
         if self.semantic_rule_id != rule.semantic_rule_id:
             raise ValueError("transformation semantic rule is not the closed version")
+        if self.loss_policy is not _LOSS_POLICY_BY_KIND[self.kind]:
+            raise ValueError(
+                "transformation loss policy is not valid for its kind")
+        if (self.uncertainty_propagation_policy
+                is not _UNCERTAINTY_POLICY_BY_KIND[self.kind]):
+            raise ValueError(
+                "transformation uncertainty policy is not valid for its kind")
         if self.scientific_assumption_ids != rule.scientific_assumption_ids:
             raise ValueError("transformation scientific assumptions are not explicit")
         _parameter_schema(self.kind).validate(self.parameters)
@@ -398,16 +484,36 @@ class TransformationSpec:
         inputs = tuple(input_ports)
         outputs = tuple(output_ports)
         params = strict_copy(parameters)
+        if kind is TransformationKind.REPROJECT_BILINEAR:
+            # Callers declare the CRS pair and target lattice, never an
+            # authority-bearing pipeline.  Planning selects the locally best
+            # fully available operation and freezes its exact PROJJSON.
+            from engine.runtime.operations import bind_reprojection_parameters
+            try:
+                source_grid = inputs[0].descriptor.grid
+                target_grid = outputs[0].descriptor.grid
+            except IndexError as exc:
+                raise ValueError(
+                    "reprojection requires source/result descriptor ports") from exc
+            if source_grid is None or target_grid is None:
+                raise ValueError("reprojection requires declared source/result grids")
+            params = bind_reprojection_parameters(
+                params,
+                source_axis_order=source_grid.axis_order,
+                target_axis_order=target_grid.axis_order,
+            )
         payload = _transformation_payload(
             transformation_id, transformation_version, kind,
             execution_profile, BinderRef.from_key(rule.binder_key), inputs,
             outputs, params, cost_units, rule.semantic_rule_id,
+            _LOSS_POLICY_BY_KIND[kind], _UNCERTAINTY_POLICY_BY_KIND[kind],
             rule.scientific_assumption_ids,
         )
         return cls(
             strict_hash(payload), transformation_id, transformation_version,
             kind, execution_profile, BinderRef.from_key(rule.binder_key),
             inputs, outputs, params, cost_units, rule.semantic_rule_id,
+            _LOSS_POLICY_BY_KIND[kind], _UNCERTAINTY_POLICY_BY_KIND[kind],
             rule.scientific_assumption_ids,
         )
 
@@ -453,11 +559,13 @@ class TransformationSpec:
             self.transformation_id, self.transformation_version, self.kind,
             self.execution_profile, self.binder, self.input_ports,
             self.output_ports, self.parameters, self.cost_units,
-            self.semantic_rule_id, self.scientific_assumption_ids,
+            self.semantic_rule_id, self.loss_policy,
+            self.uncertainty_propagation_policy,
+            self.scientific_assumption_ids,
         ))
 
     def to_capability_spec(self) -> CapabilitySpec:
-        """Lower this edge to the existing ordinary capability relation."""
+        """Lower this edge without discarding its scientific authority."""
         return CapabilitySpec.bind(
             capability_id=f"transform:{self.transformation_id}",
             capability_version=self.transformation_version,
@@ -474,6 +582,16 @@ class TransformationSpec:
             execution_profile_id=self.execution_profile.profile_id,
             evidence_profile_id="evidence:unknown",
             cost_model_id="cost:declared-v1",
+            transformation_authority=self.to_authority(),
+        )
+
+    def to_authority(self) -> TransformationAuthority:
+        """Freeze this specification and its closed semantic-rule identities."""
+        return TransformationAuthority.bind(
+            transformation_spec=self.to_dict(),
+            semantic_rule_implementation_sha256=
+                _semantic_rule_implementation_sha256(self),
+            parameter_rule_sha256=_parameter_rule_sha256(self),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -489,6 +607,9 @@ class TransformationSpec:
             "parameters": strict_copy(self.parameters),
             "cost_units": self.cost_units,
             "semantic_rule_id": self.semantic_rule_id,
+            "loss_policy": self.loss_policy.value,
+            "uncertainty_propagation_policy":
+                self.uncertainty_propagation_policy.value,
             "scientific_assumption_ids": list(self.scientific_assumption_ids),
         }
 
@@ -501,6 +622,10 @@ class TransformationSpec:
         raw["execution_profile"] = ExecutionProfile.from_dict(
             raw["execution_profile"])
         raw["binder"] = BinderRef.from_dict(raw["binder"])
+        raw["loss_policy"] = TransformationLossPolicy(raw["loss_policy"])
+        raw["uncertainty_propagation_policy"] = (
+            UncertaintyPropagationPolicy(
+                raw["uncertainty_propagation_policy"]))
         for name in ("input_ports", "output_ports"):
             if not isinstance(raw[name], list):
                 raise ValueError(f"TransformationSpec.{name} must be an array")
@@ -520,10 +645,12 @@ def _transformation_payload(
         binder: BinderRef, input_ports: tuple[TransformationPort, ...],
         output_ports: tuple[TransformationPort, ...], parameters: dict[str, Any],
         cost_units: int, semantic_rule_id: str,
+        loss_policy: TransformationLossPolicy,
+        uncertainty_propagation_policy: UncertaintyPropagationPolicy,
         scientific_assumption_ids: tuple[str, ...],
 ) -> dict[str, Any]:
     return {
-        "schema": "stage4-transformation-spec-v1",
+        "schema": "stage8r-transformation-spec-v2",
         "transformation_id": transformation_id,
         "transformation_version": transformation_version,
         "kind": kind.value,
@@ -534,8 +661,190 @@ def _transformation_payload(
         "parameters": strict_copy(parameters),
         "cost_units": cost_units,
         "semantic_rule_id": semantic_rule_id,
+        "loss_policy": loss_policy.value,
+        "uncertainty_propagation_policy":
+            uncertainty_propagation_policy.value,
         "scientific_assumption_ids": list(scientific_assumption_ids),
     }
+
+
+def _semantic_rule_implementation_sha256(spec: TransformationSpec) -> str:
+    """Digest the closed semantic validator implementation and rule version.
+
+    This is intentionally conservative, like the Stage-2 binder digest: any
+    source change to the module that owns ``_validate_semantics`` invalidates
+    old authority rather than silently reinterpreting it under new code.
+    """
+    rule = _KIND_RULES[spec.kind]
+    identity = strict_hash({
+        "schema": "stage8r-semantic-rule-implementation-v1",
+        "kind": spec.kind.value,
+        "semantic_rule_id": rule.semantic_rule_id,
+        "operation": spec.implementation.to_dict(),
+        "binder": spec.binder.to_dict(),
+        "input_ports": list(rule.input_ports),
+        "output_ports": list(rule.output_ports),
+        "parameter_schema": _parameter_schema(spec.kind).to_dict(),
+        "loss_policy": spec.loss_policy.value,
+        "uncertainty_propagation_policy":
+            spec.uncertainty_propagation_policy.value,
+        "scientific_assumption_ids": list(rule.scientific_assumption_ids),
+    })
+    source = Path(__file__).read_bytes()
+    return hashlib.sha256(
+        identity.encode("ascii") + b"\0" + source).hexdigest()
+
+
+def _parameter_rule_sha256(spec: TransformationSpec) -> str:
+    """Bind parameters to exact descriptors, semantics, and the closed rule."""
+    return strict_hash({
+        "schema": "stage8r-transformation-parameter-rule-v1",
+        "transformation_spec_id": spec.spec_id,
+        "kind": spec.kind.value,
+        "semantic_rule_id": spec.semantic_rule_id,
+        "input_ports": [item.to_dict() for item in spec.input_ports],
+        "output_ports": [item.to_dict() for item in spec.output_ports],
+        "parameters": strict_copy(spec.parameters),
+        "parameter_schema": _parameter_schema(spec.kind).to_dict(),
+        "loss_policy": spec.loss_policy.value,
+        "uncertainty_propagation_policy":
+            spec.uncertainty_propagation_policy.value,
+        "scientific_assumption_ids": list(spec.scientific_assumption_ids),
+    })
+
+
+def _verified_authority_spec(
+        authority: TransformationAuthority,
+) -> TransformationSpec:
+    """Reconstruct and replay the exact authority under current closed code."""
+    if not isinstance(authority, TransformationAuthority):
+        raise TypeError("transformation authority is invalid")
+    if authority.authority_id != authority.expected_id():
+        raise ValueError("transformation authority identity does not verify")
+    spec = TransformationSpec.from_dict(
+        strict_copy(authority.transformation_spec))
+    if authority.transformation_spec_id != spec.spec_id:
+        raise ValueError("transformation authority names another specification")
+    semantic_digest = _semantic_rule_implementation_sha256(spec)
+    if authority.semantic_rule_implementation_sha256 != semantic_digest:
+        raise ValueError(
+            "transformation semantic-rule implementation is stale or forged")
+    parameter_digest = _parameter_rule_sha256(spec)
+    if authority.parameter_rule_sha256 != parameter_digest:
+        raise ValueError(
+            "transformation parameter/descriptors rule is stale or forged")
+    if authority != spec.to_authority():
+        raise ValueError("transformation authority is not the canonical certificate")
+    return spec
+
+
+def verify_capability_transformation_authority(
+        capability: CapabilitySpec,
+) -> TransformationSpec:
+    """Independently replay a transform and its exact capability lowering."""
+    if not isinstance(capability, CapabilitySpec):
+        raise TypeError("capability must be CapabilitySpec")
+    authority = capability.transformation_authority
+    if authority is None:
+        raise ValueError("reserved transform capability lacks authority")
+    spec = _verified_authority_spec(authority)
+    expected_inputs = tuple(InputPortTemplate(
+        item.port_id, exact_requirement(item.descriptor))
+        for item in spec.input_ports)
+    expected_outputs = tuple(DescriptorTemplate(
+        item.port_id, item.descriptor) for item in spec.output_ports)
+    expected_parameterizations = (BindingParameterization(
+        strict_copy(spec.parameters), {"cost_units": spec.cost_units}),)
+    comparisons = {
+        "capability_id": (
+            f"transform:{spec.transformation_id}", capability.capability_id),
+        "capability_version": (
+            spec.transformation_version, capability.capability_version),
+        "implementation": (spec.implementation, capability.implementation),
+        "binder": (spec.binder, capability.binder),
+        "input_ports": (expected_inputs, capability.input_ports),
+        "output_ports": (expected_outputs, capability.output_ports),
+        "parameter_schema": (
+            _parameter_schema(spec.kind), capability.parameter_schema),
+        "parameterizations": (
+            expected_parameterizations, capability.parameterizations),
+        "applicability_key": ("always.v1", capability.applicability_key),
+        "evidence_profile_id": (
+            "evidence:unknown", capability.evidence_profile_id),
+        "cost_model_id": ("cost:declared-v1", capability.cost_model_id),
+        "execution_profile_id": (
+            spec.execution_profile.profile_id,
+            capability.execution_profile_id),
+        "transformation_authority": (spec.to_authority(), authority),
+    }
+    mismatches = sorted(
+        name for name, (expected, observed) in comparisons.items()
+        if expected != observed)
+    if mismatches:
+        raise ValueError(
+            "transformation authority disagrees with capability lowering: "
+            f"{mismatches}")
+    return spec
+
+
+def verify_bound_transformation_authority(
+        invocation: BoundInvocation,
+) -> TransformationSpec:
+    """Independently replay authority retained by a bound invocation."""
+    if not isinstance(invocation, BoundInvocation):
+        raise TypeError("invocation must be BoundInvocation")
+    authority = invocation.transformation_authority
+    if authority is None:
+        raise ValueError("reserved transform invocation lacks authority")
+    spec = _verified_authority_spec(authority)
+    input_templates = tuple(InputPortTemplate(
+        item.port_id, exact_requirement(item.descriptor))
+        for item in spec.input_ports)
+    output_templates = tuple(DescriptorTemplate(
+        item.port_id, item.descriptor) for item in spec.output_ports)
+    binding_seed = strict_hash({
+        "schema": "stage2-invocation-binding-seed-v2",
+        "capability_id": f"transform:{spec.transformation_id}",
+        "capability_version": spec.transformation_version,
+        "binder": spec.binder.to_dict(),
+        "implementation": spec.implementation.to_dict(),
+        "parameters": strict_copy(spec.parameters),
+        "inputs": [item.to_dict() for item in input_templates],
+        "outputs": [item.to_dict() for item in output_templates],
+        "transformation_authority": authority.to_dict(),
+    })
+    expected_inputs = tuple(
+        item.bind(binding_seed) for item in input_templates)
+    expected_outputs = tuple(BoundOutputPort(
+        item.port_id, item.descriptor) for item in output_templates)
+    comparisons = {
+        "capability_id": (
+            f"transform:{spec.transformation_id}", invocation.capability_id),
+        "capability_version": (
+            spec.transformation_version, invocation.capability_version),
+        "implementation": (spec.implementation, invocation.implementation),
+        "binder": (spec.binder, invocation.binder),
+        "parameters": (spec.parameters, invocation.parameters),
+        "input_uses": (expected_inputs, invocation.input_uses),
+        "outputs": (expected_outputs, invocation.outputs),
+        "metric_estimates": (
+            {"cost_units": spec.cost_units}, invocation.metric_estimates),
+        "evidence_profile_id": (
+            "evidence:unknown", invocation.evidence_profile_id),
+        "cost_model_id": ("cost:declared-v1", invocation.cost_model_id),
+        "execution_profile_id": (
+            spec.execution_profile.profile_id,
+            invocation.execution_profile_id),
+        "transformation_authority": (spec.to_authority(), authority),
+    }
+    mismatches = sorted(
+        name for name, (expected, observed) in comparisons.items()
+        if expected != observed)
+    if mismatches:
+        raise ValueError(
+            "transformation authority disagrees with bound invocation: "
+            f"{mismatches}")
+    return spec
 
 
 def exact_requirement(descriptor: ArtifactDescriptor) -> Requirement:
@@ -598,17 +907,17 @@ def _descriptor_fields_equal(
 _VALUE_FIELDS = (
     "concept_id", "schema_version", "representation", "spatial_support",
     "temporal_support", "vertical_support", "grid", "native_resolution",
-    "missingness", "ensemble_member", "intrinsic_uncertainty",
+    "missingness", "ensemble_member", "component_names",
 )
 _SPATIAL_PRESERVED_FIELDS = (
     "concept_id", "schema_version", "representation", "units",
     "temporal_support", "vertical_support", "native_resolution",
-    "missingness", "ensemble_member", "intrinsic_uncertainty",
+    "missingness", "ensemble_member", "component_names",
 )
 _TEMPORAL_PRESERVED_FIELDS = (
     "concept_id", "schema_version", "representation", "units",
     "spatial_support", "vertical_support", "grid", "native_resolution",
-    "missingness", "ensemble_member", "intrinsic_uncertainty",
+    "missingness", "ensemble_member", "component_names",
 )
 
 
@@ -635,12 +944,67 @@ def _validate_block_cell_sizes(source, result, block_x: int,
     if (source_x * block_x != result_x) or (source_y * block_y != result_y):
         raise ValueError(
             "block factors disagree with the declared cell sizes")
-    if (decimal_value(source.affine[2]) != decimal_value(result.affine[2])
-            or decimal_value(source.affine[5])
-            != decimal_value(result.affine[5])):
+    # Affines name sample centres.  A coarse output centre is the mean of the
+    # contributing fine centres, not the fine grid's first centre.
+    expected_x0 = (decimal_value(source.affine[2])
+                   + source_x * (block_x - 1) / 2)
+    expected_y0 = (decimal_value(source.affine[5])
+                   + source_y * (block_y - 1) / 2)
+    if (expected_x0 != decimal_value(result.affine[2])
+            or expected_y0 != decimal_value(result.affine[5])):
         raise ValueError(
-            "block aggregation requires a shared origin; an offset lattice is "
-            "a resampling, not a reduction")
+            "block aggregation output origin must be the exact block centre; "
+            "an offset lattice is a resampling, not a reduction")
+
+
+def _validate_uncertainty_propagation(
+        spec: TransformationSpec,
+        source: ArtifactDescriptor,
+        outputs: dict[str, ArtifactDescriptor],
+) -> None:
+    """Refuse uncertainty claims that contradict the closed edge policy.
+
+    Exact index selection does not alter values, so it must preserve the
+    complete uncertainty record.  Every numerical mapping, interpolation,
+    aggregation, and derivation must instead bind a new known model/parameter
+    manifest or explicitly report that the propagated uncertainty is unknown.
+    Reusing the source's known record would falsely claim that a model in the
+    old units/value space also describes the transformed values.
+
+    UNKNOWN is intentionally allowed to remain UNKNOWN.  The transformation
+    contract cannot manufacture knowledge that the producer never supplied.
+    """
+    source_uncertainty = source.intrinsic_uncertainty
+    policy = spec.uncertainty_propagation_policy
+    if policy is UncertaintyPropagationPolicy.PRESERVE:
+        if any(result.intrinsic_uncertainty != source_uncertainty
+               for result in outputs.values()):
+            raise ValueError(
+                "exact-selection uncertainty policy requires preservation")
+        return
+    if policy is not UncertaintyPropagationPolicy.REBIND_OR_MARK_UNKNOWN:
+        raise AssertionError(f"unvalidated uncertainty policy {policy!r}")
+    if source_uncertainty.status is UncertaintyStatus.UNKNOWN:
+        if any(result.intrinsic_uncertainty.status
+               is not UncertaintyStatus.UNKNOWN
+               for result in outputs.values()):
+            raise ValueError(
+                "a transformation cannot turn UNKNOWN source uncertainty "
+                "into a known or not-applicable output uncertainty")
+        return
+    if source_uncertainty.status is not UncertaintyStatus.KNOWN:
+        return
+    for port_id, result in sorted(outputs.items()):
+        result_uncertainty = result.intrinsic_uncertainty
+        if result_uncertainty == source_uncertainty:
+            raise ValueError(
+                "value-changing transformation cannot preserve a KNOWN "
+                f"intrinsic uncertainty unchanged on output {port_id!r}; "
+                "bind a propagated model/manifest or mark it UNKNOWN")
+        if result_uncertainty.status is UncertaintyStatus.NOT_APPLICABLE:
+            raise ValueError(
+                "value-changing transformation cannot discard a KNOWN "
+                f"intrinsic uncertainty as NOT_APPLICABLE on output {port_id!r}")
 
 
 def _validate_semantics(spec: TransformationSpec) -> None:
@@ -652,6 +1016,7 @@ def _validate_semantics(spec: TransformationSpec) -> None:
     if any(item.origin is not OriginClass.DERIVED for item in outputs.values()):
         raise ValueError("every transformation output must declare DERIVED origin")
     source = inputs["source"]
+    _validate_uncertainty_propagation(spec, source, outputs)
 
     if spec.kind is TransformationKind.UNIT_AFFINE:
         result = outputs["result"]
@@ -678,6 +1043,7 @@ def _validate_semantics(spec: TransformationSpec) -> None:
             raise ValueError("spatial subset result is outside source support")
         if source.grid is None or result.grid is None:
             raise ValueError("spatial index subset requires declared source/result grids")
+        _validate_grid_support(source)
         x0, x1 = spec.parameters["x_start"], spec.parameters["x_stop"]
         y0, y1 = spec.parameters["y_start"], spec.parameters["y_stop"]
         if min(x0, y0) < 0 or x1 <= x0 or y1 <= y0:
@@ -716,6 +1082,7 @@ def _validate_semantics(spec: TransformationSpec) -> None:
             raise ValueError("grid transform falsely changes non-spatial metadata")
         if source.grid is None or result.grid is None:
             raise ValueError("bilinear grid transforms require declared grids")
+        _validate_grid_support(source)
         target_x = spec.parameters["target_x"]
         target_y = spec.parameters["target_y"]
         _validate_axis(target_x, "target_x")
@@ -729,14 +1096,27 @@ def _validate_semantics(spec: TransformationSpec) -> None:
                 raise ValueError("regrid cannot change CRS; use explicit reprojection")
             if not source.spatial_support.contains(result.spatial_support):
                 raise ValueError("regrid target is outside source support")
+            _require_samples_inside_source_grid(
+                source.grid,
+                [[(x, y) for x in target_x] for y in target_y],
+                "regrid target")
         else:
             if (spec.parameters["source_crs"] != source.grid.crs
                     or spec.parameters["target_crs"] != result.grid.crs
+                    or tuple(spec.parameters["source_axis_order"])
+                    != source.grid.axis_order
+                    or tuple(spec.parameters["target_axis_order"])
+                    != result.grid.axis_order
                     or source.spatial_support.crs != source.grid.crs
                     or result.spatial_support.crs != result.grid.crs):
                 raise ValueError("reprojection CRS parameters disagree with descriptors")
             if source.grid.crs == result.grid.crs:
                 raise ValueError("same-CRS interpolation is regrid, not reprojection")
+            from engine.runtime.operations import reprojection_sample_points
+            sample_points = reprojection_sample_points(
+                spec.parameters, verify_local_selection=True)
+            _require_samples_inside_source_grid(
+                source.grid, sample_points, "reprojected target")
         return
 
     if spec.kind is TransformationKind.SPATIAL_BLOCK_AGGREGATE:
@@ -759,6 +1139,8 @@ def _validate_semantics(spec: TransformationSpec) -> None:
                 "block aggregation falsely changes non-spatial metadata")
         if source.grid is None or result.grid is None:
             raise ValueError("block aggregation requires declared grids")
+        _validate_grid_support(source)
+        _validate_grid_support(result)
         if source.grid.crs != result.grid.crs:
             raise ValueError(
                 "block aggregation cannot change CRS; it is an index "
@@ -787,8 +1169,12 @@ def _validate_semantics(spec: TransformationSpec) -> None:
                 "concept_id", "schema_version", "representation", "units",
                 "spatial_support", "temporal_support", "vertical_support",
                 "grid", "native_resolution", "missingness", "ensemble_member",
-                "intrinsic_uncertainty")):
+                "component_names",
+                )):
             raise ValueError("vector rotation falsely changes vector descriptor metadata")
+        if source.component_names != ("u", "v"):
+            raise ValueError(
+                "vector rotation requires exact ('u', 'v') components")
         return
 
     if spec.kind is TransformationKind.VECTOR_UV_TO_SPEED_DIRECTION:
@@ -805,7 +1191,6 @@ def _validate_semantics(spec: TransformationSpec) -> None:
             "schema_version", "representation", "spatial_support",
             "temporal_support", "vertical_support", "grid",
             "native_resolution", "missingness", "ensemble_member",
-            "intrinsic_uncertainty",
         )
         if (not _descriptor_fields_equal(source, speed, common)
                 or not _descriptor_fields_equal(source, direction, common)):
@@ -814,6 +1199,11 @@ def _validate_semantics(spec: TransformationSpec) -> None:
             raise ValueError("vector decomposition has invalid output units")
         if len({source.concept_id, speed.concept_id, direction.concept_id}) != 3:
             raise ValueError("vector and scalar output concepts must be distinct")
+        if (source.component_names != ("u", "v")
+                or speed.component_names != ("speed",)
+                or direction.component_names != ("direction",)):
+            raise ValueError(
+                "vector decomposition component contracts are invalid")
         return
 
     raise AssertionError(f"unvalidated transformation kind {spec.kind!r}")
@@ -822,15 +1212,17 @@ def _validate_semantics(spec: TransformationSpec) -> None:
 def _validate_axis(value: Any, label: str) -> None:
     if not isinstance(value, (tuple, list)) or len(value) < 2:
         raise ValueError(f"{label} must have at least two coordinates")
-    previous: float | None = None
+    numbers: list[float] = []
     for item in value:
         if (isinstance(item, bool) or not isinstance(item, (int, float))
                 or (isinstance(item, float) and not math.isfinite(item))):
             raise ValueError(f"{label} coordinates must be finite numeric")
-        number = float(item)
-        if previous is not None and number <= previous:
-            raise ValueError(f"{label} coordinates must be strictly increasing")
-        previous = number
+        numbers.append(float(item))
+    differences = [right - left
+                   for left, right in zip(numbers, numbers[1:])]
+    if (any(item == 0 for item in differences)
+            or min(differences) < 0 < max(differences)):
+        raise ValueError(f"{label} coordinates must be strictly monotonic")
 
 
 def _validate_subset_grid(
@@ -855,21 +1247,26 @@ def _validate_subset_grid(
 
 def _validate_grid_support(descriptor: ArtifactDescriptor) -> None:
     assert descriptor.grid is not None
-    grid = descriptor.grid
-    support = descriptor.spatial_support
-    if grid.crs != support.crs or grid.axis_order != support.axis_order:
-        raise ValueError("grid and spatial support CRS/axes disagree")
-    rows, columns = grid.shape
-    a, b, c, d, e, f = (decimal_value(item) for item in grid.affine)
-    corners = tuple(
-        (a * x + b * y + c, d * x + e * y + f)
-        for x, y in ((0, 0), (columns, 0), (0, rows), (columns, rows)))
-    expected_bounds = tuple(canonical_decimal(item) for item in (
-        min(item[0] for item in corners), min(item[1] for item in corners),
-        max(item[0] for item in corners), max(item[1] for item in corners),
-    ))
-    if support.bounds != expected_bounds:
-        raise ValueError("spatial support bounds disagree with grid affine/shape")
+    descriptor.grid.require_support(descriptor.spatial_support)
+
+
+def _require_samples_inside_source_grid(
+        source_grid, sample_points: list[list[tuple[float, float]]],
+        label: str) -> None:
+    """Bilinear support is bounded by centres, not outer cell edges."""
+    source_x = tuple(decimal_value(item)
+                     for item in source_grid.centre_axis("x"))
+    source_y = tuple(decimal_value(item)
+                     for item in source_grid.centre_axis("y"))
+    xmin, xmax = min(source_x), max(source_x)
+    ymin, ymax = min(source_y), max(source_y)
+    for row_index, row in enumerate(sample_points):
+        for column_index, (raw_x, raw_y) in enumerate(row):
+            x, y = decimal_value(raw_x), decimal_value(raw_y)
+            if x < xmin or x > xmax or y < ymin or y > ymax:
+                raise ValueError(
+                    f"{label} sample [{row_index},{column_index}] is outside "
+                    "the source sample-centre interpolation support")
 
 
 def _validate_target_grid(
@@ -887,16 +1284,10 @@ def _validate_target_grid(
         dx, 0, x[0], 0, dy, y[0]))
     if result.grid.affine != expected_affine:
         raise ValueError("target coordinates disagree with result grid affine")
-    if (decimal_value(result.grid.spacing.x) != dx
-            or decimal_value(result.grid.spacing.y) != dy):
+    if (decimal_value(result.grid.spacing.x) != abs(dx)
+            or decimal_value(result.grid.spacing.y) != abs(dy)):
         raise ValueError("target coordinates disagree with result grid spacing")
-    expected_bounds = tuple(canonical_decimal(item) for item in (
-        x[0], y[0], x[-1], y[-1]))
-    if result.spatial_support.bounds != expected_bounds:
-        raise ValueError("target coordinates disagree with result support bounds")
-    if (result.spatial_support.crs != result.grid.crs
-            or result.spatial_support.axis_order != result.grid.axis_order):
-        raise ValueError("target support and result grid CRS/axes disagree")
+    _validate_grid_support(result)
 
 
 def _validate_temporal_indices(
@@ -934,7 +1325,7 @@ def _validate_temporal_indices(
         step = spec.parameters["step"]
         count = spec.parameters["count"]
         if (start < 0 or step < 1 or count < 1
-                or start + count * step > source_count):
+                or start + (count - 1) * step >= source_count):
             raise ValueError("temporal alignment indices are invalid")
         expected_start = timestamp_value(offered.start) + timedelta(
             seconds=start * cadence)

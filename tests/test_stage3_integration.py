@@ -20,11 +20,14 @@ from resolution import (
     ArtifactAvailabilitySnapshot,
     ArtifactCommitRecord,
     ArtifactCommitStatus,
+    DiscoveryCertificate,
+    DiscoveryUniverseContract,
     DiscoveryLimits,
     MilpSolveOptions,
     ProducerSelectionRef,
     PlanningBenchmarkProfile,
     ResolutionStatus,
+    SatisfactionArcSelectionRef,
     SelectionConstraints,
     WorkflowResolver,
 )
@@ -40,6 +43,10 @@ def _resolver(*, limits: DiscoveryLimits = DiscoveryLimits()):
     return fixture, WorkflowResolver(
         fixture.catalog,
         fixture.deployment_snapshot,
+        discovery_certificate=DiscoveryCertificate.for_base_catalog(
+            fixture.catalog),
+        discovery_universe=DiscoveryUniverseContract.declare(
+            fixture.catalog.catalog_id),
         artifact_leaves=fixture.offered_artifact_leaves,
         availability_snapshot=availability,
         discovery_limits=limits,
@@ -145,6 +152,43 @@ def test_explicit_exclusion_forces_the_more_expensive_non_pair_alternative():
         "example-add", "example-left-constant", "example-right-constant"}
 
 
+def test_resolver_passes_exact_satisfaction_policy_to_independent_validator(
+        monkeypatch):
+    """The service adapter must not discard the selector's exact-use policy."""
+    import resolution.service as service_module
+    from resolution.validator import validate_selected_plan as replay
+
+    fixture, resolver = _resolver()
+    baseline = resolver.resolve(fixture.root_uses)
+    selected = {
+        (binding.use_id, output.producer_kind, output.producer_id,
+         output.output_port_id)
+        for binding in baseline.selection.plan.satisfactions
+        for output in binding.outputs
+    }
+    arc = next(
+        value for value in baseline.selector_problem.satisfaction_arcs
+        if (value.use_id, value.producer_kind, value.producer_id,
+            value.output_port_id) in selected)
+    required = SatisfactionArcSelectionRef.from_arc(arc)
+    observed = []
+
+    def capture(*args, constraints, **kwargs):
+        observed.extend(constraints.required_satisfactions)
+        return replay(*args, constraints=constraints, **kwargs)
+
+    monkeypatch.setattr(service_module, "validate_selected_plan", capture)
+    outcome = resolver.resolve(
+        fixture.root_uses,
+        constraints=SelectionConstraints.bind(
+            required_satisfactions=(required,)),
+    )
+
+    assert outcome.status is ResolutionStatus.READY
+    assert outcome.validation is not None and outcome.validation.valid
+    assert observed == [required]
+
+
 def test_incomplete_discovery_is_never_reported_globally_optimal_or_executable():
     fixture, resolver = _resolver(
         limits=DiscoveryLimits(max_candidates=5))
@@ -221,6 +265,10 @@ def test_artifact_evidence_is_bound_to_exact_manifest_realization():
     wrong = WorkflowResolver(
         fixture.catalog,
         fixture.deployment_snapshot,
+        discovery_certificate=DiscoveryCertificate.for_base_catalog(
+            fixture.catalog),
+        discovery_universe=DiscoveryUniverseContract.declare(
+            fixture.catalog.catalog_id),
         artifact_leaves=(wrong_leaf,),
         availability_snapshot=wrong_availability,
         evidence_snapshot=wrong_snapshot,
@@ -250,6 +298,10 @@ def test_artifact_evidence_is_bound_to_exact_manifest_realization():
     accepted = WorkflowResolver(
         fixture.catalog,
         fixture.deployment_snapshot,
+        discovery_certificate=DiscoveryCertificate.for_base_catalog(
+            fixture.catalog),
+        discovery_universe=DiscoveryUniverseContract.declare(
+            fixture.catalog.catalog_id),
         artifact_leaves=(correct_leaf,),
         availability_snapshot=correct_availability,
         evidence_snapshot=correct_snapshot,

@@ -15,6 +15,8 @@ from resolution import (
     ArtifactAvailabilitySnapshot,
     ArtifactCommitRecord,
     ArtifactCommitStatus,
+    DiscoveryCertificate,
+    DiscoveryUniverseContract,
     MilpSolveOptions,
     PlanningBenchmarkProfile,
     WorkflowResolver,
@@ -34,6 +36,10 @@ def main() -> None:
     resolver = WorkflowResolver(
         fixture.catalog,
         fixture.deployment_snapshot,
+        discovery_certificate=DiscoveryCertificate.for_base_catalog(
+            fixture.catalog),
+        discovery_universe=DiscoveryUniverseContract.declare(
+            fixture.catalog.catalog_id),
         artifact_leaves=fixture.offered_artifact_leaves,
         availability_snapshot=availability,
     )

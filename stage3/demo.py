@@ -21,6 +21,8 @@ from resolution import (
     ArtifactAvailabilitySnapshot,
     ArtifactCommitRecord,
     ArtifactCommitStatus,
+    DiscoveryCertificate,
+    DiscoveryUniverseContract,
     ResolutionOutcome,
     ResolutionStatus,
     WorkflowResolver,
@@ -48,6 +50,10 @@ def build_demo_plan() -> Stage3DemoPlan:
     resolution = WorkflowResolver(
         fixture.catalog,
         fixture.deployment_snapshot,
+        discovery_certificate=DiscoveryCertificate.for_base_catalog(
+            fixture.catalog),
+        discovery_universe=DiscoveryUniverseContract.declare(
+            fixture.catalog.catalog_id),
         artifact_leaves=fixture.offered_artifact_leaves,
         availability_snapshot=availability,
     ).resolve(fixture.root_uses)

@@ -12,6 +12,7 @@ from .alternatives import (
     SourceAlternative,
     admissible_alternatives,
     candidate_producers_for_concept,
+    candidate_satisfactions_for_use,
     enumerate_source_alternatives,
 )
 from .comparability import (
@@ -55,6 +56,7 @@ __all__ = [
     "assess_comparability",
     "build_choice_report",
     "candidate_producers_for_concept",
+    "candidate_satisfactions_for_use",
     "enumerate_source_alternatives",
     "read_metric",
     "resolve_with_objective",

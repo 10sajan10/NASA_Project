@@ -1,38 +1,81 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-16 (Stage 9A-Core, then the Stage-9B placement
-prerequisite; Stage 9B itself is blocked; MVP review outstanding)
+Last updated: 2026-08-18 (Stage 8R remediation and bounded same-node
+operational closeout implemented; real-site evidence external; Stage 9B blocked)
 
 This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
 context only.
 
+## 2026-08-18 current handoff — supersedes older status claims below
+
+Stage 8R is no longer merely planned. Its adversarial matrix has fifteen
+passing local cases and one explicitly external-blocked case, including
+discovery-universe replay, transformation and
+acquisition authority, exact contested arcs, field/grid/component agreement,
+packet replay and restart reservations, partial scheduler visibility, and
+authoritative Cube projection.  The implementation is currently a large
+**uncommitted working-tree change on `v2` at base commit `45aaee1`**.  Do not
+discard or broadly stage it.
+
+The correct headline is **“bounded soundness and same-node operational gates
+implemented; real-site evidence remains external,” not “universally complete.”**
+
+| Area | Current status |
+|---|---|
+| Planning/discovery | PASS for an explicitly declared, certificate-covered universe. Every layer is independently replayed; copied/truncated content cannot silently claim the same universe. Stage-6 alternatives and the final chosen/fallback re-solve must retain the exact planning context. |
+| Transform authority | PASS. Reserved operations replay the full transformation contract, rule digests, exact parameters/descriptors, component behavior, information-loss class, and uncertainty policy. |
+| Acquisition science/content | PASS for the bounded local transcript. Session scope, queries/cursors/candidates, coverage, source schema, descriptor, ordered blobs, receipt, and materialization are replayed. Provider-global truth is not claimed. |
+| Acquisition quota recovery | PASS for the same-node boundary. A non-expiring OS manifest lock excludes a live concurrent fetcher; durable per-asset attempt/checkpoint rows reuse completed blobs, and every retry or post-crash reopen consumes another call/byte reservation before provider access. |
+| Grid/field contract | PASS for axis-aligned rectilinear `field-json-v2`. Component names are mandatory; signed sample-centre affine coordinates and Decimal block centres agree across contract, runtime, and commit. WRF CRS/origin establishment and hashes of external PROJ grid-shift bytes remain non-claims. |
+| Packet/runtime | PASS for bounded same-node safety and reconciliation. Packet completion is derived from the exact RuntimeStore run, plan, tasks, validated artifacts, and scientific input receipts. An expired zero-launch run is cancelled under the exclusive controller lock and released without consuming retry sequence; an exact terminal result remains recoverable after expiry. Any run with uncertain launch evidence remains fenced. |
+| Queued provider | PASS in the hermetic fake-Slurm controller→worker→artifact path; real deployment is **PARTIAL/untested**. No real Slurm, MPI, GPU, WRF, or network operation ran. |
+| Cube | PASS for the bounded local RuntimeStore/DuckDB projection pair. Projection is authoritative and rebuildable; cross-database convergence is replayable/idempotent rather than atomic. |
+
+Verification was intentionally bounded and split by subsystem.  Current-tree
+evidence includes: planning/acquisition focused slices up to 211 passing;
+coordinate slice 59 passing; runtime/partition/Cube slice 212 passing and one
+skip; fake-Slurm slice 43 passing and one skip; and Stage-6 objective/context
+45 passing.  A combined 669-test Stage/Cube collection reached 86% with no
+failure before stalling in a slow provider test and was stopped; two attempts
+at the repository-wide legacy suite also stalled after 20 tests in the old
+Cube/critic path on this NFS workspace.  Do not invent a unified green total.
+
+Operational-closeout verification added one current combined run of **206
+passing** across Stage-5 session/binding/manifest/search/integration, Stage-7
+admission/partitions, Stage-8R gates/partition inputs, and Stage-1
+runtime/provider, followed by the receipt-ack crash regression; the affected
+Stage-5/Stage-7 files now pass **70 tests** together. The new
+crash/live-owner/late-terminal cases also pass in the machine-readable matrix.
+
+The next stage is **Composition MVP release review**, in this order:
+
+1. review the large uncommitted Stage-8R working tree and commit only project
+   changes while preserving the user-owned WRF/config files;
+2. decide the missed Stage-6 representative latency/evidence gate rather than
+   relabeling conformance evidence as science;
+3. gather real-site deployment evidence only when a provisioned private/Slurm
+   site is available; and
+4. choose R1/R2 reference-science work or authorized provider validation. Do
+   not begin Stage 9B research work first.
+
 ## First instructions for the next instance
 
 1. Read this file completely.
 2. Work in `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project`.
-3. Verify branch `v2` and the audit-remediation commits before changing
-   anything (see "Repository and roadmap" below).
+3. Verify branch `v2` at base commit `45aaee1`, then inspect the entire dirty
+   Stage-8R working tree before changing anything (see above).
 4. Inspect `git status` before edits. Preserve the user-owned dirty files listed
    below and never stage them accidentally.
-5. Read `stage6/README.md`, `stage7/README.md`, `stage8/README.md`, and
-   the "External audit and what it changed" section below.
+5. Read the master roadmap's **Stage 8R** section and `stage8r/README.md` first.
+   Older stage READMEs and the historical audit below contain useful history
+   but are not the current status authority.
 6. Run only the bounded Stage 0-9A tests initially. Do not run WRF-SFIRE, MPI,
    Slurm, real remote providers, or other heavy workloads. The Stage-5
    connectors are in-process; nothing in the suite touches a network.
-7. **Do not trust a stage label without reading its README.** An external
-   audit in August 2026 found several claims running ahead of the
-   implementation. Those defects are fixed and the labels were downgraded to
-   match what is demonstrated: Stage 5 and Stage 6 are **prototypes**, Stage 7
-   is a **control-plane prototype**, Stage 8 is a **policy plus a working
-   runtime bridge**. See the audit section below.
-
-8. **The Composition MVP review is still outstanding.** Three findings remain
-   queued for it: the Section 9.5 planning-latency gate is measured and
-   **missed** by roughly 3x; no real held-out reference observations exist for
-   an evidence pack, so Stage-6 evidence is synthetic; and Stage-7 partitions
-   still do not execute per-partition science through the Stage-1 runtime.
-   Ask the user before assuming any of them is resolved.
+7. **Do not trust a stage label or an aggregate green suite as a cross-layer
+   proof.** Use the adversarial matrix and its exact tests.
+8. **Do not start Stage 9B.** Perform the Composition MVP release review above.
 
 ## User's actual objective
 
@@ -72,21 +115,22 @@ and source-versus-model choice. It is not special-cased by the resolver.
 - Stage-6 implementation commit: `bf4e360`
 - Stage-7 implementation commit: `59ffc8f`
 - Stage-8 implementation commit: `538eb65`
+- Audit remediation and runtime bridge: `18a5131` through `2d4abca`
+- Stage-9A simulated provider: `1f82229`
+- WRF placement/georeference/resampling work: `49841bd` through `995dedf`
+- Cube v3 immutable-entry sidecar: `45aaee1` (current `v2` head)
 - External roadmap:
   `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/nasa_project_docs/scientific_workflow_composition_plan.md`
 - Original poster:
   `/uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/nasa_project_docs/diagrams/2026_SCposter_SajanNeupane.pdf`
 
-The roadmap has been updated through Stage 5, including an execution-status
-block on the Stage-5 section. It still marks the representative Stage-6
-planning-latency gate as pending. `stage4/README.md` and `stage5/README.md`
-remain the authoritative records of what those stages actually delivered.
-
-**Note on the roadmap file.** `scientific_workflow_composition_plan.md` lives in
-a *separate* repository (`nasa_project_docs`, remote
-`https://github.com/10sajan10/nasa_project_docs.git`) and, as of this handoff,
-is still **untracked** there — it has never been committed or pushed. It exists
-only on this node's filesystem. Treat backing it up as a standing task.
+The roadmap is tracked in the separate `nasa_project_docs` repository on branch
+`main`; before this update its head was `a930997`. It is updated through the
+Stage-9B blocked status and now contains the detailed Stage-8R remediation
+plan. That repository has no configured upstream branch on this node, so verify
+its remote and push state independently rather than assuming this handoff was
+published. Its dirty README/diagram changes belong to the user and must be
+preserved.
 
 ## Files owned by the user: preserve them
 
@@ -101,10 +145,97 @@ The following user file is untracked:
 
 - `.burncheck_logpath`
 
+The separate `nasa_project_docs` repository also has user-owned changes in
+`README.md`, `diagrams/make_diagrams.py`, and untracked diagram/PDF/cache files.
+The Stage-8R edit intentionally changes only
+`scientific_workflow_composition_plan.md` there.
+
 Do not overwrite, revert, delete, or stage these files. Do not use broad
 commands such as `git add .`, `git reset --hard`, or `git checkout -- <file>`.
 
-## Completed implementation
+## Historical pre-Stage-8R audit snapshot
+
+This section is retained to explain why Stage 8R was created.  Its blocker
+list describes the 2026-08-17 base tree and is **not** the current status; use
+the 2026-08-18 table above for the implemented working tree.
+
+The full hermetic suite was independently rerun from the current branch in the
+real host context:
+
+```text
+852 passed, 1 skipped, 7 xfailed, 140 warnings in 88.60 s
+```
+
+Stage 4--8 bounded demos pass. Twenty-two WRF georeference tests also pass
+against retained output metadata. **No WRF-SFIRE simulation, network transfer,
+MPI job, or SLURM submission was executed.** These results prove regression and
+bounded conformance, not the missing cross-layer guarantees.
+
+| Boundary | Honest current status |
+|---|---|
+| Stages 0--3 | Built finite-graph foundation, contracts, exact selector, and local durable kernel |
+| Stage 4 | Runnable finite-transform prototype; completeness and semantic authority are bypassable at the lowering boundary |
+| Stage 5 | Bounded acquisition prototype; coverage/materialization and exact fetched-content identity are not yet one contract |
+| Stage 6 | Evidence/decision prototype; exact contested-use forcing is missing, the latency gate fails, and real held-out evidence is absent |
+| Stage 7 | 10^4 control-plane lifecycle plus an eight-partition executable slice; general partition inputs and replay idempotency remain open |
+| Stage 8 | Policy plus real local concurrency bridge; restart reservation recovery and full-graph live priority remain open |
+| Stage 9A | Fake-scheduler prototype only; partial observability can still duplicate submission |
+| Stage 9B | Blocked and not started |
+| Cube v3 | Tested immutable-entry/lineage sidecar; no production writer uses it and it is not authoritative publication |
+
+### Reproduced release blockers
+
+1. A truncated Stage-4 closure reports a false complete/global optimum when its
+   bare augmented catalog is passed to the resolver without optional upstream
+   flags.
+2. A caller-built raw `CapabilitySpec` can claim a reserved transform and use a
+   forged factor (the reproduced metre-to-kilometre example used 666) because
+   transform kind/rule/assumptions are dropped during lowering.
+3. Stage-5 lowering accepts caller-invented coverage; planned coverage admits
+   mosaics the x-only runtime cannot materialize; fetched blob digests are only
+   in a mutable post-fetch receipt rather than executable task identity.
+4. Reapplying the same failed Stage-7 `PacketResult` increments the attempt
+   count and writes another attempt row. `NOT_ATTEMPTED` can also consume retry
+   budget.
+5. A restarted controller rebuilds an empty Stage-8 ledger while a durable
+   attempt is still active, so it can dispatch beyond capacity. Live rank is
+   computed from the ready subset rather than the full dependency graph.
+6. If a completed job is gone from `squeue` and `sacct` is unavailable, the
+   Stage-9A provider can submit another job for the same token.
+7. Grid semantics disagree across transform contract, runtime, and commit:
+   block aggregation derives different axes, valid north-up negative-y grids
+   fail commit validation, and a WRF-specific Lambert display token is not an
+   executable CRS definition.
+8. Stage-6 "source alternatives" constrain producer presence, not the exact
+   contested `RequirementUse`/output arc.
+
+These are the inputs to **Stage 8R -- Cross-layer Soundness and Integration**
+in the master roadmap. Do not paraphrase them as already fixed.
+
+### Cube v3: what Claude built and what it did not build
+
+Commit `45aaee1` adds schema-v3 `entries` and `entry_inputs`, immutable entry
+identity over content and derivation, deterministic `MOST_DERIVED`, `BASELINE`,
+and `MOST_RECENT` policies, content-based staleness, per-entry grids, lineage,
+and the important self/downstream exclusion for a model that consumes and
+produces the same concept. Its 26 focused tests are valuable and pass.
+
+The layer is not load-bearing. `write_static` still writes legacy mutable
+tables; no producer publishes an entry through `ArtifactCommitter`; the Cube
+catalog trusts a caller digest/free-text producer; entry and input-edge writes
+are not an authoritative artifact transaction; and catalog export does not make
+this a durable scientific provenance record. The migration should be additive:
+retain compatibility reads for the roughly 15 read-mostly application
+consumers, make the artifact transaction authoritative, and project verified
+artifacts into Cube entries through an idempotent outbox.
+
+Claude's suggestion that grid/preflight alone is enough to launch WRF is too
+strong. It removes one predictable publication failure, but Stage 9B still has
+no promoted R1/R2 fixture or certified provider, and the grid contract itself
+is inconsistent. Build/compile work may continue independently, but do not run
+WRF-SFIRE under this plan.
+
+## Implemented components (scope-qualified)
 
 ### Stage 0 — baseline and architectural audit
 
@@ -186,6 +317,11 @@ See `resolution/`, `stage3/`, and commit `36c46a8`.
 
 ### Stage 4 — explicit semantic transformations
 
+**Current qualification:** the typed transformation layer and scalar demo are
+real, but the lowering path drops the transform certificate and the resolver's
+completeness input is an optional caller convention. The "correctness fix"
+below was first-pass plumbing, not a system invariant; Stage 8R-A replaces it.
+
 - Added `TransformationSpec`: an immutable hyperedge between *exact* descriptor
   states carrying kind, closed operation/binder pair, typed ports, parameters,
   cost, semantic rule ID, and explicit scientific assumptions.
@@ -220,6 +356,12 @@ See `resolution/`, `stage3/`, and commit `36c46a8`.
 See `transformations/`, `stage4/`, `stage4/README.md`, and commit `e8b4bfd`.
 
 ### Stage 5 — progressive acquisition, coverage, and real alternatives
+
+**Current qualification:** the API order and local demo are real. Claims below
+about exact lowering, durable restart, quota, frozen sessions, quarantine, and
+snapshot completeness are not release guarantees: adversarial tests found the
+descriptor, receipt, coverage/materializer, and restart gaps summarized above.
+Stage 8R-B owns their correction.
 
 - Acquisition became a planning act with a type-enforced order:
   `search metadata -> assess coverage -> bind an exact manifest -> fetch bytes`.
@@ -271,6 +413,11 @@ See `acquisition/`, `stage5/`, `stage5/README.md`, and `resolution/upstream.py`.
 
 ### Stage 6 — dataset versus model, evidence gating, and the latency gate
 
+**Current qualification:** pairwise comparability and frozen-evidence lookup
+were repaired, but an alternative re-solve constrains producer presence rather
+than the exact contested use/arc. The latency gate remains an expected failure
+and the evidence is synthetic.
+
 - Built the four-input reduced-consequence slice the roadmap draws: a result
   requiring ignition, fuel, terrain, and a contested flow field that a direct
   observed source and a coarse-source-plus-lightweight-model path both offer.
@@ -318,6 +465,13 @@ See `objectives/`, `stage6/`, and `stage6/README.md`.
 
 ### Stage 7 — lazy partitions, bounded admission, and collection completeness
 
+**Current qualification:** the 10^4 run is a control-plane lifecycle. An
+eight-member input-free packet executes through Stage 1, but per-partition
+input binding is absent. The later replay audit also shows that applying the
+same failed result creates another attempt; the retry/idempotency bullets below
+describe the intended design and first-pass implementation, not a passed
+Stage-8R gate.
+
 - Added `partitions/`. `PartitionSetSpec` is the ordered Cartesian product of
   declared axes represented as a **mixed-radix number system**: partition *n* is
   decoded from its index, `total` is computed by multiplication, and there is
@@ -358,9 +512,16 @@ See `partitions/`, `stage7/`, and `stage7/README.md`.
 
 ### Stage 8 — resource-aware local scheduling
 
+**Current qualification:** the policy is now wired to a real local-concurrency
+bridge, contrary to the older "not wired" text retained later in this file.
+However, reservations are in memory and disappear on controller restart, and
+live priority does not use the whole graph. The simulation and local bridge are
+useful evidence, not a restart-safe scheduler claim.
+
 - Added `scheduling/`. Ready work is ranked by remaining **critical path**
   (computed once in reverse topological order, O(V+E)) combined with **aging**,
-  so the task unblocking the longest tail runs first but nothing starves.
+  so the task unblocking the longest tail runs first while bounded aging can
+  reduce delay. Capped aging is not a general starvation-freedom proof.
   Aging is capped by `starvation_ceiling_s`; without a ceiling a long-waiting
   trivial task eventually outranks everything and the policy degenerates to
   FIFO with extra steps.
@@ -388,7 +549,12 @@ See `partitions/`, `stage7/`, and `stage7/README.md`.
 
 See `scheduling/`, `stage8/`, and `stage8/README.md`.
 
-## External audit and what it changed
+## Historical August-16 audit remediation
+
+This section records fixes that landed before the independent August-17
+cross-layer review. It is historical evidence, not a claim that every boundary
+is now sound; the current status and Stage-8R blockers above supersede its
+headlines.
 
 An independent audit in August 2026 reviewed Stages 4-8 and found that several
 claims ran ahead of the implementation. Its verdict on status was accepted:
@@ -480,14 +646,20 @@ See `tests/test_stage9_runtime_bridge.py`.
 
 ## Stage 9A-Core — conditional SLURM provider (simulated only)
 
-`engine/runtime/slurm.py` implements the queued-provider boundary:
+**Current qualification:** a later adversarial test found an unsafe partial
+observability window: when the token is absent from `squeue` and `sacct` is
+unavailable, submission can proceed and duplicate a completed job. Stage 8R-E
+must make absence tri-state and require authoritative confirmed absence. Do not
+describe this provider as ready for real-site validation until that passes.
+
+`engine/runtime/slurm.py` implements most of the queued-provider boundary:
 nonblocking submit, batched reconcile through `squeue` then `sacct`, cancel,
 persisted external handles, and orphan detection.
 
 **It has never talked to a real scheduler.** No `sbatch` was run. This node is
 not a SLURM submit environment, and every behavioural test drives a fake
-scheduler through the provider's command seam. Treat the provider as ready to
-be validated, not validated.
+scheduler through the provider's command seam. Treat it as ready for Stage-8R-E
+repair tests, not ready for real-site validation.
 
 The design centre is the crash window between `sbatch` returning a job ID and
 that ID reaching disk. Identity does not depend on our bookkeeping surviving:
@@ -706,17 +878,18 @@ million-candidate discovery is solved.
 
 ## Verification evidence at handoff
 
-The **entire** repository suite passes:
+The **entire** repository suite passes in the independently verified host
+context:
 
 ```text
-829 passed, 1 skipped, 7 xfailed
+852 passed, 1 skipped, 7 xfailed, 140 warnings in 88.60 s
 ```
 
 Progression: Stage 4 `501/1/6`, Stage 5 `574/1/6`, Stage 6 `617/1/7`,
 Stage 7 `662/1/7`, Stage 8 `691/1/7`, audit remediation `718/1/7`,
 Stage 9A-Core `744/1/7`, placement contract `772/1/7`,
 WRF georeference reader `794/1/7`, declared resampling rules `811/1/7`,
-block-aggregate transformation `829/1/7`.
+block-aggregate transformation `829/1/7`, Cube v3 entries `852/1/7`.
 
 **The seventh xfail is new and is not a quarantine.** It is the strict-xfail
 Section 9.5 latency gate: a real, measured miss (see the Stage-6 exit evidence
@@ -731,9 +904,10 @@ skip instead of running; re-freeze it with
 .venv/bin/python -m pytest tests/ -q
 ```
 
-The six xfails are strict and deliberate: two quarantined WRF configuration
-decisions and four frozen legacy-runtime defects (see `stage0/`). A strict
-xfail that starts passing fails the suite and forces a decision.
+The seven xfails are strict and deliberate: the measured Stage-6 latency miss,
+two quarantined WRF configuration decisions, and four frozen legacy-runtime
+defects (see `stage0/`). A strict xfail that starts passing fails the suite and
+forces a decision.
 
 Note: `tests/test_stage1_runtime.py::
 test_controller_restart_reconciles_live_process_without_resubmit` is
@@ -853,9 +1027,10 @@ Additional evidence:
   million-asset discovery is still not claimed.
 - `acquisition.materialize.v1` reads a local content-addressed store whose
   location comes from the `NASA_STAGE5_ASSET_STORE` environment variable. What
-  it reads is pinned by manifest root, asset list, and per-blob sha256, so the
-  result does not depend on the path — but the operation is not pure over its
-  parameters alone. This is a deliberate, documented exception.
+  it reads is checked against per-blob SHA-256 values in a post-fetch receipt,
+  but that receipt/content root is not part of the pre-fetch executable task
+  identity. Stage 8R-B must add a post-fetch content-binding phase; do not call
+  the current operation pure or reproducible from its task parameters alone.
 - Stage-5 transfer is single-threaded and per-asset: no parallel fetch, range
   requests, or resume mid-asset. Provider quota is one SQLite ledger on one
   node, not a distributed quota. Connector deadlines are checked between pages,
@@ -869,9 +1044,10 @@ Additional evidence:
   reprojection, and vector operations are implemented and tested at the
   operation and contract layers, but no multi-hop chain is promoted as a
   scientific fixture.
-- Transformation *loss* is declared and visible but is not an optimization
-  dimension. A lowered transformation carries `evidence:unknown`; Stage 4 does
-  not invent empirical error for a conversion.
+- Transformation loss/uncertainty is not a complete typed contract and the
+  semantic-rule authority is dropped during ordinary capability lowering. A
+  lowered transformation carries `evidence:unknown`, but that does not repair
+  the missing authenticated rule.
 - The automatic MVP objective is minimum declared integer cost under hard
   constraints. Quality optimization, latency objectives, Pareto enumeration,
   CP-SAT, beam/A*, and learned estimates are deferred.
@@ -887,15 +1063,13 @@ Additional evidence:
   SLURM submit environment, so real-cluster behaviour -- accounting lag,
   `sacct` purge windows, QOS rejection, federation job-ID suffixes -- is
   entirely unverified.
-- **The 253/1001 fix stops one step short of publication.** Placement can now
-  be decided and WRF's grid can now be read, and together they show the real
-  answer is `CRS_MISMATCH` — WRF's Lambert against the cube's UTM. What does
-  not exist is the declared Stage-4 reprojection that would resolve it, so no
-  WRF output can be published yet. It fails closed, before the run, instead of
-  48 hours in. Nothing resamples, `cube/store.py` still does its own write-time
-  shape check independently of the preflight, and the user-owned
-  `models/wrf_sfire_adapter.py` does not yet consume the reader.
-- **Stage-6 planning latency misses the Section 9.5 target by roughly 5x** on a
+- **The 253/1001 work diagnoses but does not yet enforce launch safety.** WRF's
+  retained output is Lambert while the legacy cube request is UTM. Placement
+  and georeference tools exist, but `run_cascade.py` does not call a complete
+  launch preflight, the grid contract disagrees with artifact validation, and
+  the user-owned adapter is not wired to authoritative publication. Do not say
+  it now fails before the run; that is a Stage-8R-C acceptance gate.
+- **Stage-6 planning latency misses the Section 9.5 target by roughly 3x** on a
   representative graph. This is the largest known gap at the MVP boundary.
 - Stage-6 evidence is **synthetic fixture data**. Real wind evidence remains
   unavailable and was not invented; `stage2/wind_evidence_pack_v1.json` is
@@ -912,30 +1086,26 @@ Additional evidence:
   concept per decision report is supported.
 - `quality_under_budget`, `minimum_dependency_latency`, and user-defined
   lexicographic policies from Section 6.4 remain deferred.
-- **The Stage-8 scheduling policy is not wired into the Stage-1 controller.**
-  That controller still enforces `max_inflight=1` and is deliberately serial.
-  Stage 8 delivers the policy, tested in isolation; making it the runtime's
-  scheduler is unfinished.
+- **The Stage-8 policy is wired into a real local-concurrency bridge**, but
+  reservations are not durable/reconstructed after controller restart and live
+  critical-path rank is computed from only currently ready nodes.
 - **Stage-8 makespans come from a discrete-event simulation**, not wall-clock
   runs of real subprocesses. Durations are declared or measured; the simulator
   answers whether a policy orders work better, not how long a real run takes.
   Resource feasibility inside it is real — every start goes through the ledger.
-- **Nothing collects Stage-8 observations from real attempts.** `peak_memory_mb`
-  is never measured; the revision machinery is correct but is driven by
-  caller-supplied numbers.
+- Real local attempts now emit duration and sampled peak-memory observations;
+  this remains single-node conformance evidence rather than portable resource
+  enforcement.
 - **Stage-5 acquisition throttling and network-site feasibility are not
   integrated** into Stage-8 admission, though the Build section asks for it.
   `ExecutionSite` filters on network classes, but the per-provider quota ledger
   stays separate. GPUs are counted, not pinned to IDs.
-- **Stage-7 partitions are not executed through the Stage-1 runtime.** The
-  demo drives all 10,000 through admission, packetisation, and commit, but the
-  outcomes are *recorded* rather than produced by running 10,000 subprocess
-  tasks. Bridging `WorkPacket` members to `BoundExecutionGraph` tasks is the
-  top Stage-7 follow-up; until it exists this is the partition **control
-  plane**, not partitioned science.
-- `PacketAttempt` is a record, not a provider submission. No external handle,
-  no provider-boundary fencing of duplicate packet results beyond the
-  per-member dedup in `record_outcome`.
+- Stage 7 executes an eight-member input-free packet through Stage 1. The
+  10,000-member result remains a control-plane lifecycle, and general
+  partition-key-to-input binding is absent.
+- Packet result replay is not idempotent: repeating one failed result creates
+  another attempt, and `NOT_ATTEMPTED` can consume budget. This is a Stage-8R-D
+  correctness blocker, not merely an external-provider feature.
 - Stage-7 fusion overhead is **not** measured against Section 8.7's 5% target,
   because there is no representative useful work to measure it against yet.
 - The legacy eager `list(tile_iter)` in `engine/tiled.py` is untouched. The new
@@ -945,7 +1115,7 @@ Additional evidence:
   remains a Stage-10 question.
 - WRF-SFIRE is not a current test workload.
 
-## Stage-4 exit evidence (met)
+## Stage-4 bounded demo evidence (cross-layer gates remain)
 
 Recorded so the next instance does not re-litigate settled ground. Each of the
 ten Stage-4 invariants was checked against the implementation:
@@ -964,7 +1134,7 @@ ten Stage-4 invariants was checked against the implementation:
 - Domain-neutral scalar and vector fixtures only; no resolver code depends on
   any concept meaning.
 
-## Stage-5 exit evidence (met)
+## Stage-5 bounded demo evidence (cross-layer gates remain)
 
 Each of the ten Stage-5 invariants was checked against the implementation, and
 each expected exit criterion is asserted by a test rather than only observed in
@@ -1018,7 +1188,7 @@ Stage-5 scope. Lowering to a capability keeps acquisition inside the ordinary
 selector without touching the compiler, and mirrors how Stage 4 lowered
 transformations.
 
-## Stage-6 exit evidence (mostly met; one gate MISSED)
+## Stage-6 candidate evidence (release gate not met)
 
 Six of the seven Stage-6 exit criteria are met and asserted by tests. The
 seventh -- the Section 9.5 planning-latency budget -- was measured and **is not
@@ -1044,14 +1214,14 @@ Met:
 
 Missed:
 
-- **Warm end-to-end planning does not meet the Section 9.5 target.** On the
-  frozen representative graph (126 invocations, 250 arcs, 6 levels -- all
-  inside the 1,000/5,000/12 caps) the p95 is roughly **23 s against a 5 s
-  budget**. The MILP solve is ~83% of planning time and scales sharply: 30
-  invocations 1.1 s, 64 invocations 5.5 s, 126 invocations ~23 s. Enabling
-  HiGHS presolve helps (4.6 s to 3.1 s solve at 64 invocations) but nowhere
-  near enough, and presolve is off by default because Stage 3 found this build
-  returning a false infeasibility on a valid regression.
+- **Warm end-to-end planning does not meet the Section 9.5 target.** The latest
+  frozen representative graph has 126 invocations, 250 arcs, and 6 levels --
+  all inside the 1,000/5,000/12 caps -- and records p95
+  **15.123187728 s against a 5 s budget**. Commit `6a2f310` enabled guarded
+  HiGHS presolve and `201d3d7` re-froze this result; the miss remains about 3x.
+  The profile also self-labels `STAGE3_CONFORMANCE_MICROBENCHMARK` and
+  `NOT_A_STAGE6_REPRESENTATIVE_SLO`, so it is useful performance evidence but
+  cannot by itself satisfy the Stage-6 release gate.
 
   The assertion lives as a **strict xfail** in `tests/test_stage6_benchmark.py`.
   If solver work ever makes it pass, the suite fails and forces a re-freeze and
@@ -1063,10 +1233,10 @@ One design decision worth not re-litigating: the decision record binds into
 identity. The roadmap says "candidate-plan identity"; the bound plan is what
 executes, and reaching it this way avoided changing Stage-2 core identity.
 
-## Stage-7 exit evidence (met, with one scope boundary)
+## Stage-7 bounded evidence (partial; Stage-8R replay gate open)
 
-All six Stage-7 exit criteria are met at the partition control-plane level, and
-each is asserted by a test rather than only shown in the demo:
+Five bounded properties and one executable slice are demonstrated, but packet
+replay prevents an exit claim:
 
 - **One scientific selection is reused by all compatible partitions.** The
   template carries a single resolved invocation taken from a real Stage-3
@@ -1079,33 +1249,28 @@ each is asserted by a test rather than only shown in the demo:
   nothing skipped, nothing multiplied.
 - **Partial partitions cannot satisfy a complete collection.** `ALL` requires
   every partition committed *and* zero failures; `FRACTION` rounds up.
-- **A partially failed packet preserves committed members** and offers only the
-  uncommitted retry-safe ones; a committed partition is never un-committed by a
-  duplicate or late result.
+- **A partially failed packet preserves committed members** on the first
+  application and offers retry-safe failures. Reapplying the same result,
+  however, creates another attempt; replay idempotency is not established.
 - **Memory stays bounded by the window, not the partition count.** Peak
   allocation grows 1.4x for a 10x larger space once the window is saturated.
 
-**The scope boundary to be honest about:** partitions are admitted,
-packetised, and committed, but they are **not executed through the Stage-1
-runtime**. The demo records outcomes rather than running 10,000 subprocess
-tasks. The roadmap's demonstration line says "execute at least 10^4
-partitions"; what is demonstrated is the full partition lifecycle at that
-scale, not 10^4 scientific executions. Bridging `WorkPacket` members to
-`BoundExecutionGraph` tasks is the first thing to do if Stage 7 is revisited,
-and it is also what would make the Section 8.7 five-percent fusion-overhead
-target measurable.
+**The scope boundary:** an eight-member input-free packet executes through
+Stage 1 and publishes artifacts. The 10^4 demo measures admission,
+packetisation, and collection state, not 10^4 subprocesses; partition-specific
+input manifests and the five-percent fusion-overhead measurement are absent.
 
-## Stage-8 exit evidence (met, with one scope boundary)
+## Stage-8 bounded evidence (partial; Stage-8R recovery gate open)
 
-All four Stage-8 exit criteria are met at the policy level, each asserted by a
-test rather than only shown in the demo:
+The original four policy fixtures pass, but later integration checks prevent an
+exit claim:
 
 - **CPU and memory are not oversubscribed.** The ledger refuses on any
   dimension and names the one that blocked; the simulator routes every start
   through it, so `oversubscribed` is measured. Peak usage was 2 of 2 cores.
-- **Low-priority work cannot starve.** A task nothing depends on started at
-  40.0 s without aging and 10.0 s with it, at identical makespan. Aging is
-  capped so it cannot invert the graph permanently.
+- **Aging reduces delay on the fixture.** A task nothing depends on started at
+  40.0 s without aging and 10.0 s with it, at identical makespan. This is not
+  starvation freedom: a rank gap above the capped bonus can still dominate.
 - **Event-driven execution improves makespan over the layer runner.** 39.0 s →
   30.0 s on the imbalanced graph, a 23.1% improvement that also equals the
   critical-path lower bound, with the chain running back-to-back.
@@ -1113,66 +1278,57 @@ test rather than only shown in the demo:
   identified `DeploymentRevision` carrying declared value, observed peak,
   proposal, and reason; the declared envelope is left untouched.
 
-**The scope boundary:** the policy is **not wired into the live Stage-1
-controller**, which still enforces `max_inflight=1` and is deliberately serial.
-Makespans come from a deterministic discrete-event simulation over declared or
-measured durations, not from wall-clock runs of real subprocesses — the
-simulator answers whether a policy orders work better, not how long a real run
-takes. Resource feasibility inside it is real. Nothing yet instruments the
-Stage-1 worker to produce observations, so `peak_memory_mb` is never actually
-measured.
+**Current bridge and blocker:** the policy now drives concurrent local
+subprocesses and samples peak memory. The 39/39/30 comparison remains a
+simulation, while 6.9/1.9 is the real bridge fixture. Controller restart loses
+the in-memory ledger while active attempts remain durable, and the live ranker
+sees only ready nodes; Stage 8 therefore has not passed its recovery/priority
+exit gate.
 
-## Next: the deferred Composition MVP review, or the runtime bridge
+## Next: Stage 8R -- Cross-layer Soundness and Integration
 
-Stage 6 reached the roadmap's Composition MVP release boundary. The user
-directed that Stages 7 and 8 proceed anyway, so **the review was deferred, not
-performed**. Four findings are queued for it:
+Do not start another ordinary feature stage. The detailed release-blocking plan
+is in the master roadmap. Its implementation order is:
 
-1. **Planning latency misses its Section 9.5 target by roughly 5x** (23.3 s p95
-   against 5 s, MILP-dominated). Solver strategy, not graph size — the
-   benchmark asserts a floor on graph size so the gate cannot be gamed.
-2. **No real reference observations exist.** Stage-6 evidence is synthetic and
-   `stage2/wind_evidence_pack_v1.json` is still `status: UNAVAILABLE`.
-3. **Stage-7 partitions do not execute** through the Stage-1 runtime.
-4. **The Stage-8 policy is not the runtime's scheduler.**
+1. **Freeze the adversarial matrix.** Turn every reproduced counterexample in
+   the current-status section into a named regression before changing its
+   implementation.
+2. **Planning authority.** Make discovery completeness a mandatory certificate,
+   carry authenticated transform semantics through selection/compile/commit,
+   and constrain Stage-6 alternatives to the exact contested satisfaction arc.
+3. **Exact data and grids.** Derive descriptors from source metadata, align
+   coverage with executable mosaics, bind exact fetched bytes before payload
+   execution, freeze discovery sessions, and establish one coordinate/affine/
+   CRS contract across descriptor, runtime, and commit.
+4. **Authoritative publication and Cube promotion.** Keep `ArtifactCommitter`
+   authoritative and project validated artifacts into Cube v3 entries through
+   an idempotent outbox. Migrate read-mostly consumers additively; do not route
+   producers directly through unauthenticated `commit_entry`.
+5. **Runtime recovery.** Make packet-result replay idempotent, preserve retry
+   budget for `NOT_ATTEMPTED`, reconstruct/fence reservations before restart
+   dispatch, rank from the full bound graph, and bind distinct partition input
+   manifests.
+6. **Queued-provider uncertainty.** Treat `squeue` and `sacct` as independent
+   tri-state evidence; partial observability never authorizes resubmission.
+7. **Reconcile release evidence.** Full suite plus bounded demos, one current
+   status table across README/stage docs/roadmap/handoff, and explicit non-runs.
 
-Findings 3 and 4 share one root cause and one fix. Stages 7 and 8 both built
-layers *around* a Stage-1 controller that is deliberately serial. The single
-highest-value piece of work available is the **runtime bridge**: lift
-`max_inflight=1`, drive admission from `BoundedAdmissionController`, order
-ready work with the Stage-8 policy, reserve through the ledger, and instrument
-the worker to emit `TaskObservation` values. That would make Stages 7 and 8
-real rather than adjacent, and would let the fusion-overhead and makespan
-claims be measured on wall-clock rather than simulated.
-
-Moving further down the roadmap is currently **blocked**, and it is worth being
-precise about by what. Stage 9A is built but simulated. Stage 9B cannot start:
-no R1 golden fixture is promoted, no R2/R2A lane exists, and no provider is
-certified. The placement contract removed one of 9B's blockers; the ones that
-remain need either a real cluster or a promoted reference run, and neither can
-be manufactured here.
-
-The two concrete pieces of 9B prerequisite work that *are* doable without a
-cluster:
-
-1. **Declare the WRF-SFIRE output georeference.** The placement contract can
-   only decide a publication when the producer says which grid its array is on.
-   That declaration belongs in `models/wrf_sfire_adapter.py`, which is
-   user-owned and was deliberately not touched. This is the remaining half of
-   the 253/1001 fix.
-2. **Wire `cube/store.py` to the preflight**, so the legacy cascade refuses an
-   unplaceable plan at launch rather than 48 hours in. Not done here because it
-   changes the running v1 pipeline and there is no way to exercise it end to
-   end on this node.
+The Stage-6 planning latency miss and absent real evidence pack remain separate
+MVP release decisions even after Stage 8R. Stage 8R also does not authorize a
+WRF-SFIRE run: Stage 9B still lacks R1/R2 fixtures and a certified provider.
+The WRF publication preflight is a lightweight Stage-8R-C conformance test; it
+must reject the recorded mismatch without launching the model.
 
 ## Later stages, briefly
 
-- **Stage 9A:** conditional nonblocking Slurm provider, only when an eligible
-  workload/site requires it.
+- **Stage 9A:** the fake-scheduler provider remains a prototype. After Stage
+  8R-E, validate it only when an eligible, authorized workload/site requires
+  managed batch execution.
 - **Stage 9B:** WRF integration through a proven execution provider, using
   reference fixtures; never use WRF as the first runtime correctness test.
-  **Blocked** — see the Stage 9B section above. The 253/1001 placement blocker
-  is typed and tested; R1 promotion and provider certification are not.
+  **Blocked** — see the Stage 9B section above. The 253/1001 mismatch is
+  diagnosed, not yet enforced as a launch-time system invariant; R1 promotion
+  and provider certification are also absent.
 - **Stage 10+:** measurement-triggered arrays/pilot/million-scale hardening,
   operations, standards export, and finally the research paper.
 
@@ -1206,37 +1362,30 @@ in there, and push `v2`.
 ## Suggested first prompt on the new machine
 
 ```text
-Read codex_handoff.md completely. Verify branch v2 and its head commit.
-Inspect git status and preserve the listed user-owned dirty files. Read
-stage6/README.md, stage7/README.md, stage8/README.md, stage9a/README.md, and
-stage9b/README.md. Run the full test suite (expect 829 passed, 1 skipped,
-7 xfailed) without WRF-SFIRE, MPI, Slurm, or any real remote provider.
+Read codex_handoff.md and the master roadmap's Stage 8R section completely.
+Verify branch v2 at 45aaee1, inspect git status, and preserve every listed
+user-owned dirty file. The separate nasa_project_docs repository also has dirty
+README/diagram work; preserve it.
 
-Do not attempt Stage 9B. Its gates fail: no R1 golden fixture is promoted, no
-R2/R2A lane exists, and no provider is certified (Stage 9A has never submitted
-a job). The 253/1001 placement blocker is typed and tested, but its producer
-half is now readable via models/wrf_georeference.py, and it shows the real
-answer is CRS_MISMATCH: WRF writes Lambert Conformal on a sphere, the cube is
-UTM. transformations/resampling.py states what a regrid must preserve per
-variable, but the declared Stage-4 reprojection itself does not exist,
-and wiring the reader into user-owned models/wrf_sfire_adapter.py needs the
-user's say-so. Ask before touching that file.
+The last independently verified full suite result is 993 passed, 1 skipped,
+7 xfailed (Stage-8R working tree, including the Cube projection-authority
+fix). Initially run only bounded tests; do not run WRF-SFIRE, MPI, a real
+Slurm command, or a real remote provider.
 
-Do not assume the Composition MVP review happened -- it was deferred when the
-user chose to continue past the Stage-6 boundary. Four findings are queued for
-it: planning latency misses its Section 9.5 target by ~5x and is MILP-dominated
-(treat solver strategy as the target, not graph shrinking -- the benchmark
-asserts a floor on graph size so the gate cannot be gamed); no real held-out
-reference observations exist for an evidence pack; Stage-7 partitions are
-admitted and committed but never executed through the Stage-1 runtime; and the
-Stage-8 scheduling policy is not wired into that runtime either.
+Do not begin Stage 9B or another feature stage. Implement Stage 8R in its stated
+order, starting by freezing the adversarial reproductions. A green ordinary
+suite is not proof of the missing boundaries. In particular: discovery
+completeness must be certificate-bound; transforms need authenticated semantic
+rules; fetched bytes need a post-fetch content binding; packet replay and
+resource restart must be idempotent; partial Slurm observability must never
+resubmit; and Cube v3 must remain a projection behind ArtifactCommitter.
 
-The last two share a root cause: both stages built layers around a Stage-1
-controller that is still deliberately serial (max_inflight=1). The runtime
-bridge -- lifting that guard, driving admission from BoundedAdmissionController,
-ordering with the Stage-8 policy, reserving through the ledger, and
-instrumenting the worker to emit TaskObservation values -- is the highest-value
-work available, and would let the fusion-overhead and makespan claims be
-measured on wall-clock rather than simulated. Ask the user which to take on
-before writing any code.
+Cube v3 at 45aaee1 is tested but not load-bearing. Do not wire producers
+directly to Catalog.commit_entry or claim the new entries replace artifact
+publication. Preserve compatibility reads and migrate through an idempotent
+projection/outbox.
+
+The Stage-6 latency target still fails and its real evidence pack is absent.
+Stage 9B also lacks R1/R2 and a certified provider. WRF is an example model and
+must not be used as the integration test.
 ```

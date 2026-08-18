@@ -19,13 +19,56 @@ from .space import PartitionKey
 
 
 @dataclass(frozen=True)
+class PartitionRetryPolicy:
+    """Immutable automatic-retry authority for a partition collection.
+
+    Both the safety decision and its attempt ceiling are scientific execution
+    policy.  Keeping them together in the template identity prevents a packet
+    result caller from increasing either value after the collection was
+    registered.
+    """
+
+    retry_safe: bool = False
+    max_attempts: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.retry_safe) is not bool:
+            raise TypeError("retry_safe must be bool")
+        if (isinstance(self.max_attempts, bool)
+                or not isinstance(self.max_attempts, int)
+                or self.max_attempts < 1):
+            raise ValueError("max_attempts must be a positive integer")
+        if not self.retry_safe and self.max_attempts != 1:
+            raise ValueError(
+                "a non-retry-safe policy must have max_attempts=1")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "stage8r-partition-retry-policy-v1",
+            "retry_safe": self.retry_safe,
+            "max_attempts": self.max_attempts,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "PartitionRetryPolicy":
+        raw = require_object_fields(
+            value, {"schema", "retry_safe", "max_attempts"},
+            "PartitionRetryPolicy")
+        if raw.pop("schema") != "stage8r-partition-retry-policy-v1":
+            raise ValueError(
+                "PartitionRetryPolicy schema is not "
+                "stage8r-partition-retry-policy-v1")
+        return cls(**raw)
+
+
+@dataclass(frozen=True)
 class PartitionTaskTemplate:
     """A verified invocation shared by every partition in one collection."""
 
     template_id: str
     invocation: BoundInvocation
     estimated_cost_units: int
-    retry_safe: bool = False
+    retry_policy: PartitionRetryPolicy
 
     def __post_init__(self) -> None:
         _digest(self.template_id, "template_id")
@@ -36,9 +79,12 @@ class PartitionTaskTemplate:
                 or not isinstance(self.estimated_cost_units, int)
                 or self.estimated_cost_units < 0):
             raise ValueError("estimated cost must be a non-negative integer")
-        if type(self.retry_safe) is not bool:
-            raise TypeError("retry_safe must be bool")
-        if self.retry_safe and not self.invocation.implementation.retry_safe:
+        if not isinstance(self.retry_policy, PartitionRetryPolicy):
+            raise TypeError(
+                "partition template retry_policy must be a "
+                "PartitionRetryPolicy")
+        if (self.retry_policy.retry_safe
+                and not self.invocation.implementation.retry_safe):
             raise ValueError(
                 "automatic retry cannot exceed the implementation contract")
         if self.template_id != self.expected_id():
@@ -47,7 +93,9 @@ class PartitionTaskTemplate:
     @classmethod
     def bind(cls, invocation: BoundInvocation, *,
              estimated_cost_units: int | None = None,
-             retry_safe: bool = False) -> "PartitionTaskTemplate":
+             retry_policy: PartitionRetryPolicy | None = None,
+             retry_safe: bool | None = None,
+             max_attempts: int | None = None) -> "PartitionTaskTemplate":
         """Compile from a resolver output; automatic retry is opt-in."""
         if not isinstance(invocation, BoundInvocation):
             raise TypeError("bind requires a BoundInvocation")
@@ -57,19 +105,42 @@ class PartitionTaskTemplate:
                 raise ValueError(
                     "bound invocation cost_units must be an integer")
             estimated_cost_units = value
-        payload = cls._payload(invocation, estimated_cost_units, retry_safe)
+        if retry_policy is not None:
+            if retry_safe is not None or max_attempts is not None:
+                raise ValueError(
+                    "retry_policy cannot be combined with retry_safe or "
+                    "max_attempts")
+            if not isinstance(retry_policy, PartitionRetryPolicy):
+                raise TypeError(
+                    "retry_policy must be a PartitionRetryPolicy")
+        else:
+            safe = False if retry_safe is None else retry_safe
+            ceiling = ((3 if safe else 1) if max_attempts is None
+                       else max_attempts)
+            retry_policy = PartitionRetryPolicy(safe, ceiling)
+        payload = cls._payload(
+            invocation, estimated_cost_units, retry_policy)
         return cls(strict_hash(payload), invocation, estimated_cost_units,
-                   retry_safe)
+                   retry_policy)
 
     @staticmethod
     def _payload(invocation: BoundInvocation, estimated_cost_units: int,
-                 retry_safe: bool) -> dict[str, Any]:
+                 retry_policy: PartitionRetryPolicy) -> dict[str, Any]:
         return {
-            "schema": "stage7-partition-task-template-v2",
+            "schema": "stage8r-partition-task-template-v3",
             "invocation": invocation.to_dict(),
             "estimated_cost_units": estimated_cost_units,
-            "retry_safe": retry_safe,
+            "retry_policy": retry_policy.to_dict(),
         }
+
+    @property
+    def retry_safe(self) -> bool:
+        """Compatibility view; the authority is the typed policy."""
+        return self.retry_policy.retry_safe
+
+    @property
+    def max_attempts(self) -> int:
+        return self.retry_policy.max_attempts
 
     @property
     def invocation_key(self) -> str:
@@ -101,7 +172,7 @@ class PartitionTaskTemplate:
 
     def expected_id(self) -> str:
         return strict_hash(self._payload(
-            self.invocation, self.estimated_cost_units, self.retry_safe))
+            self.invocation, self.estimated_cost_units, self.retry_policy))
 
     def logical_task_key(self, partition: PartitionKey) -> str:
         """Stable identity for this exact invocation and one partition."""
@@ -116,7 +187,7 @@ class PartitionTaskTemplate:
 
     def to_dict(self) -> dict[str, Any]:
         payload = self._payload(
-            self.invocation, self.estimated_cost_units, self.retry_safe)
+            self.invocation, self.estimated_cost_units, self.retry_policy)
         payload["template_id"] = self.template_id
         return payload
 
@@ -125,14 +196,16 @@ class PartitionTaskTemplate:
         raw = require_object_fields(
             value,
             {"schema", "template_id", "invocation",
-             "estimated_cost_units", "retry_safe"},
+             "estimated_cost_units", "retry_policy"},
             "PartitionTaskTemplate")
-        if raw.pop("schema") != "stage7-partition-task-template-v2":
+        if raw.pop("schema") != "stage8r-partition-task-template-v3":
             raise ValueError(
                 "PartitionTaskTemplate schema is not "
-                "stage7-partition-task-template-v2")
+                "stage8r-partition-task-template-v3")
         raw["invocation"] = BoundInvocation.from_dict(raw["invocation"])
+        raw["retry_policy"] = PartitionRetryPolicy.from_dict(
+            raw["retry_policy"])
         return cls(**raw)
 
 
-__all__ = ["PartitionTaskTemplate"]
+__all__ = ["PartitionRetryPolicy", "PartitionTaskTemplate"]

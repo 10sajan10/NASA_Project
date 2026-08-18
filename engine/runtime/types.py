@@ -5,9 +5,16 @@ import dataclasses
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Iterable
 
-from .identity import freeze_json, require_object_fields, strict_copy, strict_hash
+from .identity import (
+    FrozenDict,
+    freeze_json,
+    require_object_fields,
+    strict_copy,
+    strict_hash,
+)
 
 
 _HEX_DIGEST_LENGTH = 64
@@ -152,11 +159,123 @@ class InputBinding:
 
 
 @dataclass(frozen=True)
+class ExternalArtifactInputBinding:
+    """One task input supplied by an already-authoritatively committed artifact.
+
+    The artifact identity, not a caller-provided manifest path, is the graph
+    binding.  :class:`RuntimeStore` resolves that identity through its own
+    ``artifact_commits`` table when the run is created and freezes the exact
+    manifest path used by every attempt.
+    """
+
+    input_name: str
+    artifact_id: str
+
+    def __post_init__(self) -> None:
+        _required_text(self.input_name, "external input_name")
+        _digest(self.artifact_id, "external input artifact_id")
+
+    @classmethod
+    def from_dict(
+            cls, value: dict[str, Any]) -> "ExternalArtifactInputBinding":
+        return cls(**_strict_dataclass(
+            value, cls, "ExternalArtifactInputBinding"))
+
+
+@dataclass(frozen=True)
+class AttemptInputReceipt:
+    """Exact immutable artifact receipt presented to one worker input port.
+
+    A manifest path on its own is only a locator: replacing the file with a
+    different otherwise-valid manifest used to redirect a worker silently.
+    The attempt now carries the complete authority tuple resolved by
+    :class:`RuntimeStore`; the worker must replay every field before reading
+    the object.
+    """
+
+    artifact_id: str
+    recipe_id: str
+    content_sha256: str
+    size_bytes: int
+    manifest_path: str
+
+    def __post_init__(self) -> None:
+        _digest(self.artifact_id, "attempt input artifact_id")
+        _digest(self.recipe_id, "attempt input recipe_id")
+        _digest(self.content_sha256, "attempt input content_sha256")
+        if (isinstance(self.size_bytes, bool)
+                or not isinstance(self.size_bytes, int)
+                or self.size_bytes < 0):
+            raise ValueError("attempt input size_bytes must be non-negative")
+        _required_text(self.manifest_path, "attempt input manifest_path")
+        if not Path(self.manifest_path).is_absolute():
+            raise ValueError("attempt input manifest_path must be absolute")
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "AttemptInputReceipt":
+        return cls(**_strict_dataclass(value, cls, "AttemptInputReceipt"))
+
+
+@dataclass(frozen=True)
+class ScientificArtifactBinding:
+    """Frozen Stage-2 meaning attached to one executable output.
+
+    Stage 1 does not infer any of these values from payload bytes.  The
+    compiler supplies the complete descriptor snapshot and the three exact
+    scientific-plan coordinates which selected it.  Keeping the descriptor as
+    strict JSON avoids importing the scientific-contract layer into the
+    runtime's persisted data model; construction nevertheless replays that
+    layer's closed decoder and content identity.
+    """
+
+    bound_plan_id: str
+    invocation_id: str
+    output_port: str
+    descriptor_id: str
+    descriptor: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        _digest(self.bound_plan_id, "scientific binding bound_plan_id")
+        _digest(self.invocation_id, "scientific binding invocation_id")
+        _required_text(self.output_port, "scientific binding output_port")
+        _digest(self.descriptor_id, "scientific binding descriptor_id")
+        object.__setattr__(self, "descriptor", freeze_json(self.descriptor))
+        if not isinstance(self.descriptor, dict):
+            raise ValueError("scientific binding descriptor must be an object")
+        # Local import keeps Stage-1 worker startup independent of the
+        # scientific layer unless a compiled scientific recipe is decoded.
+        from contracts.types import ArtifactDescriptor
+
+        decoded = ArtifactDescriptor.from_dict(strict_copy(self.descriptor))
+        if decoded.descriptor_id != self.descriptor_id:
+            raise ValueError(
+                "scientific binding descriptor snapshot does not match its identity")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "bound_plan_id": self.bound_plan_id,
+            "invocation_id": self.invocation_id,
+            "output_port": self.output_port,
+            "descriptor_id": self.descriptor_id,
+            "descriptor": strict_copy(self.descriptor),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ScientificArtifactBinding":
+        return cls(**_strict_dataclass(
+            value, cls, "ScientificArtifactBinding"))
+
+
+@dataclass(frozen=True)
 class OutputSpec:
     name: str = "result"
     media_type: str = "application/json"
     validation: dict[str, Any] = field(
         default_factory=lambda: {"kind": "finite_json"})
+    scientific_binding: ScientificArtifactBinding | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.name, "output name")
@@ -164,10 +283,23 @@ class OutputSpec:
         object.__setattr__(self, "validation", freeze_json(self.validation))
         if not isinstance(self.validation, dict):
             raise ValueError("output validation must be a JSON object")
+        if (self.scientific_binding is not None
+                and not isinstance(
+                    self.scientific_binding, ScientificArtifactBinding)):
+            raise TypeError(
+                "output scientific_binding must be a ScientificArtifactBinding")
+        if (self.scientific_binding is not None
+                and self.scientific_binding.output_port != self.name):
+            raise ValueError(
+                "output scientific binding names another output port")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "OutputSpec":
-        return cls(**_strict_dataclass(value, cls, "OutputSpec"))
+        raw = _strict_dataclass(value, cls, "OutputSpec")
+        if raw["scientific_binding"] is not None:
+            raw["scientific_binding"] = ScientificArtifactBinding.from_dict(
+                raw["scientific_binding"])
+        return cls(**raw)
 
 
 @dataclass(frozen=True)
@@ -176,6 +308,7 @@ class TaskTemplate:
     component: ExecutableComponent
     parameters: dict[str, Any] = field(default_factory=dict)
     inputs: tuple[InputBinding, ...] = ()
+    external_inputs: tuple[ExternalArtifactInputBinding, ...] = ()
     outputs: tuple[OutputSpec, ...] = field(
         default_factory=lambda: (OutputSpec(),))
     resources: ResourceRequest = field(default_factory=ResourceRequest)
@@ -199,8 +332,24 @@ class TaskTemplate:
             raise ValueError("invalid retry policy")
         if self.max_attempts > 1 and not self.component.retry_safe:
             raise ValueError("non-retry-safe component cannot request retries")
-        if len({i.input_name for i in self.inputs}) != len(self.inputs):
+        if (not isinstance(self.inputs, tuple)
+                or not all(isinstance(value, InputBinding)
+                           for value in self.inputs)
+                or not isinstance(self.external_inputs, tuple)
+                or not all(isinstance(value, ExternalArtifactInputBinding)
+                           for value in self.external_inputs)):
+            raise TypeError("task inputs must be immutable typed tuples")
+        input_names = tuple(value.input_name for value in self.inputs)
+        external_names = tuple(
+            value.input_name for value in self.external_inputs)
+        if len(set(input_names)) != len(input_names):
             raise ValueError(f"task {self.key!r} has duplicate input names")
+        if len(set(external_names)) != len(external_names):
+            raise ValueError(
+                f"task {self.key!r} has duplicate external input names")
+        if set(input_names).intersection(external_names):
+            raise ValueError(
+                f"task {self.key!r} binds one input both internally and externally")
         object.__setattr__(self, "parameters", freeze_json(self.parameters))
         if not isinstance(self.parameters, dict):
             raise ValueError("task parameters must be a JSON object")
@@ -218,6 +367,7 @@ class ArtifactRecipe:
     output_name: str
     media_type: str
     validation: dict[str, Any]
+    scientific_binding: ScientificArtifactBinding | None = None
 
     def __post_init__(self) -> None:
         _digest(self.recipe_id, "recipe_id")
@@ -227,16 +377,29 @@ class ArtifactRecipe:
         object.__setattr__(self, "validation", freeze_json(self.validation))
         if not isinstance(self.validation, dict):
             raise ValueError("artifact validation must be a JSON object")
+        if (self.scientific_binding is not None
+                and not isinstance(
+                    self.scientific_binding, ScientificArtifactBinding)):
+            raise TypeError(
+                "artifact recipe scientific_binding has the wrong type")
+        if (self.scientific_binding is not None
+                and self.scientific_binding.output_port != self.output_name):
+            raise ValueError(
+                "artifact recipe scientific binding names another output")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ArtifactRecipe":
-        return cls(**_strict_dataclass(value, cls, "ArtifactRecipe"))
+        raw = _strict_dataclass(value, cls, "ArtifactRecipe")
+        if raw["scientific_binding"] is not None:
+            raw["scientific_binding"] = ScientificArtifactBinding.from_dict(
+                raw["scientific_binding"])
+        return cls(**raw)
 
     @classmethod
     def bind(cls, plan_id: str, task_id: str,
              output: OutputSpec) -> "ArtifactRecipe":
         identity = {
-            "schema": "stage1-artifact-recipe-v1",
+            "schema": "stage1-artifact-recipe-v2",
             "plan_id": plan_id,
             "task_id": task_id,
             "output": dataclasses.asdict(output),
@@ -247,6 +410,7 @@ class ArtifactRecipe:
             output_name=output.name,
             media_type=output.media_type,
             validation=strict_copy(output.validation),
+            scientific_binding=output.scientific_binding,
         )
 
 
@@ -257,6 +421,7 @@ class BoundTask:
     component: ExecutableComponent
     parameters: dict[str, Any]
     inputs: tuple[InputBinding, ...]
+    external_inputs: tuple[ExternalArtifactInputBinding, ...]
     outputs: tuple[ArtifactRecipe, ...]
     resources: ResourceRequest
     max_attempts: int
@@ -274,9 +439,20 @@ class BoundTask:
             raise ValueError("bound task has duplicate output names")
         if len({binding.input_name for binding in self.inputs}) != len(self.inputs):
             raise ValueError("bound task has duplicate input names")
+        if (len({binding.input_name for binding in self.external_inputs})
+                != len(self.external_inputs)):
+            raise ValueError("bound task has duplicate external input names")
+        if ({binding.input_name for binding in self.inputs}
+                .intersection(binding.input_name
+                              for binding in self.external_inputs)):
+            raise ValueError(
+                "bound task binds one input both internally and externally")
         if (not isinstance(self.inputs, tuple)
                 or not all(isinstance(value, InputBinding)
                            for value in self.inputs)
+                or not isinstance(self.external_inputs, tuple)
+                or not all(isinstance(value, ExternalArtifactInputBinding)
+                           for value in self.external_inputs)
                 or not isinstance(self.outputs, tuple)
                 or not all(isinstance(value, ArtifactRecipe)
                            for value in self.outputs)
@@ -305,9 +481,14 @@ class BoundTask:
         raw["component"] = ExecutableComponent.from_dict(raw["component"])
         if not isinstance(raw["inputs"], list):
             raise ValueError("BoundTask.inputs must be a JSON array")
+        if not isinstance(raw["external_inputs"], list):
+            raise ValueError("BoundTask.external_inputs must be a JSON array")
         if not isinstance(raw["outputs"], list):
             raise ValueError("BoundTask.outputs must be a JSON array")
         raw["inputs"] = tuple(InputBinding.from_dict(v) for v in raw["inputs"])
+        raw["external_inputs"] = tuple(
+            ExternalArtifactInputBinding.from_dict(v)
+            for v in raw["external_inputs"])
         raw["outputs"] = tuple(ArtifactRecipe.from_dict(v) for v in raw["outputs"])
         raw["resources"] = ResourceRequest.from_dict(raw["resources"])
         return cls(**raw)
@@ -389,6 +570,8 @@ class BoundExecutionGraph:
                 "task_key": task.key,
                 "component": dataclasses.asdict(task.component),
                 "inputs": [dataclasses.asdict(v) for v in task.inputs],
+                "external_inputs": [
+                    dataclasses.asdict(v) for v in task.external_inputs],
                 "parameters": task.parameters,
             })
             for task in templates_t
@@ -402,6 +585,7 @@ class BoundExecutionGraph:
                 component=task.component,
                 parameters=strict_copy(task.parameters),
                 inputs=tuple(task.inputs),
+                external_inputs=tuple(task.external_inputs),
                 outputs=tuple(
                     ArtifactRecipe.bind(plan_id, task_id, output)
                     for output in task.outputs),
@@ -434,10 +618,12 @@ class BoundExecutionGraph:
             component=task.component,
             parameters=task.parameters,
             inputs=task.inputs,
+            external_inputs=task.external_inputs,
             outputs=tuple(OutputSpec(
                 name=recipe.output_name,
                 media_type=recipe.media_type,
                 validation=recipe.validation,
+                scientific_binding=recipe.scientific_binding,
             ) for recipe in task.outputs),
             resources=task.resources,
             max_attempts=task.max_attempts,
@@ -516,7 +702,7 @@ class AttemptSpec:
     attempt_number: int
     fencing_token: int
     provider: str
-    input_artifacts: dict[str, str]
+    input_artifacts: dict[str, AttemptInputReceipt]
     stage_dir: str
     created_at: float
 
@@ -538,12 +724,15 @@ class AttemptSpec:
                 or not math.isfinite(float(self.created_at))
                 or self.created_at <= 0):
             raise ValueError("attempt created_at must be a positive finite timestamp")
-        object.__setattr__(self, "input_artifacts", freeze_json(
-            self.input_artifacts))
         if not isinstance(self.input_artifacts, dict) or any(
-                not isinstance(key, str) or not isinstance(path, str)
-                for key, path in self.input_artifacts.items()):
-            raise ValueError("input artifacts must map string ports to paths")
+                not isinstance(key, str) or not key
+                or not isinstance(receipt, AttemptInputReceipt)
+                for key, receipt in self.input_artifacts.items()):
+            raise ValueError(
+                "input artifacts must map non-empty ports to exact receipts")
+        object.__setattr__(self, "input_artifacts", FrozenDict(
+            (key, receipt) for key, receipt
+            in sorted(self.input_artifacts.items())))
 
     @property
     def attempt_token(self) -> str:
@@ -555,12 +744,23 @@ class AttemptSpec:
         })
 
     def to_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        value = dataclasses.asdict(self)
+        value["input_artifacts"] = {
+            key: receipt.to_dict()
+            for key, receipt in self.input_artifacts.items()
+        }
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "AttemptSpec":
         raw = _strict_dataclass(value, cls, "AttemptSpec")
         raw["task"] = BoundTask.from_dict(raw["task"])
+        if not isinstance(raw["input_artifacts"], dict):
+            raise ValueError("AttemptSpec.input_artifacts must be an object")
+        raw["input_artifacts"] = {
+            key: AttemptInputReceipt.from_dict(receipt)
+            for key, receipt in raw["input_artifacts"].items()
+        }
         spec = cls(**raw)
         expected = attempt_id(
             spec.run_id, spec.task.task_id, spec.deployment_id,

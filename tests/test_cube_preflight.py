@@ -37,9 +37,11 @@ def test_the_bridge_preserves_the_grid_exactly():
     descriptor = grid_descriptor(grid)
     assert descriptor.shape == grid.shape == (1001, 1001)
     assert descriptor.crs == "EPSG:32610"
-    # Same six numbers as rasterio's Affine, in the same order.
+    # SimulationGrid stores outer edges; the descriptor stores first centres.
     a, b, c, d, e, f = grid.transform[:6]
-    assert tuple(float(v) for v in descriptor.affine) == (a, b, c, d, e, f)
+    assert tuple(float(v) for v in descriptor.affine) == (
+        a, b, c + a / 2, d, e, f + e / 2)
+    assert tuple(float(v) for v in descriptor.support_bounds) == grid.bounds
 
 
 def test_a_grid_places_onto_itself():

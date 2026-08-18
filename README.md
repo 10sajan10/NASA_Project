@@ -177,6 +177,7 @@ runnable, and no stage may claim capability it has not demonstrated.
 | [7](stage7/) | Lazy partitions, bounded atomic admission, durable retry | control plane |
 | [8](stage8/) | Resource-aware scheduling policy, now driving the controller | policy + bridge |
 | [9A](stage9a/) | Conditional SLURM provider: token recovery, batched reconcile | simulated only |
+| [8R](stage8r/) | Cross-layer authority, replay, recovery, and projection remediation | bounded local gates pass; real-site evidence external |
 | 9B | WRF integration behind a certified provider | |
 
 Stages 5–8 are deliberately labelled below "done". An external audit found
@@ -187,25 +188,29 @@ the labels now match what is demonstrated. The honest reading:
 - **Stage 6** competes a model against data on synthetic evidence. No real
   held-out reference observations exist, and its Section 9.5 planning-latency
   gate is **measured and missed** by roughly 5x.
-- **Stage 7** drives 10^4 partitions through admission, packetisation, retry,
-  and commit. Those commits are durable state transitions; per-partition
-  scientific execution through the Stage-1 runtime is still unbuilt.
+- **Stage 7** drives 10^4 partitions through bounded control-plane admission.
+  The Stage-8R bridge also executes bounded partitions through Stage 1 with
+  exact committed input receipts; it is not yet the million-partition design.
 - **Stage 8** is a scheduling policy plus a real bridge into the durable
   controller: concurrent attempts under a reservation ledger, measured on real
   subprocesses. Its three-policy makespan comparison remains a simulation.
-- **Stage 9A** has never talked to a real scheduler. No `sbatch` has been run;
-  every test drives a fake SLURM. It is ready to be validated, not validated.
+- **Stage 9A** has never talked to a real scheduler. Its complete
+  controller→fake-`sbatch`→worker→artifact path is hermetic conformance
+  evidence, not deployment validation.
+- **Stage 8R** closes the frozen cross-layer false-success cases. Same-node
+  fetch ownership/checkpoints now preserve quota across crash/concurrency, and
+  expired packets can release only after an exclusive zero-launch proof while
+  exact terminal runs remain recoverable. Real-site deployment evidence is
+  still external and unclaimed.
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
-# 744 passed, 1 skipped, 7 xfailed
+.venv/bin/python -m pytest -q tests/test_stage*.py tests/test_cube*.py
 ```
 
-The seven xfails are deliberate and **strict**: four frozen legacy-runtime
-defects, two quarantined WRF configuration decisions, and the Section 9.5
-planning-latency gate, which is a real measured miss rather than a quarantine.
-If one starts passing, the suite fails and forces a decision instead of
-silently absorbing the change.
+Use [`stage8r/adversarial_matrix.json`](stage8r/adversarial_matrix.json) for
+the stable cross-layer gates. The complete repository suite currently stalls
+in an older Cube/critic test on this NFS workspace, so the handoff reports
+split subsystem evidence rather than inventing one aggregate green count.
 
 ---
 
@@ -221,8 +226,10 @@ none.
 - **Idealized and real-data fire modes are different contracts.** Real-data WRF
   needs a full 3-D meteorological boundary collection; it must never be
   simplified to "10 m wind".
-- **No remote acquisition yet.** No metadata search, asset manifest binding,
-  coverage algebra, or payload fetch — that is Stage 5.
+- **No real remote provider was contacted.** Stage 5 implements bounded
+  metadata discovery, manifests, coverage, receipts, and payload identity with
+  in-process connectors. Completeness is relative to its durable connector
+  transcript, not a claim about an open provider's global catalog.
 - **Cost is the only automatic objective.** Quality, latency, and Pareto
   ranking are deferred; transformation loss is visible but not optimized.
 - **SLURM is unavailable on this development node** and is a future conditional

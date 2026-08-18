@@ -17,6 +17,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable
 
+from grid_convention import (
+    FIELD_JSON_SCHEMA,
+    FIELD_JSON_VALIDATOR_KIND,
+    LEGACY_FIELD_JSON_SCHEMA,
+)
+
 from capabilities import (
     ArtifactLeaf,
     BoundInvocation,
@@ -32,6 +38,7 @@ from engine.runtime.types import (
     InputBinding,
     OutputSpec,
     ResourceRequest,
+    ScientificArtifactBinding,
     TaskTemplate,
 )
 from plans import (
@@ -40,7 +47,17 @@ from plans import (
     ProducerKind,
     SatisfactionKind,
 )
-from contracts import EvidenceSnapshot, RequirementUse, direct_match
+from contracts import (
+    EvidenceSnapshot,
+    GRID_AFFINE_CONVENTION,
+    RequirementUse,
+    direct_match,
+)
+from transformations.model import verify_bound_transformation_authority
+from acquisition.lowering import (
+    ACQUISITION_OPERATION_KEY,
+    verify_bound_acquisition_authority,
+)
 
 from .oracle import validate_compatibility_record
 
@@ -159,6 +176,8 @@ def compile_bound_plan(
              in deployment_plan.invocation_bindings} != selected):
             raise ValueError(
                 "deployment bindings do not match selected invocations")
+    _validate_transformation_authorities(invocation_values)
+    _validate_acquisition_authorities(invocation_values)
     _validate_executable_output_representations(invocation_values)
 
     leaf_ids = set(plan.candidate_plan.selected_artifact_leaf_ids)
@@ -348,6 +367,13 @@ def compile_bound_plan(
                 name=output.port_id,
                 media_type="application/json",
                 validation=_output_validation(invocation, output),
+                scientific_binding=ScientificArtifactBinding(
+                    bound_plan_id=plan.bound_plan_id,
+                    invocation_id=invocation.invocation_key,
+                    output_port=output.port_id,
+                    descriptor_id=output.descriptor.descriptor_id,
+                    descriptor=output.descriptor.to_dict(),
+                ),
             ) for output in invocation.outputs),
             resources=resource,
         ))
@@ -612,32 +638,75 @@ def _validate_executable_output_representations(
                     "Stage-2 finite_json lowering requires application/json")
 
 
+def _validate_transformation_authorities(
+    invocations: tuple[BoundInvocation, ...],
+) -> None:
+    """Replay semantic authority independently at the execution boundary."""
+    for invocation in invocations:
+        if not invocation.implementation.operation_key.startswith("transform."):
+            if invocation.transformation_authority is not None:
+                raise ValueError(
+                    "non-transform invocation carries transformation authority")
+            continue
+        try:
+            verify_bound_transformation_authority(invocation)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "transformation authority failed compiler replay for "
+                f"invocation {invocation.invocation_key}: {exc}") from exc
+
+
+def _validate_acquisition_authorities(
+    invocations: tuple[BoundInvocation, ...],
+) -> None:
+    """Replay fetched-content authority independently before runtime lowering."""
+    for invocation in invocations:
+        if invocation.implementation.operation_key != ACQUISITION_OPERATION_KEY:
+            if invocation.acquisition_authority is not None:
+                raise ValueError(
+                    "non-acquisition invocation carries acquisition authority")
+            continue
+        try:
+            verify_bound_acquisition_authority(invocation)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "acquisition authority failed compiler replay for "
+                f"invocation {invocation.invocation_key}: {exc}") from exc
+
+
 def _output_validation(invocation: BoundInvocation, output) -> dict[str, object]:
     """Lower a typed field descriptor to the narrow Stage-4 commit validator."""
     descriptor = output.descriptor
-    if descriptor.schema_version != "field-json-v1":
+    if descriptor.schema_version == LEGACY_FIELD_JSON_SCHEMA:
+        raise ValueError(
+            "legacy field-json-v1 lacks the canonical axis/grid contract and "
+            "cannot be lowered for execution; publish field-json-v2")
+    if descriptor.schema_version != FIELD_JSON_SCHEMA:
         return {"kind": "finite_json"}
     if descriptor.grid is None:
         raise ValueError(
-            "field-json-v1 executable output requires an exact grid descriptor")
+            "field-json-v2 executable output requires an exact grid descriptor")
     if (descriptor.grid.crs != descriptor.spatial_support.crs
             or descriptor.grid.axis_order
             != descriptor.spatial_support.axis_order):
         raise ValueError(
-            "field-json-v1 grid and spatial support CRS/axes disagree")
+            "field-json-v2 grid and spatial support CRS/axes disagree")
+    descriptor.grid.require_support(descriptor.spatial_support)
     temporal = descriptor.temporal_support
-    component_names: list[str] = []
-    if invocation.implementation.operation_key == "transform.vector_rotate.v1":
-        component_names = ["u", "v"]
-    elif (invocation.implementation.operation_key
-          == "transform.vector_uv_to_speed_direction.v1"):
-        component_names = [output.port_id]
+    if not descriptor.component_names:
+        raise ValueError(
+            "field-json-v2 executable output requires an exact component "
+            "contract in its artifact descriptor")
+    component_names = list(descriptor.component_names)
     return {
-        "kind": "field_json_v1",
+        "kind": FIELD_JSON_VALIDATOR_KIND,
         "descriptor_id": descriptor.descriptor_id,
         "crs": descriptor.spatial_support.crs,
+        "grid_affine_convention": GRID_AFFINE_CONVENTION,
+        "grid_axis_order": list(descriptor.grid.axis_order),
         "grid_shape": list(descriptor.grid.shape),
         "grid_affine": list(descriptor.grid.affine),
+        "grid_support_bounds": list(descriptor.spatial_support.bounds),
         "temporal": {
             "kind": temporal.kind.value,
             "start": temporal.start,

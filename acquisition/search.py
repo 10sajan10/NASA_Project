@@ -15,11 +15,13 @@ There is deliberately no second completeness mechanism.
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Iterable
 
+from capabilities import DiscoveryLayerCertificate
 from capabilities.implementation import _digest, _required_text
 from contracts import BBoxSupport, TemporalKind, TemporalSupport
 from contracts.identity import decimal_value
@@ -30,6 +32,7 @@ from .connector import (
     AssetCandidate,
     MetadataQuery,
     PermanentSourceError,
+    SourceDescriptor,
     SourceConnector,
     TransientSourceError,
 )
@@ -59,8 +62,9 @@ class AcquisitionLimits:
                 raise ValueError(f"{name} must be a positive integer")
         if (isinstance(self.connector_deadline_s, bool)
                 or not isinstance(self.connector_deadline_s, (int, float))
+                or not math.isfinite(self.connector_deadline_s)
                 or self.connector_deadline_s <= 0):
-            raise ValueError("connector_deadline_s must be positive")
+            raise ValueError("connector_deadline_s must be finite and positive")
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -194,11 +198,24 @@ def _support_over_discovered_extent(
     windows = [item.extent.temporal for item in candidates
                if item.extent.temporal.kind is not TemporalKind.TIME_INVARIANT]
     if windows:
+        reference = windows[0]
+        for field in ("kind", "cadence_s", "anchor", "max_gap_s",
+                      "sample_semantics", "reference_time"):
+            if any(getattr(window, field) != getattr(reference, field)
+                   for window in windows):
+                # Follow-up discovery may narrow facts returned by metadata;
+                # it may never manufacture a common timeline where none was
+                # established.
+                return None
         temporal = TemporalSupport(
-            windows[0].kind,
+            reference.kind,
             start=min(window.start for window in windows),
             end=max(window.end for window in windows),
-            sample_semantics=windows[0].sample_semantics,
+            cadence_s=reference.cadence_s,
+            anchor=reference.anchor,
+            max_gap_s=reference.max_gap_s,
+            sample_semantics=reference.sample_semantics,
+            reference_time=reference.reference_time,
         )
     else:
         temporal = TemporalSupport(TemporalKind.TIME_INVARIANT)
@@ -255,6 +272,162 @@ class AcquisitionRequest:
         if type(self.bind) is not bool:
             raise TypeError("acquisition request bind flag must be bool")
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query": self.query.to_dict(),
+            "target_spatial": self.target_spatial.to_dict(),
+            "target_temporal": self.target_temporal.to_dict(),
+            "halo": str(self.halo),
+            "bind": self.bind,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "AcquisitionRequest":
+        raw = require_object_fields(
+            value,
+            {"query", "target_spatial", "target_temporal", "halo", "bind"},
+            "AcquisitionRequest",
+        )
+        raw["query"] = MetadataQuery.from_dict(raw["query"])
+        raw["target_spatial"] = BBoxSupport.from_dict(raw["target_spatial"])
+        raw["target_temporal"] = TemporalSupport.from_dict(
+            raw["target_temporal"])
+        return cls(**raw)
+
+
+def _payload_sort_key(value: Any) -> str:
+    return strict_hash(value.to_dict())
+
+
+@dataclass(frozen=True)
+class AcquisitionScope:
+    """Pre-execution identity of one exact metadata-discovery universe.
+
+    A complete result is meaningful only relative to the queries, second-order
+    rules, connector/source-schema snapshots, limits, and shared quota policy
+    that were actually searched.  Previously an empty result for two different
+    query sets could have the same expansion ID.
+    """
+
+    scope_id: str
+    requests: tuple[AcquisitionRequest, ...]
+    second_order: tuple[SecondOrderQuerySpec, ...]
+    source_descriptors: tuple[SourceDescriptor, ...]
+    limits: AcquisitionLimits
+    quota: ProviderQuota
+
+    def __post_init__(self) -> None:
+        _digest(self.scope_id, "acquisition scope_id")
+        if (not isinstance(self.requests, tuple) or not self.requests
+                or not all(isinstance(item, AcquisitionRequest)
+                           for item in self.requests)):
+            raise TypeError("acquisition scope needs typed root requests")
+        if self.requests != tuple(sorted(
+                self.requests, key=_payload_sort_key)):
+            raise ValueError("acquisition scope requests must be canonical")
+        query_ids = tuple(item.query.query_id for item in self.requests)
+        if len(query_ids) != len(set(query_ids)):
+            raise ValueError(
+                "acquisition scope cannot bind one query identity twice")
+        if (not isinstance(self.second_order, tuple)
+                or not all(isinstance(item, SecondOrderQuerySpec)
+                           for item in self.second_order)
+                or self.second_order != tuple(sorted(
+                    self.second_order, key=_payload_sort_key))):
+            raise TypeError(
+                "acquisition scope second-order rules must be canonical")
+        rule_ids = tuple(_payload_sort_key(item) for item in self.second_order)
+        if len(rule_ids) != len(set(rule_ids)):
+            raise ValueError(
+                "acquisition scope cannot bind one second-order rule twice")
+        if (not isinstance(self.source_descriptors, tuple)
+                or not self.source_descriptors
+                or not all(isinstance(item, SourceDescriptor)
+                           for item in self.source_descriptors)
+                or self.source_descriptors != tuple(sorted(
+                    self.source_descriptors, key=lambda item: item.source_id))):
+            raise TypeError(
+                "acquisition scope source descriptors must be canonical")
+        source_ids = tuple(item.source_id for item in self.source_descriptors)
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("acquisition scope cannot repeat a source")
+        if not isinstance(self.limits, AcquisitionLimits):
+            raise TypeError("acquisition scope limits must be typed")
+        if not isinstance(self.quota, ProviderQuota):
+            raise TypeError("acquisition scope quota must be typed")
+        if self.scope_id != self.expected_id():
+            raise ValueError("acquisition scope identity does not verify")
+
+    @classmethod
+    def bind(
+        cls,
+        requests: Iterable[AcquisitionRequest],
+        second_order: Iterable[SecondOrderQuerySpec],
+        source_descriptors: Iterable[SourceDescriptor],
+        limits: AcquisitionLimits,
+        quota: ProviderQuota,
+    ) -> "AcquisitionScope":
+        request_values = tuple(sorted(requests, key=_payload_sort_key))
+        rule_values = tuple(sorted(second_order, key=_payload_sort_key))
+        source_values = tuple(sorted(
+            source_descriptors, key=lambda item: item.source_id))
+        payload = cls._payload(
+            request_values, rule_values, source_values, limits, quota)
+        return cls(
+            strict_hash(payload), request_values, rule_values, source_values,
+            limits, quota)
+
+    @staticmethod
+    def _payload(
+        requests: tuple[AcquisitionRequest, ...],
+        second_order: tuple[SecondOrderQuerySpec, ...],
+        source_descriptors: tuple[SourceDescriptor, ...],
+        limits: AcquisitionLimits,
+        quota: ProviderQuota,
+    ) -> dict[str, Any]:
+        return {
+            "schema": "stage8r-acquisition-scope-v1",
+            "requests": [item.to_dict() for item in requests],
+            "second_order": [item.to_dict() for item in second_order],
+            "source_descriptors": [
+                item.to_dict() for item in source_descriptors],
+            "limits": limits.to_dict(),
+            "quota": quota.to_dict(),
+        }
+
+    def expected_id(self) -> str:
+        return strict_hash(self._payload(
+            self.requests, self.second_order, self.source_descriptors,
+            self.limits, self.quota))
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self._payload(
+            self.requests, self.second_order, self.source_descriptors,
+            self.limits, self.quota)
+        payload["scope_id"] = self.scope_id
+        return payload
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "AcquisitionScope":
+        raw = require_object_fields(
+            value,
+            {"schema", "scope_id", "requests", "second_order",
+             "source_descriptors", "limits", "quota"},
+            "AcquisitionScope",
+        )
+        if raw.pop("schema") != "stage8r-acquisition-scope-v1":
+            raise ValueError("unsupported acquisition scope schema")
+        for name, parser in (
+                ("requests", AcquisitionRequest.from_dict),
+                ("second_order", SecondOrderQuerySpec.from_dict),
+                ("source_descriptors", SourceDescriptor.from_dict)):
+            if not isinstance(raw[name], list):
+                raise ValueError(f"AcquisitionScope.{name} must be an array")
+            raw[name] = tuple(parser(item) for item in raw[name])
+        raw["limits"] = AcquisitionLimits.from_dict(raw["limits"])
+        raw["quota"] = ProviderQuota.from_dict(raw["quota"])
+        return cls(**raw)
+
 
 @dataclass(frozen=True)
 class QueryOutcome:
@@ -278,6 +451,8 @@ class AcquisitionExpansion:
 
     expansion_id: str
     session_id: str
+    session_digest: str
+    scope: AcquisitionScope
     limits: AcquisitionLimits
     outcomes: tuple[QueryOutcome, ...]
     bound_manifests: tuple[BoundAssetManifest, ...]
@@ -289,6 +464,12 @@ class AcquisitionExpansion:
     def __post_init__(self) -> None:
         _digest(self.expansion_id, "acquisition expansion_id")
         _required_text(self.session_id, "acquisition session_id")
+        _digest(self.session_digest, "acquisition session_digest")
+        if not isinstance(self.scope, AcquisitionScope):
+            raise TypeError("acquisition expansion scope is invalid")
+        if self.scope.limits != self.limits:
+            raise ValueError(
+                "acquisition expansion limits disagree with its scope")
         if not isinstance(self.limits, AcquisitionLimits):
             raise TypeError("acquisition expansion limits are invalid")
         if type(self.discovery_complete) is not bool:
@@ -319,11 +500,13 @@ class AcquisitionExpansion:
 
     def expected_id(self) -> str:
         return strict_hash(self._payload(
-            self.session_id, self.limits, self.bound_manifests,
-            self.discovery_complete, self.limit_reasons))
+            self.session_id, self.session_digest, self.scope, self.limits,
+            self.bound_manifests, self.discovery_complete, self.limit_reasons))
 
     @staticmethod
-    def _payload(session_id: str, limits: AcquisitionLimits,
+    def _payload(session_id: str, session_digest: str,
+                 scope: AcquisitionScope,
+                 limits: AcquisitionLimits,
                  bound_manifests: tuple[BoundAssetManifest, ...],
                  discovery_complete: bool,
                  limit_reasons: tuple[AcquisitionLimitReason, ...],
@@ -333,8 +516,10 @@ class AcquisitionExpansion:
         # Resuming an interrupted search and finding the same assets must yield
         # the same snapshot, or a restart would look like a changed world.
         return {
-            "schema": "stage5-acquisition-expansion-v1",
+            "schema": "stage8r-acquisition-expansion-v2",
             "session_id": session_id,
+            "session_digest": session_digest,
+            "scope_id": scope.scope_id,
             "limits": limits.to_dict(),
             "manifest_roots": sorted(
                 item.manifest_root for item in bound_manifests),
@@ -348,15 +533,227 @@ class AcquisitionExpansion:
                 return bound
         return None
 
+    def discovery_layer(self) -> DiscoveryLayerCertificate:
+        """Project the exact, store-verifiable acquisition layer."""
+        return DiscoveryLayerCertificate.bind(
+            "ACQUISITION_EXPANSION",
+            self.expansion_id,
+            source_ids=tuple(
+                item.source_id for item in self.scope.source_descriptors),
+            limits=self.limits.to_dict(),
+            limit_reasons=self.limit_reasons,
+            complete=self.complete,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = self._payload(
-            self.session_id, self.limits, self.bound_manifests,
-            self.discovery_complete, self.limit_reasons)
+            self.session_id, self.session_digest, self.scope, self.limits,
+            self.bound_manifests, self.discovery_complete, self.limit_reasons)
         payload["expansion_id"] = self.expansion_id
+        payload["scope"] = self.scope.to_dict()
         # Reported for attribution, deliberately outside the snapshot identity.
         payload["rounds"] = self.rounds
         payload["outcomes"] = [item.to_dict() for item in self.outcomes]
         return payload
+
+
+@dataclass(frozen=True)
+class AcquisitionDiscoveryReplay:
+    """Trusted local-session replay for an acquisition completeness claim.
+
+    This establishes completeness relative to the connector responses durably
+    recorded in one local planning session.  It is not a provider signature or
+    proof that an open-world remote catalog disclosed every possible asset.
+    """
+
+    expansion: AcquisitionExpansion
+    session_store: PlanningSessionStore
+    shard_store: ManifestShardStore
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.expansion, AcquisitionExpansion):
+            raise TypeError("acquisition replay expansion is invalid")
+        if not isinstance(self.session_store, PlanningSessionStore):
+            raise TypeError("acquisition replay session store is invalid")
+        if not isinstance(self.shard_store, ManifestShardStore):
+            raise TypeError("acquisition replay shard store is invalid")
+
+    def verify(
+        self,
+        catalog: "CapabilityCatalog",
+        layer: DiscoveryLayerCertificate,
+    ) -> None:
+        # Imports stay local so acquisition does not otherwise depend on the
+        # capability catalog implementation.
+        from capabilities import CapabilityCatalog
+
+        if not isinstance(catalog, CapabilityCatalog):
+            raise TypeError("acquisition replay needs a capability catalog")
+        current_digest = self.session_store.session_digest(
+            self.expansion.session_id)
+        if current_digest != self.expansion.session_digest:
+            raise ValueError(
+                "acquisition session changed after its expansion was frozen")
+        durable_scope = self.session_store.scope_for(
+            self.expansion.session_id)
+        if (durable_scope is None
+                or durable_scope[0] != self.expansion.scope.scope_id
+                or durable_scope[1] != self.expansion.scope.to_dict()):
+            raise ValueError(
+                "acquisition scope disagrees with its durable session")
+        persisted_limits = set(self.session_store.limits_for(
+            self.expansion.session_id))
+        expected_limits = {
+            (reason.code.value, subject)
+            for reason in self.expansion.limit_reasons
+            for subject in reason.subject_ids
+        }
+        if persisted_limits != expected_limits:
+            raise ValueError(
+                "acquisition limit record disagrees with its durable session")
+        if self.expansion.complete and any(
+                not item.exhausted for item in self.expansion.outcomes):
+            raise ValueError(
+                "complete acquisition has a non-exhausted durable query")
+
+        # Reconstruct the complete query frontier from the frozen roots,
+        # closed second-order rules and exact durable candidates.  This is the
+        # load-bearing check that prevents a caller-authored expansion from
+        # attaching forged manifests to a genuine session digest.
+        requests = {
+            item.query.query_id: item for item in self.expansion.scope.requests
+        }
+        rounds = {query_id: 1 for query_id in requests}
+        changed = True
+        while changed:
+            changed = False
+            for spec in self.expansion.scope.second_order:
+                trigger = requests.get(spec.trigger_query_id)
+                if trigger is None:
+                    continue
+                found = self.session_store.candidates_for(
+                    self.expansion.session_id, spec.trigger_query_id)
+                if not found:
+                    continue
+                follow_up = second_order_rule(spec.rule_id)(spec, found)
+                if follow_up is None or follow_up.query_id in requests:
+                    continue
+                requests[follow_up.query_id] = AcquisitionRequest(
+                    query=follow_up,
+                    target_spatial=follow_up.spatial,
+                    target_temporal=follow_up.temporal,
+                    halo=trigger.halo,
+                )
+                rounds[follow_up.query_id] = (
+                    rounds[spec.trigger_query_id] + 1)
+                changed = True
+
+        known_ids = self.session_store.known_query_ids(
+            self.expansion.session_id)
+        if any(query_id not in requests for query_id in known_ids):
+            raise ValueError(
+                "durable acquisition query is outside the frozen scope")
+        outcomes_by_id = {
+            item.query_id: item for item in self.expansion.outcomes
+        }
+        if self.expansion.complete:
+            replayed_ids = set(requests)
+            if (set(known_ids) != replayed_ids
+                    or set(outcomes_by_id) != replayed_ids):
+                raise ValueError(
+                    "complete acquisition does not cover its entire replayed "
+                    "query frontier")
+            if any(not self.session_store.cursor_for(
+                    self.expansion.session_id, query_id).exhausted
+                    for query_id in replayed_ids):
+                raise ValueError(
+                    "complete acquisition contains an unexhausted query")
+            if self.expansion.rounds != max(rounds.values(), default=0):
+                raise ValueError(
+                    "acquisition round count disagrees with replayed frontier")
+        if any(query_id not in outcomes_by_id for query_id in known_ids):
+            raise ValueError(
+                "acquisition outcome omits a durable query")
+
+        for query_id, outcome in outcomes_by_id.items():
+            request = requests.get(query_id)
+            if request is None:
+                raise ValueError(
+                    "acquisition outcome is outside the replayed frontier")
+            if (outcome.source_id != request.query.source_id
+                    or outcome.round_index != rounds[query_id]):
+                raise ValueError(
+                    "acquisition outcome source/round does not replay")
+            state = self.session_store.cursor_for(
+                self.expansion.session_id, query_id)
+            found = self.session_store.candidates_for(
+                self.expansion.session_id, query_id)
+            if query_id in known_ids:
+                if (self.session_store.query_payload_for(
+                        self.expansion.session_id, query_id)
+                        != request.query.to_dict()
+                        or outcome.pages_read != state.pages_read
+                        or outcome.candidate_count != len(found)
+                        or outcome.exhausted != state.exhausted):
+                    raise ValueError(
+                        "acquisition outcome disagrees with durable pages")
+            elif (outcome.pages_read != 0 or outcome.candidate_count != 0
+                  or outcome.exhausted):
+                raise ValueError(
+                    "non-durable acquisition outcome claims provider results")
+
+        descriptors = {
+            item.source_id: item
+            for item in self.expansion.scope.source_descriptors
+        }
+        replayed_results: list[BindingResult] = []
+        replayed_bound: list[BoundAssetManifest] = []
+        for query_id in sorted(outcomes_by_id):
+            request = requests[query_id]
+            if not request.bind:
+                continue
+            descriptor = descriptors.get(request.query.source_id)
+            if descriptor is None:
+                continue
+            result = bind_manifest(
+                self.session_store.candidates_for(
+                    self.expansion.session_id, query_id),
+                query=request.query,
+                source_schema=descriptor.schema_for_query(request.query),
+                store=self.shard_store,
+                target_spatial=request.target_spatial,
+                target_temporal=request.target_temporal,
+                halo=request.halo,
+            )
+            replayed_results.append(result)
+            if result.bound is not None:
+                replayed_bound.append(result.bound)
+        if tuple(replayed_results) != self.expansion.binding_results:
+            raise ValueError(
+                "acquisition binding results disagree with durable replay")
+        if tuple(replayed_bound) != self.expansion.bound_manifests:
+            raise ValueError(
+                "acquisition manifests disagree with durable replay")
+
+        authoritative_roots = {
+            item.manifest_root for item in replayed_bound
+        }
+        catalog_roots = {
+            item.acquisition_authority.bound_manifest["manifest"][
+                "manifest_root"]
+            for item in catalog.capabilities
+            if item.acquisition_authority is not None
+        }
+        if catalog_roots != authoritative_roots:
+            raise ValueError(
+                "acquisition catalog capabilities do not exactly project "
+                "the replayed manifests")
+        if self.expansion.discovery_layer() != layer:
+            raise ValueError(
+                "acquisition discovery layer disagrees with session replay")
+        if layer not in catalog.discovery_provenance.layers:
+            raise ValueError(
+                "acquisition discovery layer is absent from the final catalog")
 
 
 class AcquisitionSearch:
@@ -378,7 +775,14 @@ class AcquisitionSearch:
             raise TypeError("search requires a ManifestShardStore")
         self.session_store = session_store
         self.shard_store = shard_store
-        self.connectors = {value.source_id: value for value in connectors}
+        connector_values = tuple(connectors)
+        if (not all(isinstance(value, SourceConnector)
+                    for value in connector_values)):
+            raise TypeError("search connectors must implement SourceConnector")
+        if len({value.source_id for value in connector_values}) \
+                != len(connector_values):
+            raise ValueError("search cannot bind one source ID twice")
+        self.connectors = {value.source_id: value for value in connector_values}
         if not self.connectors:
             raise ValueError("at least one connector is required")
         self.limits = limits
@@ -400,11 +804,46 @@ class AcquisitionSearch:
             raise ValueError("discovery needs at least one request")
         rules = tuple(second_order)
 
+        scope = AcquisitionScope.bind(
+            request_values,
+            rules,
+            (value.descriptor for value in self.connectors.values()),
+            self.limits,
+            self.quota,
+        )
+        # Bind before quota debit or connector invocation. A crash after a
+        # partial page can then resume only under this exact frozen universe.
+        self.session_store.bind_scope(
+            session_id, scope.scope_id, scope.to_dict())
+        # Execute the exact canonical ordering whose identity was frozen above.
+        # If bounded discovery used caller iteration order while the scope hash
+        # sorted it, two calls with the same scope could activate different
+        # frontiers under max_queries/max_rounds.
+        request_values = scope.requests
+        rules = scope.second_order
+
         by_query: dict[str, AcquisitionRequest] = {
             item.query.query_id: item for item in request_values}
+        if len(by_query) != len(request_values):
+            raise ValueError(
+                "one acquisition query identity cannot be requested twice")
         outcomes: dict[str, QueryOutcome] = {}
         candidates: dict[str, tuple[AssetCandidate, ...]] = {}
+        # A planning-session identity is monotonic.  Once a bound has cut one
+        # of its searches short, a restart may continue collecting a useful
+        # incumbent but it may not quietly reinterpret that same session as a
+        # complete availability snapshot.  The earlier implementation wrote
+        # these rows but rebuilt ``activated`` from only the current call,
+        # which made completeness depend on process history.
         activated: dict[AcquisitionLimitCode, set[str]] = {}
+        for raw_code, subject in self.session_store.limits_for(session_id):
+            try:
+                code = AcquisitionLimitCode(raw_code)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "planning session contains an unknown persisted "
+                    f"discovery limit {raw_code!r}") from exc
+            activated.setdefault(code, set()).add(subject)
 
         pending = [item.query for item in request_values]
         executed: set[str] = set()
@@ -456,9 +895,14 @@ class AcquisitionSearch:
             request = by_query[query_id]
             if not request.bind:
                 continue
+            connector = self.connectors.get(request.query.source_id)
+            if connector is None:
+                continue
+            source_schema = connector.descriptor.schema_for_query(request.query)
             result = bind_manifest(
                 candidates.get(query_id, ()),
                 query=request.query,
+                source_schema=source_schema,
                 store=self.shard_store,
                 target_spatial=request.target_spatial,
                 target_temporal=request.target_temporal,
@@ -489,13 +933,14 @@ class AcquisitionSearch:
         ordered_outcomes = tuple(
             outcomes[key] for key in sorted(outcomes))
         complete = not limit_reasons
+        session_digest = self.session_store.session_digest(session_id)
         expansion_id = strict_hash(AcquisitionExpansion._payload(
-            session_id, self.limits, tuple(bound_manifests), complete,
-            limit_reasons))
+            session_id, session_digest, scope, self.limits,
+            tuple(bound_manifests), complete, limit_reasons))
         expansion = AcquisitionExpansion(
-            expansion_id, session_id, self.limits, ordered_outcomes,
-            tuple(bound_manifests), tuple(binding_results), complete,
-            limit_reasons, rounds)
+            expansion_id, session_id, session_digest, scope, self.limits,
+            ordered_outcomes, tuple(bound_manifests), tuple(binding_results),
+            complete, limit_reasons, rounds)
         # Only a *whole* search seals the session.  A truncated one leaves the
         # cursors open so a later pass can continue from them; its snapshot is
         # still usable, but it is explicitly incomplete rather than final.
@@ -525,6 +970,10 @@ class AcquisitionSearch:
                            (query.source_id,), session_id)
             return (QueryOutcome(query.query_id, query.source_id, round_index,
                                  state.pages_read, 0, False, resumed), ())
+        # Refuse relabelling before spending provider quota or accepting any
+        # provider metadata.  Query facts are authorized by a frozen schema,
+        # not by whatever a caller puts in a request object.
+        connector.descriptor.schema_for_query(query)
         if self.session_store.in_cooldown(query.source_id):
             self._activate(activated, AcquisitionLimitCode.PROVIDER_COOLDOWN,
                            (query.source_id,), session_id)
@@ -618,6 +1067,8 @@ __all__ = [
     "AcquisitionLimitReason",
     "AcquisitionLimits",
     "AcquisitionRequest",
+    "AcquisitionScope",
+    "AcquisitionDiscoveryReplay",
     "AcquisitionSearch",
     "QueryOutcome",
     "SecondOrderQuerySpec",

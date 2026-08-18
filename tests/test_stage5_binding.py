@@ -13,10 +13,13 @@ from pathlib import Path
 
 import pytest
 
+from grid_convention import FIELD_JSON_SCHEMA
+
 from acquisition import (
     AssetCandidate,
     AssetConditionalIdentity,
     AssetExtent,
+    AssemblyMode,
     BindingRejectionCode,
     BindingStatus,
     ConditionalIdentityKind,
@@ -25,6 +28,7 @@ from acquisition import (
     ManifestShardStore,
     MetadataQuery,
     SnapshotIngestionPlan,
+    SourceSchema,
     StaleReasonCode,
     bind_manifest,
     derive_exclusion_plan,
@@ -34,10 +38,13 @@ from acquisition import (
 from contracts import (
     ArtifactDescriptor,
     BBoxSupport,
+    GridDescriptor,
     Missingness,
     MissingnessStatus,
     OriginClass,
     SampleSemantics,
+    ScaleBasis,
+    SpatialScale,
     TemporalKind,
     TemporalSupport,
 )
@@ -70,10 +77,44 @@ def _candidate(asset_id: str, bounds, *, etag: str | None = "v1",
 def _query() -> MetadataQuery:
     return MetadataQuery(
         source_id="src", concept_id="example.field.flow_speed",
-        schema_version="example-field-v1", units="m.s-1",
+        schema_version=FIELD_JSON_SCHEMA, units="m.s-1",
         representation="application/json",
         spatial=BBoxSupport(CRS, AXES, ("0", "0", "4", "4")),
         temporal=_window())
+
+
+def _source_schema() -> SourceSchema:
+    return SourceSchema(
+        source_id="src",
+        concept_id="example.field.flow_speed",
+        schema_version=FIELD_JSON_SCHEMA,
+        representation="application/json",
+        units="m.s-1",
+        spatial_crs=CRS,
+        spatial_axis_order=AXES,
+        temporal_kind=TemporalKind.SERIES,
+        sample_semantics=SampleSemantics.INSTANTANEOUS,
+        origin=OriginClass.OBSERVATION,
+        assembly_mode=AssemblyMode.FIELD_JSON_X_TILES_V1,
+        component_names=("value",),
+        grid=GridDescriptor(
+            CRS, AXES, (4, 4),
+            ("1", "0", "0.5", "0", "1", "0.5"),
+            SpatialScale("1", "1", "degree", ScaleBasis.ANGULAR),
+        ),
+    )
+
+
+def test_tiled_field_assembly_requires_its_exact_runtime_schema_and_grid():
+    values = _source_schema().to_dict()
+    values["schema_version"] = "caller-authored-field-v1"
+    with pytest.raises(ValueError, match="emits field-json-v2"):
+        SourceSchema.from_dict(values)
+
+    values = _source_schema().to_dict()
+    values["grid"] = None
+    with pytest.raises(ValueError, match="exact source grid"):
+        SourceSchema.from_dict(values)
 
 
 @pytest.fixture()
@@ -83,7 +124,7 @@ def store(tmp_path: Path) -> ManifestShardStore:
 
 def _bind(store, candidates, bounds=("0", "0", "4", "4")):
     return bind_manifest(
-        candidates, query=_query(), store=store,
+        candidates, query=_query(), source_schema=_source_schema(), store=store,
         target_spatial=BBoxSupport(CRS, AXES, bounds),
         target_temporal=_window())
 

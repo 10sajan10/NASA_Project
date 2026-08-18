@@ -23,6 +23,7 @@ from contracts import EvidenceProfile, EvidenceSnapshot, RequirementUse
 from engine.runtime.identity import require_object_fields, strict_hash
 from plans import PlanSnapshotRef
 from resolution import (
+    ProducerSelectionRef,
     ResolutionOutcome,
     SelectionConstraints,
 )
@@ -31,6 +32,7 @@ from .alternatives import (
     SourceAlternative,
     admissible_alternatives,
     enumerate_source_alternatives,
+    resolution_context_id,
 )
 from .comparability import ComparabilityVerdict, assess_comparability
 from .policy import (
@@ -53,6 +55,7 @@ class ChoiceRequiredReport:
     metric_definition_id: str
     alternatives: tuple[SourceAlternative, ...]
     comparability: ComparabilityVerdict
+    planning_context_id: str
     evidence_snapshot_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -65,6 +68,7 @@ class ChoiceRequiredReport:
             raise TypeError("report alternatives are invalid")
         if not isinstance(self.comparability, ComparabilityVerdict):
             raise TypeError("report comparability verdict is invalid")
+        _digest(self.planning_context_id, "report planning_context_id")
         if self.report_id != self.expected_id():
             raise ValueError("choice report identity does not verify")
 
@@ -82,26 +86,44 @@ class ChoiceRequiredReport:
     def admissible(self) -> tuple[SourceAlternative, ...]:
         return admissible_alternatives(self.alternatives)
 
-    def alternative_for(self, producer_id: str) -> SourceAlternative | None:
-        return next((item for item in self.alternatives
-                     if item.producer.producer_id == producer_id), None)
+    def alternative_for(
+            self, producer: ProducerSelectionRef) -> SourceAlternative | None:
+        """Find one unambiguous exact-use alternative for a producer.
+
+        The current choice record names a producer.  If that producer exposes
+        more than one compatible output for the contested use, silently
+        choosing an output would recreate the very ambiguity this report is
+        meant to expose, so the request fails closed.
+        """
+        if not isinstance(producer, ProducerSelectionRef):
+            raise TypeError("alternative lookup requires a producer reference")
+        matches = tuple(
+            item for item in self.alternatives if item.producer == producer)
+        if len(matches) > 1:
+            raise ValueError(
+                "the chosen producer has multiple contested satisfaction "
+                "arcs; the choice record cannot identify one unambiguously")
+        return matches[0] if matches else None
 
     def expected_id(self) -> str:
         return strict_hash(self._payload(
             self.concept_id, self.metric_definition_id, self.alternatives,
-            self.comparability, self.evidence_snapshot_id))
+            self.comparability, self.planning_context_id,
+            self.evidence_snapshot_id))
 
     @staticmethod
     def _payload(concept_id: str, metric_definition_id: str,
                  alternatives: tuple[SourceAlternative, ...],
                  comparability: ComparabilityVerdict,
+                 planning_context_id: str,
                  evidence_snapshot_id: str | None) -> dict[str, Any]:
         return {
-            "schema": "stage6-choice-required-report-v2",
+            "schema": "stage8r-choice-required-report-v4",
             "concept_id": concept_id,
             "metric_definition_id": metric_definition_id,
             "alternatives": [item.to_dict() for item in alternatives],
             "comparability": comparability.to_dict(),
+            "planning_context_id": planning_context_id,
             # A choice is only meaningful against the evidence it was shown.
             # Binding the snapshot here means a report built from different
             # evidence is a different report, and a choice made against the
@@ -115,19 +137,21 @@ class ChoiceRequiredReport:
     def bind(cls, *, concept_id: str, metric_definition_id: str,
              alternatives: tuple[SourceAlternative, ...],
              comparability: ComparabilityVerdict,
+             planning_context_id: str,
              evidence_snapshot_id: str | None = None
              ) -> "ChoiceRequiredReport":
         return cls(
             strict_hash(cls._payload(
                 concept_id, metric_definition_id, alternatives, comparability,
-                evidence_snapshot_id)),
+                planning_context_id, evidence_snapshot_id)),
             concept_id, metric_definition_id, alternatives, comparability,
-            evidence_snapshot_id)
+            planning_context_id, evidence_snapshot_id)
 
     def to_dict(self) -> dict[str, Any]:
         payload = self._payload(
             self.concept_id, self.metric_definition_id, self.alternatives,
-            self.comparability, self.evidence_snapshot_id)
+            self.comparability, self.planning_context_id,
+            self.evidence_snapshot_id)
         payload["report_id"] = self.report_id
         return payload
 
@@ -137,12 +161,13 @@ class ChoiceRequiredReport:
             value,
             {"schema", "report_id", "concept_id", "metric_definition_id",
              "alternatives", "comparability", "evidence_snapshot_id",
+             "planning_context_id",
              "ranking_complete", "nondominance_claimed"},
             "ChoiceRequiredReport")
-        if raw.pop("schema") != "stage6-choice-required-report-v2":
+        if raw.pop("schema") != "stage8r-choice-required-report-v4":
             raise ValueError(
                 "ChoiceRequiredReport schema is not "
-                "stage6-choice-required-report-v2")
+                "stage8r-choice-required-report-v4")
         if raw.pop("ranking_complete") or raw.pop("nondominance_claimed"):
             raise ValueError(
                 "an MVP report cannot claim a complete ranking or non-dominance")
@@ -232,6 +257,7 @@ def build_choice_report(
     return ChoiceRequiredReport.bind(
         concept_id=concept_id, metric_definition_id=metric_definition_id,
         alternatives=alternatives, comparability=comparability,
+        planning_context_id=resolution_context_id(baseline),
         evidence_snapshot_id=(
             evidence_snapshot.snapshot_id
             if evidence_snapshot is not None else None))
@@ -274,7 +300,7 @@ def resolve_with_objective(
         raise StaleChoiceError(decision.report_id, report.report_id)
 
     if isinstance(decision, ChoiceRecord):
-        chosen = report.alternative_for(decision.chosen_producer.producer_id)
+        chosen = report.alternative_for(decision.chosen_producer)
         if chosen is None:
             raise ValueError(
                 "the chosen producer is not among the presented alternatives")
@@ -283,11 +309,32 @@ def resolve_with_objective(
                 "the chosen producer has no globally consistent plan: "
                 f"{chosen.detail}")
         resolution = resolve(
-            SelectionConstraints.bind(include=(decision.chosen_producer,)))
+            SelectionConstraints.bind(
+                required_satisfactions=(chosen.satisfaction,)))
+        selected_plan = resolution.selection.plan
+        if (selected_plan is None or not any(
+                binding.use_id == chosen.satisfaction.use_id
+                and any(
+                    output.producer_kind
+                    is chosen.satisfaction.producer_kind
+                    and output.producer_id
+                    == chosen.satisfaction.producer_id
+                    and output.output_port_id
+                    == chosen.satisfaction.output_port_id
+                    for output in binding.outputs)
+                for binding in selected_plan.satisfactions)):
+            raise RuntimeError(
+                "the constrained choice re-solve did not select the exact "
+                "presented satisfaction arc")
     elif isinstance(decision, FallbackDecision):
         resolution = resolve(SelectionConstraints())
     else:  # pragma: no cover - guarded by ObjectiveRequest construction
         raise TypeError("unsupported decision type")
+
+    if resolution_context_id(resolution) != report.planning_context_id:
+        raise ValueError(
+            "the final objective re-solve used another frozen planning "
+            "universe")
 
     return ObjectiveOutcome(
         ObjectiveStatus.RESOLVED, SelectionObjective.EMPIRICAL_QUALITY,

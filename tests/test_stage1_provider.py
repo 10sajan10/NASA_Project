@@ -23,6 +23,7 @@ from engine.runtime.provider import (
 )
 from engine.runtime.site import current_private_site
 from engine.runtime.types import (
+    AttemptInputReceipt,
     AttemptSpec,
     AttemptState,
     BoundExecutionGraph,
@@ -45,7 +46,7 @@ def _provider(root: Path) -> LocalSubprocessProvider:
 def _spec(provider: LocalSubprocessProvider,
           graph: BoundExecutionGraph, task_key: str, *,
           run_id: str,
-          input_artifacts: dict[str, str] | None = None,
+          input_artifacts: dict[str, AttemptInputReceipt] | None = None,
           stage_dir: Path | None = None) -> AttemptSpec:
     task = graph.task_by_key(task_key)
     binding = deployment_id(graph.plan_id, provider.site, provider.name)
@@ -246,8 +247,8 @@ def test_worker_rejects_input_object_escape(tmp_path):
     manifest_path.parent.mkdir(parents=True)
     manifest_path.write_text(strict_canonical_json({
         "schema": "stage1-artifact-manifest-v1",
-        "artifact_id": "synthetic-artifact",
-        "recipe_id": "synthetic-recipe",
+        "artifact_id": "a" * 64,
+        "recipe_id": "b" * 64,
         "media_type": "application/json",
         "content_sha256": hashlib.sha256(b"3").hexdigest(),
         "size_bytes": 1,
@@ -255,7 +256,13 @@ def test_worker_rejects_input_object_escape(tmp_path):
     }))
     spec = _spec(
         provider, graph, "consumer", run_id="input-confinement",
-        input_artifacts={"value": str(manifest_path.resolve())},
+        input_artifacts={"value": AttemptInputReceipt(
+            artifact_id="a" * 64,
+            recipe_id="b" * 64,
+            content_sha256=hashlib.sha256(b"3").hexdigest(),
+            size_bytes=1,
+            manifest_path=str(manifest_path.resolve()),
+        )},
     )
 
     handle = provider.submit(spec)
@@ -263,6 +270,68 @@ def test_worker_rejects_input_object_escape(tmp_path):
 
     assert observation.state is AttemptState.FAILED
     assert "escapes the runtime root" in observation.error
+    assert not (Path(spec.stage_dir) / "result.json").exists()
+
+
+def test_worker_rejects_manifest_substitution_against_attempt_receipt(tmp_path):
+    provider = _provider(tmp_path)
+    producer = TaskTemplate(
+        key="upstream",
+        component=operation_component("synthetic.constant.v1"),
+        parameters={"value": 3},
+    )
+    consumer = TaskTemplate(
+        key="consumer",
+        component=operation_component("synthetic.identity.v1"),
+        inputs=(InputBinding("value", "upstream", "result"),),
+        resources=ResourceRequest(memory_mb=32, walltime_s=5),
+    )
+    graph = BoundExecutionGraph.bind(
+        "input-receipt-substitution", (producer, consumer))
+    objects = tmp_path / "objects"
+    manifests = tmp_path / "manifests"
+    objects.mkdir()
+    manifests.mkdir()
+    first_payload, second_payload = b"3", b"4"
+    (objects / "first.json").write_bytes(first_payload)
+    (objects / "second.json").write_bytes(second_payload)
+    manifest_path = manifests / "input.json"
+    first_digest = hashlib.sha256(first_payload).hexdigest()
+    first_artifact = "a" * 64
+    recipe_id = "b" * 64
+    manifest_path.write_text(strict_canonical_json({
+        "schema": "stage1-artifact-manifest-v1",
+        "artifact_id": first_artifact,
+        "recipe_id": recipe_id,
+        "media_type": "application/json",
+        "content_sha256": first_digest,
+        "size_bytes": 1,
+        "object_path": "objects/first.json",
+    }))
+    spec = _spec(
+        provider, graph, "consumer", run_id="input-substitution",
+        input_artifacts={"value": AttemptInputReceipt(
+            artifact_id=first_artifact,
+            recipe_id=recipe_id,
+            content_sha256=first_digest,
+            size_bytes=1,
+            manifest_path=str(manifest_path.resolve()),
+        )},
+    )
+
+    # Replace the locator's contents with a different valid-looking manifest.
+    manifest_path.write_text(strict_canonical_json({
+        "schema": "stage1-artifact-manifest-v1",
+        "artifact_id": "c" * 64,
+        "recipe_id": recipe_id,
+        "media_type": "application/json",
+        "content_sha256": hashlib.sha256(second_payload).hexdigest(),
+        "size_bytes": 1,
+        "object_path": "objects/second.json",
+    }))
+    observation = _wait(provider, provider.submit(spec))
+    assert observation.state is AttemptState.FAILED
+    assert "exact attempt receipt" in observation.error
     assert not (Path(spec.stage_dir) / "result.json").exists()
 
 

@@ -45,22 +45,34 @@ boundary is executable rather than aspirational.
 ## Truncated discovery cannot claim a global optimum
 
 Transformation closure is *discovery*. A selection that is optimal over a
-catalog which is missing candidates is not globally optimal, so
-`WorkflowResolver` now accepts upstream completeness:
+catalog which is missing candidates is not globally optimal. The resolver
+therefore requires both the catalog-derived certificate and an independently
+predeclared universe:
 
 ```python
 WorkflowResolver(
     expansion.augmented_catalog,
     deployment_snapshot,
-    upstream_discovery_complete=expansion.complete,
-    upstream_limit_codes=(...),        # typed reasons, e.g. MAX_DEPTH
+    discovery_certificate=expansion.discovery_certificate(),
+    discovery_universe=DiscoveryUniverseContract.declare(
+        base_catalog.catalog_id,
+        (DiscoveryLayerScope.bind(
+            "TRANSFORMATION_EXPANSION",
+            source_ids=(transformation_catalog.catalog_id,),
+            limits=limits.to_dict()),),
+    ),
 )
 ```
 
-The effective flag is `graph.discovery_complete and upstream_complete`, and it
-reaches the selector, the `UNSATISFIABLE`-versus-`INCOMPLETE` decision, and the
-independent validator's candidate-universe check alike. The two flags cannot be
-set inconsistently: complete-with-codes and incomplete-without-codes both raise.
+The certificate proves what produced the catalog; the universe states what
+discovery was required to run. The resolver requires exact agreement on the
+base catalog, layer kind, source IDs, and configured limits. The effective
+completeness flag remains the conjunction of local graph discovery and every
+certified layer, and reaches selection, status, and independent validation.
+This is an integrity boundary, not an external authority proof: a caller can
+still lie when declaring the universe. Consequently, “globally optimal” means
+optimal over the declared, certificate-covered universe, never over unknown
+sources in the open world.
 
 With a truncated closure the plan stays structurally valid, but the reported
 status becomes `FEASIBLE_NOT_PROVEN_OPTIMAL` and binding is refused unless the

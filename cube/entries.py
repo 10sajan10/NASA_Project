@@ -179,10 +179,56 @@ def order_key(policy: ResolutionPolicy):
     }[policy]
 
 
+class ProjectionAuthority:
+    """Proof that an artifact was verified against the RuntimeStore.
+
+    The public :meth:`Catalog.commit_entry` already refuses caller-authored
+    publication, but the private authoritative committer only replayed the
+    projection's *internal* identity: a self-consistent receipt built by hand
+    would have published a Cube entry for an artifact that never existed.
+    Internal consistency is not authority.
+
+    So the committer now demands one of these, and it can only be minted after
+    ``CubeProjector._verify_manifest`` has re-read the manifest bytes, replayed
+    the artifact identity, and re-hashed the object.  It is bound to the exact
+    artifact it was minted for, so it cannot be replayed against another.
+
+    This mirrors ``acquisition.connector.FetchAuthorization``, which guards the
+    fetch boundary the same way.
+    """
+
+    __slots__ = ("run_id", "artifact_id", "content_sha256")
+
+    def __init__(self, mint: object, run_id: str, artifact_id: str,
+                 content_sha256: str) -> None:
+        if mint is not _MINT:
+            raise PermissionError(
+                "ProjectionAuthority is minted only by a verified "
+                "RuntimeStore artifact projection")
+        self.run_id = run_id
+        self.artifact_id = artifact_id
+        self.content_sha256 = content_sha256
+
+    def authorizes(self, run_id: str, artifact_id: str,
+                   content_sha256: str) -> bool:
+        return (run_id == self.run_id and artifact_id == self.artifact_id
+                and content_sha256 == self.content_sha256)
+
+
+_MINT = object()
+
+
+def _mint_projection_authority(run_id: str, artifact_id: str,
+                               content_sha256: str) -> ProjectionAuthority:
+    """Internal: used by :mod:`cube.projection` after verification succeeds."""
+    return ProjectionAuthority(_MINT, run_id, artifact_id, content_sha256)
+
+
 __all__ = [
     "CubeEntry",
     "EntryInput",
     "EntryNotFound",
+    "ProjectionAuthority",
     "ResolutionPolicy",
     "grid_from_json",
     "order_key",

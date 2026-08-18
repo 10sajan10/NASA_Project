@@ -20,6 +20,7 @@ from .deployment import (
     DeploymentCapabilitySnapshot,
     ExecutionProfile,
 )
+from .discovery import CatalogDiscoveryProvenance, DiscoveryLayerCertificate
 from .implementation import _digest
 from .model import (
     BindingCandidate,
@@ -43,6 +44,7 @@ class CapabilityCatalog:
     catalog_id: str
     capabilities: tuple[CapabilitySpec, ...]
     execution_profiles: tuple[ExecutionProfile, ...]
+    discovery_provenance: CatalogDiscoveryProvenance
 
     def __post_init__(self) -> None:
         _digest(self.catalog_id, "capability catalog_id")
@@ -54,6 +56,9 @@ class CapabilityCatalog:
                 or not all(isinstance(value, ExecutionProfile)
                            for value in self.execution_profiles)):
             raise TypeError("execution profiles must be an immutable typed tuple")
+        if not isinstance(
+                self.discovery_provenance, CatalogDiscoveryProvenance):
+            raise TypeError("catalog discovery provenance is invalid")
         if tuple(sorted(self.capabilities, key=lambda value: value.spec_id)) \
                 != self.capabilities:
             raise ValueError("capabilities must be sorted by spec_id")
@@ -95,15 +100,31 @@ class CapabilityCatalog:
     @classmethod
     def freeze(cls, capabilities: Iterable[CapabilitySpec],
                execution_profiles: Iterable[ExecutionProfile],
+               *,
+               discovery_base_catalog_id: str | None = None,
+               discovery_layers: Iterable[DiscoveryLayerCertificate] = (),
                ) -> "CapabilityCatalog":
         specs = tuple(sorted(capabilities, key=lambda value: value.spec_id))
         profiles = tuple(sorted(
             execution_profiles, key=lambda value: value.profile_id))
-        payload = _catalog_payload(specs, profiles)
-        return cls(strict_hash(payload), specs, profiles)
+        layer_values = tuple(discovery_layers)
+        provenance = (
+            CatalogDiscoveryProvenance.authored()
+            if not layer_values and discovery_base_catalog_id is None
+            else CatalogDiscoveryProvenance.discovered(
+                discovery_base_catalog_id, layer_values))
+        payload = _catalog_payload(specs, profiles, provenance)
+        return cls(strict_hash(payload), specs, profiles, provenance)
 
     def expected_id(self) -> str:
         return strict_hash(_catalog_payload(
+            self.capabilities, self.execution_profiles,
+            self.discovery_provenance))
+
+    @property
+    def content_id(self) -> str:
+        """Identity of typed catalog contents before discovery provenance."""
+        return strict_hash(_catalog_content_payload(
             self.capabilities, self.execution_profiles))
 
     def to_dict(self) -> dict[str, Any]:
@@ -112,6 +133,7 @@ class CapabilityCatalog:
             "capabilities": [value.to_dict() for value in self.capabilities],
             "execution_profiles": [
                 value.to_dict() for value in self.execution_profiles],
+            "discovery_provenance": self.discovery_provenance.to_dict(),
         }
 
     @classmethod
@@ -126,6 +148,8 @@ class CapabilityCatalog:
             if not isinstance(raw[name], list):
                 raise ValueError(f"CapabilityCatalog.{name} must be an array")
             raw[name] = tuple(parser(item) for item in raw[name])
+        raw["discovery_provenance"] = CatalogDiscoveryProvenance.from_dict(
+            raw["discovery_provenance"])
         return cls(**raw)
 
     @cached_property
@@ -299,9 +323,22 @@ class CapabilityCatalog:
 def _catalog_payload(
         capabilities: tuple[CapabilitySpec, ...],
         execution_profiles: tuple[ExecutionProfile, ...],
+        discovery_provenance: CatalogDiscoveryProvenance,
 ) -> dict[str, Any]:
     return {
-        "schema": "stage2-capability-catalog-v1",
+        "schema": "stage8r-capability-catalog-v2",
+        "capabilities": [value.to_dict() for value in capabilities],
+        "execution_profiles": [value.to_dict() for value in execution_profiles],
+        "discovery_provenance": discovery_provenance.to_dict(),
+    }
+
+
+def _catalog_content_payload(
+        capabilities: tuple[CapabilitySpec, ...],
+        execution_profiles: tuple[ExecutionProfile, ...],
+) -> dict[str, Any]:
+    return {
+        "schema": "stage8r-capability-catalog-content-v1",
         "capabilities": [value.to_dict() for value in capabilities],
         "execution_profiles": [value.to_dict() for value in execution_profiles],
     }

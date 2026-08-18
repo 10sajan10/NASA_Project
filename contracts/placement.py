@@ -112,9 +112,8 @@ class PlacementUndefined(ValueError):
         self.assessment = assessment
 
 
-# ``GridDescriptor.affine`` follows rasterio's ``Affine(a, b, c, d, e, f)``
-# ordering, the same one ``engine/runtime/artifacts.py`` validates: scale terms
-# at 0 and 4, rotation terms at 1 and 3, origins at 2 and 5.  Everything below
+# ``GridDescriptor.affine`` uses ``(a,b,c,d,e,f)`` ordering but, unlike a
+# rasterio transform, c/f are the first *sample centre*.  Everything below
 # reports (x, y) pairs in that order, while ``shape`` stays row-major (y, x).
 _X_SCALE, _Y_SCALE = 0, 4
 _ROTATION_TERMS = (1, 3)
@@ -128,6 +127,7 @@ def _is_axis_aligned(grid: GridDescriptor) -> bool:
 
 
 def _origin(grid: GridDescriptor) -> tuple[Decimal, Decimal]:
+    """First sample centre in array order."""
     return (decimal_value(grid.affine[_X_ORIGIN]),
             decimal_value(grid.affine[_Y_ORIGIN]))
 
@@ -140,14 +140,15 @@ def _cell_size(grid: GridDescriptor) -> tuple[Decimal, Decimal]:
 
 def _footprint(grid: GridDescriptor) -> tuple[Decimal, Decimal, Decimal,
                                               Decimal]:
-    """(min_x, min_y, max_x, max_y) in CRS units, sign-normalised."""
+    """(min_x, min_y, max_x, max_y) outer cell-edge footprint."""
+    return tuple(decimal_value(value) for value in grid.support_bounds)
+
+
+def _first_edge(grid: GridDescriptor) -> tuple[Decimal, Decimal]:
+    """Leading cell edge along each signed array axis."""
     origin_x, origin_y = _origin(grid)
     cell_x, cell_y = _cell_size(grid)
-    # ``shape`` is row-major (y, x) while cell sizes are (x, y).
-    far_x = origin_x + Decimal(grid.shape[1]) * cell_x
-    far_y = origin_y + Decimal(grid.shape[0]) * cell_y
-    return (min(origin_x, far_x), min(origin_y, far_y),
-            max(origin_x, far_x), max(origin_y, far_y))
+    return origin_x - cell_x / 2, origin_y - cell_y / 2
 
 
 def _contained(inner: tuple[Decimal, Decimal, Decimal, Decimal],
@@ -222,9 +223,11 @@ def assess_placement(source: GridDescriptor,
         coarsening.append(_integer_ratio(abs(target_cell[index]),
                                          abs(source_cell[index])))
 
-    offset_x = ((source_origin[0] - target_origin[0]) / target_cell[0]
+    source_edge = _first_edge(source)
+    target_edge = _first_edge(target)
+    offset_x = ((source_edge[0] - target_edge[0]) / target_cell[0]
                 if target_cell[0] != 0 else None)
-    offset_y = ((source_origin[1] - target_origin[1]) / target_cell[1]
+    offset_y = ((source_edge[1] - target_edge[1]) / target_cell[1]
                 if target_cell[1] != 0 else None)
     aligned = (offset_x is not None and offset_y is not None
                and abs(offset_x - offset_x.to_integral_value())

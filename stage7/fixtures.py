@@ -23,7 +23,12 @@ from partitions import (
     PartitionSetSpec,
     PartitionTaskTemplate,
 )
-from resolution import ResolutionStatus, WorkflowResolver
+from resolution import (
+    DiscoveryCertificate,
+    DiscoveryUniverseContract,
+    ResolutionStatus,
+    WorkflowResolver,
+)
 from stage3.fixtures import make_composition_fixture
 
 TILE_COUNT = 100
@@ -66,6 +71,10 @@ def resolve_one_selection() -> BoundInvocation:
     fixture = make_composition_fixture()
     outcome = WorkflowResolver(
         fixture.catalog, fixture.deployment_snapshot,
+        discovery_certificate=DiscoveryCertificate.for_base_catalog(
+            fixture.catalog),
+        discovery_universe=DiscoveryUniverseContract.declare(
+            fixture.catalog.catalog_id),
     ).resolve(fixture.root_uses)
     if (outcome.status is not ResolutionStatus.READY
             or outcome.selection.plan is None):
@@ -104,6 +113,10 @@ def resolve_all_selected() -> tuple[BoundInvocation, ...]:
     fixture = make_composition_fixture()
     outcome = WorkflowResolver(
         fixture.catalog, fixture.deployment_snapshot,
+        discovery_certificate=DiscoveryCertificate.for_base_catalog(
+            fixture.catalog),
+        discovery_universe=DiscoveryUniverseContract.declare(
+            fixture.catalog.catalog_id),
     ).resolve(fixture.root_uses)
     if (outcome.status is not ResolutionStatus.READY
             or outcome.selection.plan is None):

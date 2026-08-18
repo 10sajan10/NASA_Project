@@ -8,7 +8,7 @@ publication: only ``task_commits`` plus ``task_output_slots`` is authoritative.
 
 The implementation supports one JSON payload file per output port.  In
 addition to the Stage-1 ``finite_json`` validator, Stage 4 adds a deliberately
-narrow ``field_json_v1`` validator for the canonical, domain-neutral test-field
+narrow ``field_json_v2`` validator for the canonical, domain-neutral test-field
 representation.  New scientific formats must add explicit validators; they
 must not bypass this boundary.
 """
@@ -30,6 +30,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from grid_convention import (
+    FIELD_JSON_SCHEMA,
+    FIELD_JSON_VALIDATOR_KIND,
+    GRID_AFFINE_CONVENTION,
+)
+
 from .identity import strict_canonical_json, strict_hash
 from .state import AttemptRecord, RuntimeStore
 from .types import ArtifactRecipe, AttemptSpec, AttemptState, TaskState
@@ -39,7 +45,7 @@ _SAFE_PORT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _RESULT_SCHEMA = "stage1-attempt-result-v1"
 _ARTIFACT_SCHEMA = "stage1-artifact-manifest-v1"
 _INVENTORY_SCHEMA = "stage1-staged-inventory-v1"
-_VALIDATION_SCHEMA = "stage1-validation-record-v1"
+_VALIDATION_SCHEMA = "stage1-validation-record-v2"
 _MAX_RESULT_BYTES = 1024 * 1024
 _READ_CHUNK = 1024 * 1024
 
@@ -426,8 +432,8 @@ class ArtifactCommitter:
             if configuration == {"kind": "finite_json"}:
                 validator_id = "stage1.finite-json@1"
             elif (isinstance(configuration, dict)
-                  and configuration.get("kind") == "field_json_v1"):
-                validator_id = "stage4.field-json@1"
+                  and configuration.get("kind") == FIELD_JSON_VALIDATOR_KIND):
+                validator_id = "stage8r.field-json@2"
                 _validate_field_configuration(configuration)
                 field_validation_passed = False
             else:
@@ -444,8 +450,8 @@ class ArtifactCommitter:
             value = _decode_strict_json(payload)
             strict_json_passed = True
             decoded_type = type(value).__name__
-            if configuration.get("kind") == "field_json_v1":
-                _validate_field_json_v1(value, configuration)
+            if configuration.get("kind") == FIELD_JSON_VALIDATOR_KIND:
+                _validate_field_json_v2(value, configuration)
                 field_validation_passed = True
             passed = True
         except (InvalidArtifactError, UnicodeError, json.JSONDecodeError,
@@ -456,13 +462,20 @@ class ArtifactCommitter:
             "schema": _VALIDATION_SCHEMA,
             "validator_id": validator_id,
             "validator_configuration": configuration,
+            # This is the exact compiler-bound descriptor and plan/output
+            # coordinate, not metadata inferred from the payload.  The Cube
+            # projector requires an identical replay in the passed validation
+            # record before it will expose an entry.
+            "scientific_binding": (
+                staged.recipe.scientific_binding.to_dict()
+                if staged.recipe.scientific_binding is not None else None),
             "recipe_id": staged.recipe.recipe_id,
             "content_sha256": staged.content_sha256,
             "size_bytes": staged.size_bytes,
             "checks": {
                 "immutable_object_checksum": checksum_passed,
                 "strict_finite_json": strict_json_passed,
-                "field_json_v1": field_validation_passed,
+                "field_json_v2": field_validation_passed,
             },
             "passed": passed,
         }
@@ -766,6 +779,17 @@ class ArtifactCommitter:
                     "(run_id,recipe_id,artifact_id,state) VALUES(?,?,?,'PENDING')",
                     (spec.run_id, manifest.recipe_id, manifest.artifact_id),
                 )
+                recipe = next(
+                    value.recipe for value in staged
+                    if value.recipe.recipe_id == manifest.recipe_id)
+                if recipe.scientific_binding is not None:
+                    con.execute(
+                        "INSERT INTO cube_projection_outbox"
+                        "(run_id,recipe_id,artifact_id,state,created_at) "
+                        "VALUES(?,?,?,'PENDING',?)",
+                        (spec.run_id, manifest.recipe_id,
+                         manifest.artifact_id, now),
+                    )
 
             self.store._transition_attempt(
                 con, spec.attempt_id, AttemptState.RESULT_READY,
@@ -1143,49 +1167,84 @@ def _assert_finite_json(value: Any) -> None:
 
 def _validate_field_configuration(configuration: dict[str, Any]) -> None:
     expected = {
-        "kind", "descriptor_id", "crs", "grid_shape", "grid_affine",
-        "temporal", "component_names",
+        "kind", "descriptor_id", "crs", "grid_affine_convention",
+        "grid_axis_order", "grid_shape", "grid_affine",
+        "grid_support_bounds", "temporal", "component_names",
     }
     if set(configuration) != expected:
         raise InvalidArtifactError(
-            "field_json_v1 validator configuration has invalid fields")
+            "field_json_v2 validator configuration has invalid fields")
     descriptor_id = configuration["descriptor_id"]
     if (not isinstance(descriptor_id, str)
             or re.fullmatch(r"[0-9a-f]{64}", descriptor_id) is None):
         raise InvalidArtifactError(
-            "field_json_v1 requires a descriptor SHA-256 identity")
+            "field_json_v2 requires a descriptor SHA-256 identity")
     if not isinstance(configuration["crs"], str) or not configuration["crs"]:
-        raise InvalidArtifactError("field_json_v1 requires a CRS")
+        raise InvalidArtifactError("field_json_v2 requires a CRS")
+    if configuration["grid_affine_convention"] != GRID_AFFINE_CONVENTION:
+        raise InvalidArtifactError(
+            "field_json_v2 has an unsupported grid affine convention")
+    axis_order = configuration["grid_axis_order"]
+    if (not isinstance(axis_order, (list, tuple)) or len(axis_order) != 2
+            or any(not isinstance(value, str) or not value
+                   for value in axis_order)
+            or axis_order[0] == axis_order[1]):
+        raise InvalidArtifactError(
+            "field_json_v2 grid_axis_order must name distinct x/y axes")
     shape = configuration["grid_shape"]
     if (not isinstance(shape, (list, tuple)) or len(shape) != 2
             or any(type(value) is not int or value <= 0 for value in shape)):
         raise InvalidArtifactError(
-            "field_json_v1 grid_shape must be [positive_y, positive_x]")
+            "field_json_v2 grid_shape must be [positive_y, positive_x]")
     affine = configuration["grid_affine"]
     if not isinstance(affine, (list, tuple)) or len(affine) != 6:
         raise InvalidArtifactError(
-            "field_json_v1 grid_affine must contain six decimal values")
+            "field_json_v2 grid_affine must contain six decimal values")
     try:
         affine_values = tuple(Decimal(value) for value in affine)
     except (InvalidOperation, TypeError) as exc:
         raise InvalidArtifactError(
-            "field_json_v1 grid_affine values must be decimal") from exc
+            "field_json_v2 grid_affine values must be decimal") from exc
     if (any(not value.is_finite() for value in affine_values)
             or affine_values[1] != 0 or affine_values[3] != 0
-            or affine_values[0] <= 0 or affine_values[4] <= 0):
+            or affine_values[0] == 0 or affine_values[4] == 0):
         raise InvalidArtifactError(
-            "field_json_v1 requires a finite increasing axis-aligned affine")
+            "field_json_v2 requires finite nonzero signed axis-aligned steps")
+    raw_bounds = configuration["grid_support_bounds"]
+    if not isinstance(raw_bounds, (list, tuple)) or len(raw_bounds) != 4:
+        raise InvalidArtifactError(
+            "field_json_v2 grid_support_bounds must contain four decimals")
+    try:
+        bounds = tuple(Decimal(value) for value in raw_bounds)
+    except (InvalidOperation, TypeError) as exc:
+        raise InvalidArtifactError(
+            "field_json_v2 grid_support_bounds must be decimal") from exc
+    if (any(not value.is_finite() for value in bounds)
+            or bounds[0] >= bounds[2] or bounds[1] >= bounds[3]):
+        raise InvalidArtifactError(
+            "field_json_v2 grid_support_bounds must be finite ordered bounds")
+    rows, columns = shape
+    a, _, c, _, e, f = affine_values
+    x_last = c + a * (columns - 1)
+    y_last = f + e * (rows - 1)
+    x_edges = (c - a / 2, x_last + a / 2)
+    y_edges = (f - e / 2, y_last + e / 2)
+    expected_bounds = (
+        min(x_edges), min(y_edges), max(x_edges), max(y_edges))
+    if bounds != expected_bounds:
+        raise InvalidArtifactError(
+            "field_json_v2 support bounds do not match sample-centre grid edges")
     names = configuration["component_names"]
-    if (not isinstance(names, (list, tuple))
+    if (not isinstance(names, (list, tuple)) or not names
             or any(not isinstance(value, str) or not value for value in names)
             or len(names) != len(set(names))):
         raise InvalidArtifactError(
-            "field_json_v1 component_names must be unique strings")
+            "field_json_v2 component_names must be unique strings")
     temporal = configuration["temporal"]
     if not isinstance(temporal, dict) or set(temporal) != {
             "kind", "start", "end", "cadence_s"}:
         raise InvalidArtifactError(
-            "field_json_v1 temporal validator configuration is invalid")
+            "field_json_v2 temporal validator configuration is invalid")
     if temporal["kind"] == "TIME_INVARIANT":
         if any(temporal[value] is not None
                for value in ("start", "end", "cadence_s")):
@@ -1204,25 +1263,29 @@ def _validate_field_configuration(configuration: dict[str, Any]) -> None:
                 "series field validation has an invalid temporal lattice")
     else:
         raise InvalidArtifactError(
-            "field_json_v1 temporal kind must be TIME_INVARIANT or SERIES")
+            "field_json_v2 temporal kind must be TIME_INVARIANT or SERIES")
 
 
-def _validate_field_json_v1(
+def _validate_field_json_v2(
         value: Any, configuration: dict[str, Any]) -> None:
     if not isinstance(value, dict) or set(value) != {
-            "schema", "crs", "x", "y", "time", "components"}:
+            "schema", "crs", "axis_order", "x", "y", "time", "components"}:
         raise InvalidArtifactError(
-            "field_json_v1 payload has an invalid top-level schema")
-    if value["schema"] != "field-json-v1":
-        raise InvalidArtifactError("field_json_v1 payload schema is invalid")
+            "field_json_v2 payload has an invalid top-level schema")
+    if value["schema"] != FIELD_JSON_SCHEMA:
+        raise InvalidArtifactError("field_json_v2 payload schema is invalid")
     if value["crs"] != configuration["crs"]:
-        raise InvalidArtifactError("field_json_v1 payload CRS does not match")
-    x = _strictly_increasing_numbers(value["x"], "x")
-    y = _strictly_increasing_numbers(value["y"], "y")
+        raise InvalidArtifactError("field_json_v2 payload CRS does not match")
+    if (not isinstance(value["axis_order"], list)
+            or value["axis_order"] != list(configuration["grid_axis_order"])):
+        raise InvalidArtifactError(
+            "field_json_v2 payload axis names/order do not match descriptor")
+    x = _signed_axis_numbers(value["x"], "x")
+    y = _signed_axis_numbers(value["y"], "y")
     expected_y, expected_x = configuration["grid_shape"]
     if len(x) != expected_x or len(y) != expected_y:
         raise InvalidArtifactError(
-            "field_json_v1 coordinate lengths do not match descriptor grid")
+            "field_json_v2 coordinate lengths do not match descriptor grid")
     affine = tuple(Decimal(item) for item in configuration["grid_affine"])
     expected_x_values = [affine[2] + affine[0] * index
                          for index in range(expected_x)]
@@ -1231,13 +1294,13 @@ def _validate_field_json_v1(
     if ([Decimal(str(item)) for item in x] != expected_x_values
             or [Decimal(str(item)) for item in y] != expected_y_values):
         raise InvalidArtifactError(
-            "field_json_v1 coordinates do not match descriptor affine")
+            "field_json_v2 coordinates do not match descriptor affine")
     times = value["time"]
     if (not isinstance(times, list) or not times
             or any(not isinstance(item, str) or not item for item in times)
             or len(times) != len(set(times))):
         raise InvalidArtifactError(
-            "field_json_v1 time must be a non-empty unique string array")
+            "field_json_v2 time must be a non-empty unique string array")
     temporal = configuration["temporal"]
     if temporal["kind"] == "TIME_INVARIANT":
         expected_times = ["TIME_INVARIANT"]
@@ -1248,49 +1311,51 @@ def _validate_field_json_v1(
         expected_times = _series_lattice(start, end, cadence)
     if times != expected_times:
         raise InvalidArtifactError(
-            "field_json_v1 time coordinates do not match descriptor lattice")
+            "field_json_v2 time coordinates do not match descriptor lattice")
 
     components = value["components"]
     if not isinstance(components, dict) or not components:
         raise InvalidArtifactError(
-            "field_json_v1 components must be a non-empty object")
+            "field_json_v2 components must be a non-empty object")
     if any(not isinstance(name, str) or not name for name in components):
-        raise InvalidArtifactError("field_json_v1 component name is invalid")
+        raise InvalidArtifactError("field_json_v2 component name is invalid")
     expected_names = configuration["component_names"]
-    if expected_names and sorted(components) != sorted(expected_names):
+    if sorted(components) != sorted(expected_names):
         raise InvalidArtifactError(
-            "field_json_v1 components do not match the output contract")
+            "field_json_v2 components do not match the output contract")
     for name, tensor in components.items():
         if not isinstance(tensor, list) or len(tensor) != len(times):
             raise InvalidArtifactError(
-                f"field_json_v1 component {name!r} has the wrong time shape")
+                f"field_json_v2 component {name!r} has the wrong time shape")
         for plane in tensor:
             if not isinstance(plane, list) or len(plane) != len(y):
                 raise InvalidArtifactError(
-                    f"field_json_v1 component {name!r} has the wrong y shape")
+                    f"field_json_v2 component {name!r} has the wrong y shape")
             for row in plane:
                 if not isinstance(row, list) or len(row) != len(x):
                     raise InvalidArtifactError(
-                        f"field_json_v1 component {name!r} has the wrong x shape")
+                        f"field_json_v2 component {name!r} has the wrong x shape")
                 for item in row:
                     if (isinstance(item, bool)
                             or not isinstance(item, (int, float))
                             or not math.isfinite(float(item))):
                         raise InvalidArtifactError(
-                            f"field_json_v1 component {name!r} is not finite numeric")
+                            f"field_json_v2 component {name!r} is not finite numeric")
 
 
-def _strictly_increasing_numbers(value: Any, label: str) -> list[float]:
+def _signed_axis_numbers(value: Any, label: str) -> list[float]:
     if (not isinstance(value, list) or not value
             or any(isinstance(item, bool)
                    or not isinstance(item, (int, float))
                    or not math.isfinite(float(item)) for item in value)):
         raise InvalidArtifactError(
-            f"field_json_v1 {label} must be finite numeric coordinates")
+            f"field_json_v2 {label} must be finite numeric coordinates")
     result = [float(item) for item in value]
-    if any(left >= right for left, right in zip(result, result[1:])):
+    differences = [right - left for left, right in zip(result, result[1:])]
+    if differences and (any(value == 0 for value in differences)
+                        or min(differences) < 0 < max(differences)):
         raise InvalidArtifactError(
-            f"field_json_v1 {label} coordinates must be strictly increasing")
+            f"field_json_v2 {label} coordinates must be strictly monotonic")
     return result
 
 
@@ -1299,10 +1364,10 @@ def _positive_decimal(value: str, label: str) -> Decimal:
         result = Decimal(value)
     except (InvalidOperation, TypeError) as exc:
         raise InvalidArtifactError(
-            f"field_json_v1 {label} must be decimal") from exc
+            f"field_json_v2 {label} must be decimal") from exc
     if not result.is_finite() or result <= 0:
         raise InvalidArtifactError(
-            f"field_json_v1 {label} must be positive and finite")
+            f"field_json_v2 {label} must be positive and finite")
     return result
 
 
@@ -1311,9 +1376,9 @@ def _parse_utc(value: str) -> datetime:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (AttributeError, ValueError) as exc:
         raise InvalidArtifactError(
-            "field_json_v1 time is not ISO-8601") from exc
+            "field_json_v2 time is not ISO-8601") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise InvalidArtifactError("field_json_v1 time lacks a UTC offset")
+        raise InvalidArtifactError("field_json_v2 time lacks a UTC offset")
     return parsed.astimezone(timezone.utc)
 
 
@@ -1323,11 +1388,11 @@ def _expected_series_count(
     cadence_us_decimal = cadence * Decimal(1_000_000)
     if cadence_us_decimal != cadence_us_decimal.to_integral_value():
         raise InvalidArtifactError(
-            "field_json_v1 cadence must resolve to integral microseconds")
+            "field_json_v2 cadence must resolve to integral microseconds")
     cadence_us = int(cadence_us_decimal)
     if duration_us % cadence_us:
         raise InvalidArtifactError(
-            "field_json_v1 end must lie on the cadence lattice")
+            "field_json_v2 end must lie on the cadence lattice")
     return duration_us // cadence_us
 
 

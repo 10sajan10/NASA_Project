@@ -117,6 +117,7 @@ class LocalSubprocessProvider:
                     "--runtime-root", str(self.root),
                     "--stage-dir", str(stage),
                     "--attempt-token", spec.attempt_token,
+                    "--provider-name", self.name,
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=stdout,

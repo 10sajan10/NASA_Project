@@ -1,6 +1,6 @@
 """Closed Stage-4 transformation operation tests.
 
-The tiny ``field-json-v1`` values here are execution fixtures.  They are not a
+The tiny ``field-json-v2`` values here are execution fixtures.  They are not a
 replacement for production array storage and they deliberately contain no
 domain-specific wind semantics.
 """
@@ -14,6 +14,7 @@ from capabilities.binders import binder_keys, binder_rule
 from engine.runtime.operations import (
     VECTOR_CALM_DIRECTION_CONVENTION,
     VECTOR_DIRECTION_CONVENTION,
+    bind_reprojection_parameters,
     execute_component,
     operation_component,
     operation_keys,
@@ -30,8 +31,9 @@ def _field(*, components: dict | None = None,
            time: list[str] | None = None,
            crs: str = "EPSG:4326") -> dict:
     return {
-        "schema": "field-json-v1",
+        "schema": "field-json-v2",
         "crs": crs,
+        "axis_order": ["longitude", "latitude"],
         "x": [0.0, 1.0, 2.0] if x is None else x,
         "y": [10.0, 11.0, 12.0] if y is None else y,
         "time": (["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"]
@@ -64,7 +66,8 @@ def test_all_stage4_operations_have_closed_exact_binders() -> None:
             ("target_x", "target_y")),
         "transform.reproject_bilinear.v1": (
             "transform.reproject_bilinear.bind.v1", ("source",), ("result",),
-            ("source_crs", "target_crs", "target_x", "target_y")),
+            ("pipeline_projjson", "source_axis_order", "source_crs",
+             "target_axis_order", "target_crs", "target_x", "target_y")),
         "transform.vector_rotate.v1": (
             "transform.vector_rotate.bind.v1", ("source",), ("result",),
             ("angle_degrees",)),
@@ -219,17 +222,22 @@ def test_reprojection_inverse_maps_target_grid_before_bilinear_sampling() -> Non
         "EPSG:4326", "EPSG:3857", always_xy=True)
     target_x = [forward.transform(value, 0)[0] for value in (0.5, 1.5)]
     target_y = [forward.transform(0, value)[1] for value in (0.5, 1.5)]
-    result = _run(
-        "transform.reproject_bilinear.v1",
+    parameters = bind_reprojection_parameters(
         {
             "source_crs": "EPSG:4326",
             "target_crs": "EPSG:3857",
             "target_x": target_x,
             "target_y": target_y,
         },
+        source_axis_order=("longitude", "latitude"),
+        target_axis_order=("easting", "northing"),
+    )
+    result = _run(
+        "transform.reproject_bilinear.v1", parameters,
         {"source": source},
     )["result"]
     assert result["crs"] == "EPSG:3857"
+    assert result["axis_order"] == ["easting", "northing"]
     assert result["x"] == target_x
     assert result["y"] == target_y
     for actual_row, expected_row in zip(
@@ -289,8 +297,8 @@ def test_vector_decomposition_uses_documented_mathematical_direction() -> None:
 @pytest.mark.parametrize(
     "mutation",
     [
-        lambda value: value.update(schema="field-json-v2"),
-        lambda value: value["x"].reverse(),
+        lambda value: value.update(schema="field-json-v1"),
+        lambda value: value.update(x=[0.0, 2.0, 1.0]),
         lambda value: value["components"]["value"][0][0].append(3),
         lambda value: value["components"]["value"][0][0].__setitem__(0, float("inf")),
         lambda value: value.update(unexpected=True),

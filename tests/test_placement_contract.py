@@ -27,11 +27,12 @@ from contracts.types import GridDescriptor, SpatialScale
 
 def _grid(shape: tuple[int, int], cell_m: int, *, origin=(0, 0),
           crs: str = "EPSG:32610", rotation: bool = False) -> GridDescriptor:
-    """A north-up grid: rasterio affine ordering, negative y scale."""
+    """A north-up grid from an outer upper-left edge."""
     return GridDescriptor(
         crs, ("easting", "northing"), shape,
-        (str(cell_m), "1" if rotation else "0", str(origin[0]),
-         "0", str(-cell_m), str(origin[1])),
+        (str(cell_m), "1" if rotation else "0",
+         str(origin[0] + cell_m / 2),
+         "0", str(-cell_m), str(origin[1] - cell_m / 2)),
         SpatialScale(str(cell_m), str(cell_m), "m"))
 
 

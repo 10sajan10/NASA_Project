@@ -96,18 +96,27 @@ Those feed **the same** `upstream_discovery_complete` / `upstream_limit_codes`
 inputs Stage 4 added. Stage 5 deliberately did not add a second channel:
 
 ```python
-upstream = UpstreamCompleteness.merge_all((
-    UpstreamCompleteness.from_layer(acquisition.complete, acquisition.limit_codes),
-    UpstreamCompleteness.from_layer(closure.complete, closure_codes),
+universe = DiscoveryUniverseContract.declare(base_catalog.catalog_id, (
+    DiscoveryLayerScope.bind(
+        "ACQUISITION_EXPANSION", source_ids=source_snapshot_ids,
+        limits=acquisition_limits.to_dict()),
+    DiscoveryLayerScope.bind(
+        "TRANSFORMATION_EXPANSION",
+        source_ids=(transformation_catalog.catalog_id,),
+        limits=transformation_limits.to_dict()),
 ))
-WorkflowResolver(catalog, snapshot, **upstream.resolver_kwargs()).resolve(roots)
+WorkflowResolver(
+    catalog, snapshot,
+    discovery_certificate=closure.discovery_certificate(),
+    discovery_universe=universe,
+).resolve(roots)
 ```
 
-[`resolution/upstream.py`](../resolution/upstream.py) folds layers by
-conjunction of completeness and union of reasons, and refuses to assemble an
-inconsistent pair — the same rule the resolver already enforces on its own
-inputs. A truncated remote search cannot support a global-optimality claim, for
-the same reason a truncated transformation closure cannot.
+[`resolution/upstream.py`](../resolution/upstream.py) requires the catalog's
+certificate to cover exactly the independently declared discovery universe.
+Layer completeness is then conjoined and limit reasons are unioned. A
+truncated remote search cannot support a global-optimality claim, for the same
+reason a truncated transformation closure cannot.
 
 ## Staleness ends a plan; it never substitutes
 
@@ -134,6 +143,14 @@ manifest roots, completeness, and limit reasons — not over the pagination
 history that produced it. Resuming an interrupted search and finding the same
 assets yields the same snapshot ID, which is what makes a restart invisible to
 science while remaining honest about truncation.
+
+Payload restart has the same rule at asset granularity. A kernel-held manifest
+lock permits one live same-node fetcher. Before each provider call, SQLite
+records a reserved/started attempt; after the blob is durably content-addressed
+it records a reusable checkpoint. A crash therefore reuses completed assets,
+and reopening an incomplete asset consumes another call and declared-byte
+reservation before the connector is touched. A tight quota refuses the reopen
+instead of silently exceeding its budget.
 
 ## Executable evidence
 
@@ -186,7 +203,8 @@ runtime_root=$(mktemp -d /tmp/nasa-stage5-demo.XXXXXX)
   rule registry, and the upstream-channel fold.
 - `tests/test_stage5_integration.py` — the vertical slice, transfer ordering,
   transient retry versus staleness, idempotent transfer, shared quota, secret
-  hygiene, and lowering guards.
+  hygiene, lowering guards, live-owner exclusion, and crash/restart per-asset
+  quota accounting.
 
 ## Current limitations and non-claims
 
@@ -209,8 +227,9 @@ runtime_root=$(mktemp -d /tmp/nasa-stage5-demo.XXXXXX)
   deliberate, documented exception.
 - Tiles are joined by ordered concatenation along one axis. Overlaps and holes
   raise rather than blend.
-- Transfer is single-threaded and per-asset. There is no parallel fetch, range
-  request, resume-mid-asset, or partial-object recovery.
+- Transfer is single-threaded and per-asset. Completed assets are reusable
+  checkpoints, but there is no range request, resume-mid-asset, or
+  partial-object recovery.
 - Provider quota is system-level within one SQLite database on one node. It is
   not a distributed or cross-host quota.
 - Connector deadlines are wall-clock budgets checked between pages, not

@@ -23,6 +23,9 @@ from .hypergraph import (
 
 def project_oracle_problem(
     graph: FeasibleDerivationHypergraph,
+    *,
+    discovery_certificate_id: str | None = None,
+    discovery_universe_id: str | None = None,
 ) -> OracleProblem:
     """Project one discovered graph without rediscovery or filtering.
 
@@ -86,6 +89,12 @@ def project_oracle_problem(
     if graph.evidence_snapshot_id is not None:
         snapshots.append(PlanSnapshotRef(
             "evidence", graph.evidence_snapshot_id))
+    if discovery_certificate_id is not None:
+        snapshots.append(PlanSnapshotRef(
+            "discovery_certificate", discovery_certificate_id))
+    if discovery_universe_id is not None:
+        snapshots.append(PlanSnapshotRef(
+            "discovery_universe", discovery_universe_id))
 
     return OracleProblem.bind(
         f"stage3-discovered-{graph.graph_id}",

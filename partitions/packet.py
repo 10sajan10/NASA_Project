@@ -27,6 +27,25 @@ class MemberOutcome(str, Enum):
     NOT_ATTEMPTED = "NOT_ATTEMPTED"
 
 
+def expected_deployment_binding_id(collection_id: str,
+                                   template_id: str) -> str:
+    """Return the only valid deployment binding for a collection packet.
+
+    A packet member must not be able to assert an arbitrary deployment label.
+    The collection and its verified task template are the authority available
+    at this layer, so the binding is a domain-separated digest of exactly
+    those identities.  The store independently derives this value whenever a
+    packet is registered *and* whenever a result is accepted.
+    """
+    _digest(collection_id, "deployment binding collection_id")
+    _digest(template_id, "deployment binding template_id")
+    return strict_hash({
+        "schema": "stage8r-partition-deployment-binding-v1",
+        "collection_id": collection_id,
+        "template_id": template_id,
+    })
+
+
 @dataclass(frozen=True)
 class PacketMember:
     """One partition inside a packet, retaining its own identity."""
@@ -59,11 +78,13 @@ class WorkPacket:
     """One provider submission covering an ordered set of partitions."""
 
     packet_id: str
+    collection_id: str
     template_id: str
     members: tuple[PacketMember, ...]
 
     def __post_init__(self) -> None:
         _digest(self.packet_id, "packet_id")
+        _digest(self.collection_id, "packet collection_id")
         _digest(self.template_id, "packet template_id")
         if (not isinstance(self.members, tuple) or not self.members
                 or not all(isinstance(item, PacketMember)
@@ -79,40 +100,44 @@ class WorkPacket:
             raise ValueError("work packet identity does not verify")
 
     @classmethod
-    def bind(cls, template_id: str,
+    def bind(cls, collection_id: str, template_id: str,
              members: Iterable[PacketMember]) -> "WorkPacket":
         values = tuple(members)
-        return cls(strict_hash(cls._payload(template_id, values)),
-                   template_id, values)
+        return cls(strict_hash(cls._payload(collection_id, template_id, values)),
+                   collection_id, template_id, values)
 
     @staticmethod
-    def _payload(template_id: str,
+    def _payload(collection_id: str, template_id: str,
                  members: tuple[PacketMember, ...]) -> dict[str, Any]:
         return {
-            "schema": "stage7-work-packet-v1",
+            "schema": "stage8r-work-packet-v2",
+            "collection_id": collection_id,
             "template_id": template_id,
             "members": [item.to_dict() for item in members],
         }
 
     def expected_id(self) -> str:
-        return strict_hash(self._payload(self.template_id, self.members))
+        return strict_hash(self._payload(
+            self.collection_id, self.template_id, self.members))
 
     @property
     def logical_task_keys(self) -> tuple[str, ...]:
         return tuple(item.logical_task_key for item in self.members)
 
     def to_dict(self) -> dict[str, Any]:
-        payload = self._payload(self.template_id, self.members)
+        payload = self._payload(
+            self.collection_id, self.template_id, self.members)
         payload["packet_id"] = self.packet_id
         return payload
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "WorkPacket":
         raw = require_object_fields(
-            value, {"schema", "packet_id", "template_id", "members"},
+            value, {"schema", "packet_id", "collection_id", "template_id",
+                    "members"},
             "WorkPacket")
-        if raw.pop("schema") != "stage7-work-packet-v1":
-            raise ValueError("WorkPacket schema is not stage7-work-packet-v1")
+        if raw.pop("schema") != "stage8r-work-packet-v2":
+            raise ValueError("WorkPacket schema is not stage8r-work-packet-v2")
         raw["members"] = tuple(
             PacketMember.from_dict(item) for item in raw["members"])
         return cls(**raw)
@@ -209,6 +234,8 @@ class PacketResult:
         keys = [item[0] for item in self.outcomes]
         if len(set(keys)) != len(keys):
             raise ValueError("a packet result cannot report a member twice")
+        if keys != sorted(keys):
+            raise ValueError("packet result outcomes must be canonically ordered")
         if self.result_id != self.expected_id():
             raise ValueError("packet result identity does not verify")
 
@@ -217,7 +244,7 @@ class PacketResult:
              outcomes: Iterable[tuple[str, MemberOutcome]]) -> "PacketResult":
         if attempt.packet_id != packet.packet_id:
             raise ValueError("packet attempt does not belong to this packet")
-        values = tuple(outcomes)
+        values = tuple(sorted(tuple(outcomes), key=lambda item: item[0]))
         if {item[0] for item in values} != set(packet.logical_task_keys):
             raise ValueError(
                 "a packet result must report exactly its packet's members")
@@ -277,7 +304,8 @@ class PacketResult:
         return cls(**raw)
 
 
-def fuse_members(members: Iterable[PacketMember], template_id: str, *,
+def fuse_members(members: Iterable[PacketMember], collection_id: str,
+                 template_id: str, *,
                  max_members: int, cost_per_member: int,
                  target_packet_cost: int) -> tuple[WorkPacket, ...]:
     """Group adjacent partitions into packets, keeping per-partition lineage.
@@ -300,7 +328,8 @@ def fuse_members(members: Iterable[PacketMember], template_id: str, *,
     packets: list[WorkPacket] = []
     for start in range(0, len(ordered), group_size):
         packets.append(WorkPacket.bind(
-            template_id, tuple(ordered[start:start + group_size])))
+            collection_id, template_id,
+            tuple(ordered[start:start + group_size])))
     return tuple(packets)
 
 
@@ -310,5 +339,6 @@ __all__ = [
     "PacketResult",
     "PacketMember",
     "WorkPacket",
+    "expected_deployment_binding_id",
     "fuse_members",
 ]
