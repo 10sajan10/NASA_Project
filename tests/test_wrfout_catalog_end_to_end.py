@@ -11,6 +11,7 @@ resampled, or re-encoded, and the entry keeps WRF's own Lambert grid.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from pathlib import Path
 
@@ -183,3 +184,67 @@ def test_an_entry_without_a_location_is_refused(catalog, wrfout, digest):
         content_sha256=digest, media_type="application/x-netcdf")
     with pytest.raises(ValueError, match="must record its location"):
         catalog.register_dataset(entry, wrfout)
+
+
+# -- searchable, not merely readable --------------------------------------
+
+
+def test_the_catalogue_is_searchable_by_area_time_and_variable(catalog,
+                                                               wrfout, digest):
+    entry = _arrival_entry(wrfout, digest)
+    entry = dataclasses.replace(
+        entry, time_start="2019-09-04T12:00:00Z",
+        time_end="2019-09-04T12:00:00Z", variables=("TIGN_G", "FIRE_AREA"))
+    catalog.register_dataset(entry, wrfout)
+
+    # A discovery box was derived from WRF's own Lambert grid at registration.
+    found = catalog.resolve("arrival_s")
+    assert found.bbox_lonlat is not None
+    minx, miny, maxx, maxy = found.bbox_lonlat
+    assert -98.0 < minx < -95.0 and 31.0 < miny < 34.0
+
+    dallas = (-97.5, 32.0, -96.0, 33.5)
+    assert catalog.search(bbox=dallas)
+    assert catalog.search(concept="arrival_s", variable="TIGN_G")
+    assert catalog.search(time_start="2019-09-04T00:00:00Z",
+                          time_end="2019-09-05T00:00:00Z")
+    assert catalog.search(media_type="application/x-netcdf")
+    assert catalog.search(producer="wrf_sfire")
+
+
+def test_search_excludes_what_does_not_match(catalog, wrfout, digest):
+    entry = dataclasses.replace(
+        _arrival_entry(wrfout, digest), time_start="2019-09-04T12:00:00Z",
+        time_end="2019-09-04T12:00:00Z", variables=("TIGN_G",))
+    catalog.register_dataset(entry, wrfout)
+
+    assert catalog.search(bbox=(10.0, 40.0, 12.0, 42.0)) == []   # Europe
+    assert catalog.search(time_start="2020-01-01T00:00:00Z") == []
+    assert catalog.search(variable="SOIL_MOISTURE") == []
+    assert catalog.search(producer="era5") == []
+    assert catalog.search(concept="arrival_s", producer="wrf_sfire")
+
+
+def test_filters_compose(catalog, wrfout, digest):
+    entry = dataclasses.replace(
+        _arrival_entry(wrfout, digest), time_start="2019-09-04T12:00:00Z",
+        time_end="2019-09-04T12:00:00Z", variables=("TIGN_G",))
+    catalog.register_dataset(entry, wrfout)
+    assert catalog.search(concept="arrival_s", producer="wrf_sfire",
+                          media_type="application/x-netcdf",
+                          variable="TIGN_G", bbox=(-97.5, 32.0, -96.0, 33.5),
+                          time_start="2019-09-04T00:00:00Z")
+    # One wrong facet is enough to exclude it.
+    assert catalog.search(concept="arrival_s", producer="era5") == []
+
+
+def test_unstated_coverage_is_unknown_not_empty(catalog, wrfout, digest):
+    """An entry with no declared time must not vanish from a time search."""
+    catalog.register_dataset(_arrival_entry(wrfout, digest), wrfout)
+    assert catalog.search(time_start="2001-01-01T00:00:00Z",
+                          time_end="2001-01-02T00:00:00Z")
+
+
+def test_an_empty_search_lists_the_catalogue(catalog, wrfout, digest):
+    catalog.register_dataset(_arrival_entry(wrfout, digest), wrfout)
+    assert len(catalog.search()) == 1

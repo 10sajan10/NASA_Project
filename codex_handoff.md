@@ -1404,7 +1404,7 @@ Verify branch v2 at 45aaee1, inspect git status, and preserve every listed
 user-owned dirty file. The separate nasa_project_docs repository also has dirty
 README/diagram work; preserve it.
 
-The last independently verified full suite result is 1029 passed, 1 skipped,
+The last independently verified full suite result is 1034 passed, 1 skipped,
 7 xfailed (Stage-8R working tree, including the Cube projection-authority
 fix). Initially run only bounded tests; do not run WRF-SFIRE, MPI, a real
 Slurm command, or a real remote provider.

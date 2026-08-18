@@ -13,6 +13,7 @@ Opening a v1 catalog migrates it in place (additive columns only), so
 existing cubes keep working unchanged.
 """
 from __future__ import annotations
+import dataclasses
 import hashlib
 import json
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from engine.runtime.identity import strict_canonical_json, strict_json_loads
 
 from .entries import (
     CubeEntry,
+    bbox_lonlat_from_grid,
     ProjectionAuthority,
     EntryInput,
     EntryNotFound,
@@ -147,6 +149,13 @@ ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS run_id        TEXT DEFAULT '';
 ALTER TABLE entries   ADD COLUMN IF NOT EXISTS location      TEXT DEFAULT '';
 ALTER TABLE entries   ADD COLUMN IF NOT EXISTS media_type    TEXT DEFAULT '';
 ALTER TABLE entries   ADD COLUMN IF NOT EXISTS detail_json   TEXT DEFAULT '';
+-- v3.2: structured discovery fields, so the catalog is searchable and not
+-- merely readable. A consumer asking "what covers this area, over this
+-- window, holding this variable" must not have to open every file.
+ALTER TABLE entries   ADD COLUMN IF NOT EXISTS time_start    TEXT DEFAULT '';
+ALTER TABLE entries   ADD COLUMN IF NOT EXISTS time_end      TEXT DEFAULT '';
+ALTER TABLE entries   ADD COLUMN IF NOT EXISTS variables_json TEXT DEFAULT '';
+ALTER TABLE entries   ADD COLUMN IF NOT EXISTS bbox_json     TEXT DEFAULT '';
 """
 
 _VARIABLE_COLS = ["name", "kind", "units", "dtype", "description",
@@ -326,11 +335,16 @@ class Catalog:
         self.con.execute(
             "INSERT INTO entries (entry_id, concept, kind, producer, "
             "content_sha256, grid_json, depth, run_id, location, media_type, "
-            "detail_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "detail_json, time_start, time_end, variables_json, bbox_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [entry.entry_id, entry.concept, entry.kind, entry.producer,
              entry.content_sha256, entry.grid_json(), depth, entry.run_id,
              entry.location, entry.media_type,
-             json.dumps(entry.detail, sort_keys=True) if entry.detail else ""])
+             json.dumps(entry.detail, sort_keys=True) if entry.detail else "",
+             entry.time_start, entry.time_end,
+             json.dumps(list(entry.variables)) if entry.variables else "",
+             json.dumps(list(entry.bbox_lonlat))
+             if entry.bbox_lonlat else ""])
         for edge in entry.inputs:
             self.con.execute(
                 "INSERT INTO entry_inputs (entry_id, port, input_entry_id) "
@@ -393,7 +407,72 @@ class Catalog:
                 raise ValueError(
                     f"{located} does not match its recorded content digest; "
                     "the catalog would point at bytes that changed")
+        # A discovery box is derivable from the grid the entry already
+        # declares, so an entry is never left unsearchable by omission.
+        if entry.bbox_lonlat is None and entry.grid is not None:
+            derived = bbox_lonlat_from_grid(entry.grid)
+            if derived is not None:
+                entry = dataclasses.replace(entry, bbox_lonlat=derived)
         return self._commit_entry_for_test_fixture(entry)
+
+    def search(self, *, concept: str | None = None,
+               producer: str | None = None, media_type: str | None = None,
+               variable: str | None = None, time_start: str | None = None,
+               time_end: str | None = None,
+               bbox: tuple[float, float, float, float] | None = None,
+               kind: str | None = None) -> list[CubeEntry]:
+        """Find catalogued datasets by what they are, cover, and contain.
+
+        Every filter is optional and they compose; omitting all of them lists
+        the catalog. Time and bbox use *overlap*, not containment, because a
+        consumer asking for a window wants everything intersecting it.
+
+        Entries that declare no coverage are not silently excluded by a
+        coverage filter -- an unstated extent is unknown, not empty, and
+        dropping it would quietly hide data.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        for column, value in (("concept", concept), ("producer", producer),
+                              ("media_type", media_type), ("kind", kind)):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.con.execute(
+            f"SELECT {self._ENTRY_COLS} FROM entries{where}", params
+        ).fetchall()
+        found = [self._entry_from_row(row) for row in rows]
+
+        if variable is not None:
+            found = [item for item in found
+                     if variable in item.variables or not item.variables]
+        if time_start is not None or time_end is not None:
+            found = [item for item in found
+                     if self._time_overlaps(item, time_start, time_end)]
+        if bbox is not None:
+            found = [item for item in found
+                     if item.bbox_lonlat is None
+                     or self._bbox_overlaps(item.bbox_lonlat, bbox)]
+        return sorted(found, key=lambda item: (-item.depth, item.entry_id))
+
+    @staticmethod
+    def _time_overlaps(entry: CubeEntry, start: str | None,
+                       end: str | None) -> bool:
+        if not entry.time_start and not entry.time_end:
+            return True          # unstated coverage is unknown, not empty
+        entry_start = entry.time_start or entry.time_end
+        entry_end = entry.time_end or entry.time_start
+        if end is not None and entry_start > end:
+            return False
+        if start is not None and entry_end < start:
+            return False
+        return True
+
+    @staticmethod
+    def _bbox_overlaps(one: tuple, other: tuple) -> bool:
+        return not (one[2] < other[0] or one[0] > other[2]
+                    or one[3] < other[1] or one[1] > other[3])
 
     def datasets_for(self, concept: str) -> list[CubeEntry]:
         """Every catalogued dataset offering a concept, newest lineage first."""
@@ -557,11 +636,15 @@ class Catalog:
             depth=int(row[6]), inputs=edges, run_id=row[7] or "",
             committed_at=row[8], location=row[9] or "",
             media_type=row[10] or "",
-            detail=json.loads(row[11]) if row[11] else {})
+            detail=json.loads(row[11]) if row[11] else {},
+            time_start=row[12] or "", time_end=row[13] or "",
+            variables=tuple(json.loads(row[14])) if row[14] else (),
+            bbox_lonlat=tuple(json.loads(row[15])) if row[15] else None)
 
     _ENTRY_COLS = ("entry_id, concept, kind, producer, content_sha256, "
                    "grid_json, depth, run_id, committed_at, location, "
-                   "media_type, detail_json")
+                   "media_type, detail_json, time_start, time_end, "
+                   "variables_json, bbox_json")
 
     def entry(self, entry_id: str) -> Optional[CubeEntry]:
         row = self.con.execute(

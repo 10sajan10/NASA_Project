@@ -93,9 +93,22 @@ class CubeEntry:
     #: changed when a file moved would break every lineage edge pointing at it.
     location: str = ""
     media_type: str = ""
-    #: Free-form descriptive metadata for discovery -- variables held, their
-    #: dimensions and units, time coverage. Not identity-bearing.
+    #: Free-form descriptive metadata. Anything not covered by the structured
+    #: discovery fields below. Not identity-bearing.
     detail: dict = dataclasses.field(default_factory=dict)
+    #: Structured discovery fields. These are what make the catalog
+    #: *searchable* rather than merely readable: a consumer asking "what
+    #: covers this area, over this window, holding this variable" must not
+    #: have to open every file to find out.
+    #:
+    #: `bbox_lonlat` is deliberately in EPSG:4326 while the payload stays on
+    #: its native grid. Discovery needs one comparable frame -- otherwise a
+    #: Lambert entry and a UTM entry cannot be compared at all -- and
+    #: transforming four corner numbers for an index is not resampling data.
+    time_start: str = ""
+    time_end: str = ""
+    variables: tuple[str, ...] = ()
+    bbox_lonlat: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
         for value, label in ((self.concept, "concept"),
@@ -146,11 +159,16 @@ class CubeEntry:
                run_id: str = "",
                committed_at: datetime | None = None,
                location: str = "", media_type: str = "",
-               detail: dict | None = None) -> "CubeEntry":
+               detail: dict | None = None, time_start: str = "",
+               time_end: str = "", variables: tuple[str, ...] = (),
+               bbox_lonlat: tuple[float, float, float, float] | None = None
+               ) -> "CubeEntry":
         """Mint an entry, computing its identity rather than accepting one."""
         draft = cls("", concept, kind, producer, content_sha256, grid, depth,
                     tuple(inputs), run_id, committed_at, location, media_type,
-                    dict(detail or {}))
+                    dict(detail or {}), time_start, time_end,
+                    tuple(variables),
+                    None if bbox_lonlat is None else tuple(bbox_lonlat))
         return dataclasses.replace(draft, entry_id=draft.expected_id())
 
     @property
@@ -160,6 +178,38 @@ class CubeEntry:
     def grid_json(self) -> str:
         return "" if self.grid is None else json.dumps(
             self.grid.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def bbox_lonlat_from_grid(grid: GridDescriptor
+                          ) -> tuple[float, float, float, float] | None:
+    """Derive a lon/lat discovery box from a grid's own footprint.
+
+    Metadata only. The payload is never touched, never reprojected and never
+    resampled; this exists so entries on different native grids can be
+    compared in one search.
+    """
+    try:
+        from pyproj import CRS, Transformer
+    except ImportError:  # pragma: no cover - pyproj is a hard dependency
+        return None
+    crs_text = grid.crs
+    if crs_text.startswith("WRF-LCC:"):
+        params = dict(part.split("=", 1) for part in crs_text.split(":")[1:])
+        crs = CRS.from_proj4(
+            f"+proj=lcc +lat_1={params['lat_1']} +lat_2={params['lat_2']} "
+            f"+lat_0={params['lat_0']} +lon_0={params['lon_0']} "
+            f"+x_0=0 +y_0=0 +R={params['R']} +units=m +no_defs")
+    else:
+        try:
+            crs = CRS.from_user_input(crs_text)
+        except Exception:
+            return None
+    minx, miny, maxx, maxy = (float(value) for value in grid.support_bounds)
+    to_lonlat = Transformer.from_crs(crs, 4326, always_xy=True)
+    xs = [minx, minx, maxx, maxx]
+    ys = [miny, maxy, miny, maxy]
+    lons, lats = to_lonlat.transform(xs, ys)
+    return (min(lons), min(lats), max(lons), max(lats))
 
 
 def grid_from_json(text: str) -> GridDescriptor | None:
@@ -272,6 +322,7 @@ __all__ = [
     "EntryNotFound",
     "ProjectionAuthority",
     "ResolutionPolicy",
+    "bbox_lonlat_from_grid",
     "grid_from_json",
     "order_key",
 ]
