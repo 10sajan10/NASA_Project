@@ -95,13 +95,18 @@ def test_the_frozen_profile_is_a_real_graph_not_a_toy(frozen):
     reason=(
         "Section 9.5 p95 <= 5 s is NOT met on this node: 7.06 s at 126 "
         "invocations and 250 arcs, well inside the 1,000-node cap. Stage-8R "
-        "took it from 15.12 s (3.02x over) to 1.41x over; the remainder is "
-        "structural, because deterministic tie-breaking freezes producer bits "
-        "in 30-bit chunks so solver calls scale with graph width. Recorded as "
+        "took it from 15.12 s (3.02x over) to 1.41x over. The remainder is "
+        "one solver call: of 11 calls at this size the primary cost MILP is "
+        "4.89 s and the nine lexicographic tie-break chunks total ~0.1 s, so "
+        "tie-breaking is NOT the cost. Recorded as "
         "a real miss. A separate and larger limit sits just beyond this "
         "graph: at ~254 invocations the 30 s interactive solve limit expires "
-        "before optimality is proven, so the resolver honestly reports "
-        "FEASIBLE_NOT_PROVEN_OPTIMAL rather than claiming a global optimum. "
+        "before optimality is proven -- there only two solver calls happen "
+        "and the primary solve alone consumes the budget -- so the resolver "
+        "honestly reports FEASIBLE_NOT_PROVEN_OPTIMAL rather than claiming a "
+        "global optimum. Its cause is not yet identified: tightening the rank "
+        "domain and big-M 253->16, and breaking source-level cost symmetry, "
+        "each changed the time by under 1%. "
         "If this starts passing, re-freeze the profile and update "
         "stage6/README.md and the roadmap rather than deleting this marker."))
 def test_section_9_5_latency_budget_is_met(frozen):

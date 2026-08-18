@@ -284,9 +284,37 @@ than the 1.41x latency miss: latency degrades a service, but an unproven optimum
 degrades the central claim. The system does report it honestly — the status
 becomes `FEASIBLE_NOT_PROVEN_OPTIMAL` rather than silently returning a
 non-optimal plan labelled optimal — so this is a documented limit rather than a
-defect. Raising it needs solver strategy work (the deterministic tie-break
-currently freezes producer bits in 30-bit chunks, so solver calls scale with
-graph width), not a larger time limit.
+defect. A larger time limit would not fix it.
+
+### Where the time actually goes, measured
+
+An earlier version of this section (and of the xfail reason) attributed both
+the latency miss and this wall to the deterministic tie-break freezing producer
+bits in 30-bit chunks. **That was wrong, and instrumenting the solver refutes
+it.** Per-call timings:
+
+| graph | solver calls | per-call seconds |
+|---|---|---|
+| 126 invocations | 11 | `0.10, 4.89, 0.03, 0.02, 0.01 x 7` |
+| 254 invocations | 2 | `0.21, 29.68` (limit) |
+
+The nine tie-break chunk calls total about 0.1 s -- roughly 1.4% of solver
+time. **One call, the primary cost MILP, is the entire bottleneck**: 4.89 s of
+the 5.08 s spent in the solver at 126 invocations, and at 254 it alone exhausts
+the 30 s budget, which is why only two calls occur there.
+
+Three candidate causes were tested and each refuted:
+
+| hypothesis | test | result |
+|---|---|---|
+| big-M / rank domain too loose | rank upper bound and big-M tightened from 253 to 16 | 33.68 s -> 33.68 s, no change |
+| permutation symmetry across slots | source-level costs made distinct per slot, optimum preserved | 33.71 s, no change |
+| tie-break chunking | per-call instrumentation | ~0.1 s total, not material |
+
+So the cause of the primary solve's scaling is **still unidentified**, and that
+is recorded as an open question rather than guessed at again. Symmetry at the
+*upper* levels was not tested and remains the most plausible remaining
+candidate.
 
 
 ## The evidence gate, decided
