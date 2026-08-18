@@ -287,3 +287,44 @@ non-optimal plan labelled optimal — so this is a documented limit rather than 
 defect. Raising it needs solver strategy work (the deterministic tie-break
 currently freezes producer bits in 30-bit chunks, so solver calls scale with
 graph width), not a larger time limit.
+
+
+## The evidence gate, decided
+
+The other half of the Stage-6 gate is evidence, and the instruction for it was
+to *decide* it rather than relabel conformance evidence as science.
+
+**Decision: Stage 6 makes no empirical quality claim, and
+`stage2/wind_evidence_pack_v1.json` stays `UNAVAILABLE`.**
+
+No reviewed, immutable, held-out reference observations exist for wind. None
+were manufactured to close the gate, and the synthetic fixtures that drive the
+Stage-6 slice are *conformance* data -- they exercise the machinery, they are
+not measurements of ERA5, WRF, or any real wind product. The pack records that
+directly: `scope.status: UNFROZEN` because no AOI, time window, vertical scope
+or validation regime was ever reviewed; `reference_observations.reason_code:
+NO_REVIEWED_IMMUTABLE_HELD_OUT_REFERENCE`; every entry in `empirical_claims` at
+`status: UNKNOWN` with a null estimate and a null bound; and the legacy
+`quality.trust_tier` string quarantined, because a catalog label is not
+evidence.
+
+What was missing was not honesty in the file but a **binding between the file
+and the system**. The pack declared `quality_sensitive_request:
+CHOICE_REQUIRED`, and Stage 6 did behave that way, but nothing connected the
+two. Either could have drifted -- the resolver relaxed into auto-selecting on
+quality, or the policy edited -- and no test would have disagreed. That is
+exactly how conformance evidence becomes science by accident.
+
+`tests/test_stage2_evidence_pack.py` now closes it:
+
+- no empirical claim may carry an estimate, a bound, or a reference manifest,
+  so `UNAVAILABLE` cannot quietly acquire a number underneath it;
+- the declared `decision_policy` is asserted against the running Stage-6 quality
+  path, so the string and the behaviour must agree;
+- the scope must stay `UNFROZEN`, so no result can be generalised beyond a
+  review that never happened.
+
+The gate is therefore **decided and closed as a recorded non-claim**, not as a
+pass. Populating it needs real held-out observations and a reviewed validation
+regime; until those exist, quality-sensitive requests return `CHOICE_REQUIRED`
+and a human makes the call.

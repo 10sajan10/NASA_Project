@@ -58,7 +58,11 @@ The next stage is **Composition MVP release review**, in this order:
    budget) and remains a recorded strict-xfail miss. Doing so surfaced a
    larger limit: past ~254 invocations the 30 s solve budget expires before
    optimality is proven, so exact global selection is unavailable at about a
-   quarter of Section 9.5's own 1,000-node cap. See `stage6/README.md`;
+   quarter of Section 9.5's own 1,000-node cap. The **evidence** half is also
+   decided: Stage 6 makes no empirical quality claim and the wind evidence pack
+   stays `UNAVAILABLE`, with new tests binding its declared decision policy to
+   the running system so the file and the behaviour cannot drift apart. See
+   `stage6/README.md`;
 3. gather real-site deployment evidence only when a provisioned private/Slurm
    site is available; and
 4. choose R1/R2 reference-science work or authorized provider validation. Do
@@ -1372,7 +1376,7 @@ Verify branch v2 at 45aaee1, inspect git status, and preserve every listed
 user-owned dirty file. The separate nasa_project_docs repository also has dirty
 README/diagram work; preserve it.
 
-The last independently verified full suite result is 993 passed, 1 skipped,
+The last independently verified full suite result is 997 passed, 1 skipped,
 7 xfailed (Stage-8R working tree, including the Cube projection-authority
 fix). Initially run only bounded tests; do not run WRF-SFIRE, MPI, a real
 Slurm command, or a real remote provider.

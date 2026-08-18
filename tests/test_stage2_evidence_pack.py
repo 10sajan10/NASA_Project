@@ -60,3 +60,68 @@ def test_evidence_gap_ledger_covers_the_pinned_inventory_exactly():
     assert len(pack["empirical_claims"]) == len({
         item["metric_definition_id"] for item in pack["empirical_claims"]
     }) == len(inventory["metrics"])
+
+
+# -- the declared policy must bind the running system --------------------
+
+
+def _pack() -> dict:
+    return json.loads((ROOT / "stage2/wind_evidence_pack_v1.json").read_text())
+
+
+def test_no_empirical_claim_carries_a_number():
+    """The pack may not quietly acquire an estimate it never measured.
+
+    `status: UNAVAILABLE` is only meaningful if nothing underneath it reports a
+    value. A claim with an estimate or a bound would be fabricated science
+    regardless of the status string above it.
+    """
+    claims = _pack()["empirical_claims"]
+    assert claims, "an empty claim list would make this test vacuous"
+    for claim in claims:
+        assert claim["status"] == "UNKNOWN", claim["metric_definition_id"]
+        assert claim["estimate"] is None
+        assert claim["conservative_bound"] is None
+        assert claim["reference_manifest_id"] is None
+        assert claim["reason_code"]
+
+
+def test_the_declared_decision_policy_binds_the_running_system():
+    """The pack declares CHOICE_REQUIRED; Stage 6 must actually do it.
+
+    Without this, the policy is a string in a JSON file. Someone could relax
+    the resolver into auto-selecting on quality, or edit this policy, and
+    nothing would disagree -- which is precisely how conformance evidence gets
+    relabelled as science.
+    """
+    from objectives import ObjectiveStatus
+    from tests.test_stage6_integration import quality_request
+    import stage6.fixtures as fx
+
+    policy = _pack()["decision_policy"]
+    assert policy["quality_sensitive_request"] == "CHOICE_REQUIRED"
+
+    outcome = quality_request(fx.make_stage6_fixture())
+    assert outcome.status.value == policy["quality_sensitive_request"]
+    assert outcome.status is ObjectiveStatus.CHOICE_REQUIRED
+    # The system did not choose, and did not claim it could rank.
+    assert outcome.resolution is None
+    assert outcome.report.ranking_complete is False
+    assert outcome.report.nondominance_claimed is False
+
+
+def test_cost_selection_is_gated_behind_hard_constraints_as_declared():
+    policy = _pack()["decision_policy"]
+    assert policy["cost_selection"] == (
+        "ONLY_AFTER_HARD_COMPATIBILITY_CONSTRAINTS_PASS")
+
+
+def test_the_scope_is_unfrozen_so_no_result_may_be_generalised():
+    """An unfrozen scope means no AOI/window/regime was ever reviewed."""
+    pack = _pack()
+    assert pack["status"] == "UNAVAILABLE"
+    assert pack["scope"]["status"] == "UNFROZEN"
+    assert pack["reference_observations"]["status"] == "UNAVAILABLE"
+    assert pack["reference_observations"]["manifest_id"] is None
+    assert pack["reference_observations"]["reason_code"] == (
+        "NO_REVIEWED_IMMUTABLE_HELD_OUT_REFERENCE")
