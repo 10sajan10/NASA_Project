@@ -80,6 +80,22 @@ The next stage is **Composition MVP release review**, in this order:
    Cube v3 entries path, which already carries a per-entry grid. Ask before
    touching the adapter.
 
+   **The entries route is blocked by a second wall.** Cube v3 entries are only
+   publishable through an authoritative RuntimeStore artifact, and
+   `engine/runtime/artifacts.py` accepts `application/json` only. A 2130x2130
+   fire mesh as JSON is roughly 4.5M numbers parsed and validated in full, so
+   there is no viable binary payload path today. Either route therefore needs
+   a deliberate extension: a general CRS on `SimulationGrid`, or a binary
+   artifact media type.
+
+   What is unblocked and done: producers can now declare a native grid from
+   configuration (`models.wrf_georeference.native_grid_from_scenario`), which
+   is what the launch gate consumes. That declaration is deliberately *not*
+   authoritative -- WPS snaps the domain centre, so a requested centre of
+   (-96.81, 32.78) produced a run at (-96.808891, 32.779987), 103.8 m out in
+   longitude, more than one 90 m fire cell. Preflight with it; never publish
+   with it.
+
 ## First instructions for the next instance
 
 1. Read this file completely.
@@ -1388,7 +1404,7 @@ Verify branch v2 at 45aaee1, inspect git status, and preserve every listed
 user-owned dirty file. The separate nasa_project_docs repository also has dirty
 README/diagram work; preserve it.
 
-The last independently verified full suite result is 1004 passed, 1 skipped,
+The last independently verified full suite result is 1012 passed, 1 skipped,
 7 xfailed (Stage-8R working tree, including the Cube projection-authority
 fix). Initially run only bounded tests; do not run WRF-SFIRE, MPI, a real
 Slurm command, or a real remote provider.

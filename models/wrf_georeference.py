@@ -295,7 +295,89 @@ __all__ = [
     "WrfGeoreferenceError",
     "WrfGeoreferenceUnverified",
     "crs_token",
+    "native_grid_from_scenario",
     "georeference_from_dataset",
     "proj4_string",
     "read_wrf_georeference",
 ]
+
+
+def _innermost_fire_domain(scenario: Any) -> tuple[int, Any]:
+    """The domain SFIRE runs on: the finest one declaring a fire mesh."""
+    candidates = [(index, domain)
+                  for index, domain in enumerate(scenario.domains)
+                  if getattr(domain, "sr", 0) and domain.sr > 0]
+    if not candidates:
+        raise WrfGeoreferenceError(
+            "no configured domain declares a fire mesh (sr > 0), so there is "
+            "no fire grid to publish")
+    return candidates[-1]
+
+
+def _domain_origin(scenario: Any, index: int) -> tuple[float, float]:
+    """Projected (x_left_edge, y_top_edge) of a domain, from config alone.
+
+    The mother domain is centred on the projection origin, so its edges follow
+    from its own extent.  Each nest is then placed by its 1-based parent start
+    indices, which is how WPS positions it.
+    """
+    parent = scenario.domains[0]
+    x_left = -parent.nx * parent.dx_m / 2.0
+    y_top = parent.ny * parent.dx_m / 2.0
+    for level in range(1, index + 1):
+        domain = scenario.domains[level]
+        outer = scenario.domains[level - 1]
+        x_left += (domain.i_parent_start - 1) * outer.dx_m
+        y_top -= (domain.j_parent_start - 1) * outer.dx_m
+    return x_left, y_top
+
+
+def native_grid_from_scenario(scenario: Any, *, fire: bool = True
+                              ) -> GridDescriptor:
+    """Declare a WRF domain's native grid from configuration, before it runs.
+
+    This is the producer-side declaration the publication preflight needs. It
+    is derived only from what the scenario already fixes -- projection centre,
+    domain resolutions, nest placement, fire refinement -- so it is available
+    at launch rather than after a 48-hour run.
+
+    It is a *declaration*, not evidence, and it is measurably not exact. WPS
+    snaps the domain centre to the grid: a scenario requesting
+    (-96.81, 32.78) produced a run centred at (-96.808891, 32.779987), which
+    is 103.8 m in longitude -- more than one 90 m fire cell.
+
+    So this is usable to preflight a launch and never as the georeference for
+    publication. :func:`read_wrf_georeference`, which verifies real output
+    against its own ``XLONG``/``XLAT``, remains the authority.
+    """
+    if not getattr(scenario, "domains", None):
+        raise WrfGeoreferenceError("scenario declares no domains")
+    projection = str(getattr(scenario, "map_proj", "lambert")).lower()
+    if projection != "lambert":
+        raise WrfGeoreferenceError(
+            f"map_proj {projection!r} is not modelled here; refusing to guess "
+            "a projection for output that would then be placed on a cube")
+    centre_lat = float(scenario.center_lat)
+    centre_lon = float(scenario.center_lon)
+    # WPS defaults truelat1/truelat2/stand_lon to the domain centre when the
+    # scenario does not override them, which is what this configuration does.
+    attrs = {
+        "MAP_PROJ": 1,
+        "TRUELAT1": centre_lat,
+        "TRUELAT2": centre_lat,
+        "MOAD_CEN_LAT": centre_lat,
+        "STAND_LON": centre_lon,
+    }
+    token = crs_token(attrs)
+
+    if fire:
+        index, domain = _innermost_fire_domain(scenario)
+        cell = domain.dx_m / domain.sr
+        shape = (domain.ny * domain.sr, domain.nx * domain.sr)
+    else:
+        index = len(scenario.domains) - 1
+        domain = scenario.domains[index]
+        cell = domain.dx_m
+        shape = (domain.ny, domain.nx)
+    x_left, y_top = _domain_origin(scenario, index)
+    return _grid(token, shape, x_left, y_top, cell)
