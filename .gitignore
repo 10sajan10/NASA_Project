@@ -49,6 +49,7 @@ cube_snapshots/
 runs/
 events/
 .asteroid7d_logpath
+.burncheck_logpath
 Architect
 
 # OS/editor noise

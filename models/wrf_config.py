@@ -389,6 +389,7 @@ class NamelistBuilder:
  biomass_burn_opt        = {self._per_dom(1)}
  plumerisefire_frq       = {self._per_dom(30)}
  aer_ra_feedback         = {self._per_dom(0)}
+ aer_op_opt              = {self._per_dom(0)}
  have_bcs_chem           = {self._per_dom(".false.")}
  /
 """
@@ -436,9 +437,17 @@ class NamelistBuilder:
  &fire
  ifire                   = {self._row(ifire_row)}
  fire_fuel_read          = {self._per_dom(s.fire_fuel_read)}
- fire_num_ignitions      = {self._per_dom(0)}
- fire_tign_in_time       = {s.fire_tign_in_time:.3f},
- fire_print_msg          = 0,
+ fire_num_ignitions      = {self._per_dom(1)}
+ fire_ignition_start_lon1 = {self._per_dom(f"{s.center_lon:.5f}")}
+ fire_ignition_start_lat1 = {self._per_dom(f"{s.center_lat:.5f}")}
+ fire_ignition_end_lon1   = {self._per_dom(f"{s.center_lon:.5f}")}
+ fire_ignition_end_lat1   = {self._per_dom(f"{s.center_lat:.5f}")}
+ fire_ignition_radius1    = {self._per_dom(7000)}
+ fire_ignition_start_time1 = {self._per_dom(30)}
+ fire_ignition_end_time1  = {self._per_dom(90)}
+ fire_ignition_ros1       = {self._per_dom(2000)}
+ fire_tign_in_time       = {self._per_dom(f"{s.fire_tign_in_time:.3f}")}
+ fire_print_msg          = {self._per_dom(1)}
  fire_print_file         = 0,
  fmoist_run              = .true.,
  fmoist_interp           = .true.,
@@ -450,7 +459,7 @@ class NamelistBuilder:
  fire_fuel_left_method   = 1,
  fire_fuel_left_irl      = 2,
  fire_fuel_left_jrl      = 2,
- fire_atm_feedback       = {s.fire_atm_feedback},
+ fire_atm_feedback       = {self._per_dom(s.fire_atm_feedback)}
  fire_grows_only         = 1,
  fire_viscosity          = 0.4,
  fire_upwinding          = 3,

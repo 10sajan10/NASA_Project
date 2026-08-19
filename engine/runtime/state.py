@@ -1453,6 +1453,30 @@ class RuntimeStore:
                 "WHERE s.run_id=? AND s.task_id=? AND s.output_name=?",
                 (run_id, task_id, output_name)).fetchone()
 
+    def task_input_artifact_ids(
+            self, run_id: str, task_id: str) -> tuple[tuple[str, str], ...]:
+        """Return exact committed inputs under their runtime port names."""
+        with self.connect() as con:
+            internal = con.execute(
+                "SELECT d.input_name,s.artifact_id FROM task_dependencies d "
+                "JOIN task_output_slots s ON s.run_id=d.run_id "
+                "AND s.task_id=d.upstream_task_id "
+                "AND s.output_name=d.upstream_output "
+                "WHERE d.run_id=? AND d.downstream_task_id=?",
+                (run_id, task_id),
+            ).fetchall()
+            external = con.execute(
+                "SELECT input_name,artifact_id FROM task_external_inputs "
+                "WHERE run_id=? AND task_id=?",
+                (run_id, task_id),
+            ).fetchall()
+        values = tuple(sorted(
+            ((str(row[0]), str(row[1])) for row in (*internal, *external)),
+            key=lambda value: value[0]))
+        if len({value[0] for value in values}) != len(values):
+            raise RuntimeError("runtime task input port identity is ambiguous")
+        return values
+
     def committed_external_artifact(
             self, artifact_id: str) -> CommittedExternalArtifact:
         """Resolve one artifact only through an authoritative Stage-1 commit.

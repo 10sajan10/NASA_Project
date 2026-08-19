@@ -37,6 +37,7 @@ from grid_convention import (
 )
 
 from .identity import strict_canonical_json, strict_hash
+from .native import NATIVE_FILE_POINTER_VALIDATOR_KIND, NativeFilePointer
 from .state import AttemptRecord, RuntimeStore
 from .types import ArtifactRecipe, AttemptSpec, AttemptState, TaskState
 
@@ -423,6 +424,7 @@ class ArtifactCommitter:
         checksum_passed = False
         strict_json_passed = False
         field_validation_passed: bool | None = None
+        native_pointer_passed: bool | None = None
         error: str | None = None
         decoded_type: str | None = None
         try:
@@ -436,6 +438,10 @@ class ArtifactCommitter:
                 validator_id = "stage8r.field-json@2"
                 _validate_field_configuration(configuration)
                 field_validation_passed = False
+            elif configuration == {
+                    "kind": NATIVE_FILE_POINTER_VALIDATOR_KIND}:
+                validator_id = "stage10c.native-file-pointer@1"
+                native_pointer_passed = False
             else:
                 validator_id = "stage1.unsupported-validator@1"
                 raise InvalidArtifactError(
@@ -453,6 +459,11 @@ class ArtifactCommitter:
             if configuration.get("kind") == FIELD_JSON_VALIDATOR_KIND:
                 _validate_field_json_v2(value, configuration)
                 field_validation_passed = True
+            elif configuration.get("kind") == \
+                    NATIVE_FILE_POINTER_VALIDATOR_KIND:
+                pointer = NativeFilePointer.from_dict(value)
+                pointer.verify_file()
+                native_pointer_passed = True
             passed = True
         except (InvalidArtifactError, UnicodeError, json.JSONDecodeError,
                 OSError, ValueError) as exc:
@@ -476,6 +487,7 @@ class ArtifactCommitter:
                 "immutable_object_checksum": checksum_passed,
                 "strict_finite_json": strict_json_passed,
                 "field_json_v2": field_validation_passed,
+                "native_file_pointer_v1": native_pointer_passed,
             },
             "passed": passed,
         }

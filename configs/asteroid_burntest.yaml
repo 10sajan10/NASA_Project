@@ -36,7 +36,7 @@ time:
 fire:
   ifire: 1
   fire_atm_feedback: 1.0
-  fire_tign_in_time: 1.0
+  fire_tign_in_time: 0.0            # 0 = native ignition mode (TIGN-replay OFF; module_fr_sfire_model.F:360)
 
 chem:
   smoke: true

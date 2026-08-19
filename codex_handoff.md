@@ -1,11 +1,137 @@
 # Codex Project Handoff
 
-Last updated: 2026-08-18 (Stage 8R remediation and bounded same-node
-operational closeout implemented; real-site evidence external; Stage 9B blocked)
+Last updated: 2026-08-18 (Stage 10B durable target/artifact automation
+implemented on the bounded local-file path)
 
 This is the durable handoff for a new AI session. Treat the repository,
 tests, and roadmap as authoritative; the old chat transcript is supporting
 context only.
+
+## 2026-08-18 Stage 10C runtime-event bridge update
+
+Stage 10C is implemented and uncommitted on top of Stages 10A/10B. The current
+base remains branch `v2` at `161b35f`.
+
+- `engine/runtime/native.py` defines the content-addressed `NativeFilePointer`.
+  It binds an absolute path, media type, exact digest/size, and immutable
+  metadata, and verifies a stable regular file with no symlink.
+- The closed `native.file_pointer.v1` worker operation validates that file and
+  returns only the small JSON pointer. The native payload is not copied into
+  the Stage-1 object store.
+- `ArtifactCommitter` has an explicit `native_file_pointer_v1` validator. Task
+  completion still crosses the ordinary fenced Stage-1 authoritative commit;
+  process exit or a loose file is never enough.
+- `RuntimeArtifactEventBridge` observes only committed outputs, replays the
+  full `ArtifactDescriptor` from `ScientificArtifactBinding`, derives input
+  lineage from authoritative runtime slots, verifies the native bytes again,
+  and emits the Stage-10B event.
+- `WorkflowController` has an additive commit-observer seam. A terminal run is
+  rescanned on restart, so a crash after Stage-1 commit but before event
+  creation converges without rerunning the scientific task.
+
+Evidence: **193 passing** in the current focused slice spanning Stage-1
+runtime/provider, Stage-2 matching/capabilities, Stage-3 discovery/MILP/
+validator/integration, Cube entries/projection, and Stages 10A/10B/10C. The
+Stage-10C subset adds four adversarial tests for normal subprocess publication,
+missed-observer restart, idempotent terminal replay, descriptor/media mismatch,
+and native-file mutation. The runnable demo reports Stage-1 `SUCCEEDED`, target
+cost `3 -> 0`, `native_location_unchanged=true`, and no native payload copy,
+transformation, or Cube write.
+
+Boundaries: local regular files and same-node Stage-1/SQLite authorities only;
+an actual model adapter must still create the native file and complete
+scientific binding; graph admission remains the existing trusted compiler
+boundary; cross-database convergence is replayable rather than atomic. No WRF,
+MPI, Slurm, network, reprojection, transformation, or heavy workload ran.
+
+New files: `engine/runtime/native.py`, `artifacts/runtime.py`, `stage10c/`,
+`scripts/run_stage10c_demo.py`, and `tests/test_stage10c_runtime_artifacts.py`.
+The controller/state/operations/artifact-validator edits are additive. Preserve
+the pre-existing WRF/config dirt when reviewing or committing.
+
+## 2026-08-18 Stage 10B durable automation update
+
+Stage 10B is implemented but uncommitted on top of the also-uncommitted Stage
+10A tree. The current checked-out branch is `v2` at base commit `161b35f`.
+It adds:
+
+- `ArtifactTargetCoordinator`, a separate SQLite control store for immutable
+  `TargetRequest` values, current target status/revision, portable workflow
+  manifests, and content-addressed artifact-output events;
+- the replayable event state machine `PENDING -> REGISTERED -> APPLIED`.
+  Artifact publication and the coordinator are deliberately separate
+  transactions, but both crash windows converge idempotently on restart;
+- automatic re-resolution of all durable targets after an output event is
+  registered. The acceptance fixture changes the same persisted target from a
+  cost-3 two-invocation producer plan to a cost-0 native artifact selection;
+- `WorkflowManifest`, strict standalone canonical JSON carrying full root
+  requirements, selected bound invocations, satisfaction bindings, native
+  artifact records, discovery context, selected plan ID, and cost;
+- normalized SQLite metadata indexes for the complete scientific descriptor
+  summary and producer/output identity; and
+- durable stat/content verification receipts. The default re-hashes on stat
+  fingerprint change; `ALWAYS_REHASH` is available for stronger local checks.
+
+Evidence: Stage 10A+10B focused tests are 20 passing. The current cross-stage
+slice is **169 passing** across Stage 2 contracts/capabilities, Stage 3
+discovery/MILP/validator/integration, Stage 10A/10B, and Cube
+entries/projection. `scripts/run_stage10b_demo.py` deliberately simulates a
+crash after artifact registration while the event remains PENDING, rebuilds
+the services from disk, replays once, and reaches `SATISFIED_BY_ARTIFACT`
+without a payload copy, transformation, reprojection, or Cube write.
+
+Boundaries: trusted same-node SQLite and regular files; target fanout currently
+rescans all durable targets; a stat fingerprint is not hostile-writer proof;
+producer metadata must be a complete `ArtifactDescriptor`; and the generic
+outbox API is not yet emitted by Stage-1 binary output automatically. No WRF,
+MPI, Slurm, network provider, transformation, or heavy workload ran.
+
+New files: `artifacts/{manifest,coordinator}.py`, `stage10b/`,
+`scripts/run_stage10b_demo.py`, and `tests/test_stage10b_automation.py`.
+`ArtifactRegistry` gained indexed metadata and verification receipts. Preserve
+all pre-existing user-owned WRF/config edits when reviewing or committing.
+
+## 2026-08-18 Stage 10A artifact-automation update
+
+The immediate user objective was narrowed deliberately: generate a workflow
+from typed targets and point to scientifically compatible native data, without
+reprojection, transformation, payload copying, or Cube/Zarr storage.  The
+authoritative concept is now explicit: an **artifact** is the immutable data
+product; a catalog/registry is only its searchable index.
+
+Stage 10A adds `artifacts/`:
+
+- `ArtifactRecord` binds the full `ArtifactDescriptor`, exact canonical local
+  path, content digest, size, media type, producer/version/output port, input
+  lineage, evidence reference, and immutable metadata.
+- `ArtifactRegistry` verifies native files and persists only metadata/pointers.
+  Each snapshot rechecks content. Missing or changed bytes are `UNAVAILABLE`.
+- `ArtifactWorkflowResolver` refreshes the registry on every request, converts
+  its records to committed `ArtifactLeaf` candidates, and invokes the existing
+  Stage-3 discovery/MILP/independent-validator path. Its default direct-only
+  policy refuses transformation and acquisition-materialization capabilities.
+- The Cube-independent `output_arrived()` hook automatically registers typed
+  `DatasetRef` events. `ProducerV2` also registers into the same attached
+  registry on the retained Cube publisher bridge. Missing descriptors,
+  concept/unit disagreements, wrong paths, and changed bytes fail closed.
+- The returned `ArtifactWorkflowOutcome` includes exact selected record IDs and
+  native locations in addition to the validated resolution identity.
+
+Focused evidence: `tests/test_stage10a_artifacts.py` passes 13 tests, including
+the complete loop: request selects producer derivation at cost 3; a native file
+arrives and is registered with no array write; the next request selects the
+artifact at cost 0. Stage-2/3 regression evidence is 113 passing, and the seven
+existing native-`DatasetRef` focused tests pass.
+
+Boundaries: local files/SQLite only; all records are re-hashed per request;
+producer-supplied typed metadata is mandatory; no general Stage-1 binary-output
+bridge, remote object inventory, WRF, MPI, Slurm, network, transformation, or
+reprojection was exercised. See `stage10a/README.md`.
+
+Runnable proof: `.venv/bin/python scripts/run_stage10a_demo.py --workspace
+/tmp/stage10a-demo` reports producer cost `3` before arrival and artifact cost
+`0` afterward, with `array_payload_written=false` and
+`transformations_selected=false`.
 
 ## 2026-08-18 current handoff — supersedes older status claims below
 

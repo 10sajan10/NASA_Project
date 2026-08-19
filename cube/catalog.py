@@ -375,8 +375,7 @@ class Catalog:
         self._insert_entry_rows(entry, depth)
         return self.entry(entry.entry_id)
 
-    def register_dataset(self, entry: CubeEntry, path, *,
-                         verify: bool = True) -> CubeEntry:
+    def register_dataset(self, entry: CubeEntry, path) -> CubeEntry:
         """Catalog a file that already exists, without copying or converting it.
 
         This is the catalog-of-files path: WRF-SFIRE writes netCDF, a driver
@@ -391,22 +390,25 @@ class Catalog:
         file exists at a path with the recorded digest, which is what a catalog
         of external outputs can honestly claim.
         """
-        located = Path(path)
+        located = Path(path).resolve()
         if not entry.location:
             raise ValueError(
                 "a registered dataset must record its location, or it can be "
                 "described but never retrieved")
-        if verify:
-            if not located.is_file():
-                raise FileNotFoundError(f"no dataset at {located}")
-            digest = hashlib.sha256()
-            with located.open("rb") as stream:
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(block)
-            if digest.hexdigest() != entry.content_sha256:
-                raise ValueError(
-                    f"{located} does not match its recorded content digest; "
-                    "the catalog would point at bytes that changed")
+        recorded_location = Path(entry.location).resolve()
+        if recorded_location != located:
+            raise ValueError(
+                "registered dataset path must equal the catalogued location")
+        if not located.is_file():
+            raise FileNotFoundError(f"no dataset at {located}")
+        digest = hashlib.sha256()
+        with located.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != entry.content_sha256:
+            raise ValueError(
+                f"{located} does not match its recorded content digest; "
+                "the catalog would point at bytes that changed")
         # A discovery box is derivable from the grid the entry already
         # declares, so an entry is never left unsearchable by omission.
         if entry.bbox_lonlat is None and entry.grid is not None:

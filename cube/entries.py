@@ -34,7 +34,7 @@ from enum import Enum
 from typing import Any
 
 from contracts.identity import strict_hash
-from contracts.types import GridDescriptor
+from contracts.types import ArtifactDescriptor, GridDescriptor
 
 
 class ResolutionPolicy(str, Enum):
@@ -258,6 +258,14 @@ class DatasetRef:
     grid: GridDescriptor | None = None
     detail: dict = dataclasses.field(default_factory=dict)
     inputs: tuple[EntryInput, ...] = ()
+    #: Full scientific metadata used by the automatic artifact registry.
+    #: Legacy catalog-only callers may omit it, but a Cube with artifact
+    #: automation enabled fails closed rather than inventing metadata.
+    descriptor: ArtifactDescriptor | None = None
+    producer_version: str = "unknown"
+    output_port_id: str = "result"
+    evidence_profile_id: str = "evidence:unknown"
+    artifact_inputs: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.path:
@@ -268,6 +276,29 @@ class DatasetRef:
                 "consumer cannot know how to read it")
         if self.grid is not None and not isinstance(self.grid, GridDescriptor):
             raise TypeError("dataset reference grid must be a GridDescriptor")
+        if self.descriptor is not None:
+            if not isinstance(self.descriptor, ArtifactDescriptor):
+                raise TypeError(
+                    "dataset reference descriptor must be ArtifactDescriptor")
+            if self.descriptor.representation != self.media_type:
+                raise ValueError(
+                    "dataset media type and descriptor representation disagree")
+            if self.grid is not None and self.descriptor.grid != self.grid:
+                raise ValueError(
+                    "dataset grid and descriptor grid disagree")
+        for value, label in (
+                (self.producer_version, "producer version"),
+                (self.output_port_id, "output port"),
+                (self.evidence_profile_id, "evidence profile")):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"dataset reference {label} must be text")
+        if (not isinstance(self.artifact_inputs, tuple)
+                or not all(isinstance(value, tuple) and len(value) == 2
+                           and all(isinstance(item, str) and item
+                                   for item in value)
+                           for value in self.artifact_inputs)):
+            raise TypeError(
+                "dataset artifact_inputs must be (port_id, artifact_id) pairs")
 
 
 class ProjectionAuthority:

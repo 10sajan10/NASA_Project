@@ -26,12 +26,19 @@ from .grid import SimulationGrid
 
 
 class Cube:
-    def __init__(self, root: Path | str, grid: SimulationGrid):
+    def __init__(self, root: Path | str, grid: SimulationGrid, *,
+                 artifact_registry=None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "cube").mkdir(exist_ok=True)
         self.grid = grid
         self.catalog = Catalog(self.root / "catalog.duckdb")
+        # The artifact registry is metadata-only.  Native DatasetRef outputs
+        # remain at their producer path and are never copied into this Cube.
+        # Passing ``None`` preserves legacy callers; Stage 10A services attach
+        # an ArtifactRegistry explicitly and then every DatasetRef is required
+        # to carry a complete ArtifactDescriptor.
+        self.artifact_registry = artifact_registry
         # save grid for reproducibility
         grid.save(self.root / "grid.json")
 

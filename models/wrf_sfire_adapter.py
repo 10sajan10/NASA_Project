@@ -378,12 +378,23 @@ class WRFSFireAdapter(ModelAdapter):
         ``ignition_t0`` and set it on the scenario before rendering.
         Returns the value so TIGN_IN injection can clamp to it.
         """
-        ign = np.asarray(inputs["ignition_t0"], dtype="float32")
-        finite = ign[np.isfinite(ign) & (ign >= 0)]
-        max_ign = float(finite.max()) if finite.size else 0.0
-        fire_tign_in_time = max_ign + 1.0
-
         scenario = getattr(self.namelist_builder, "scenario", None)
+        configured = getattr(scenario, "fire_tign_in_time", None)
+
+        if configured is not None and configured <= 0.0:
+            # Native-ignition mode: the scenario explicitly disables TIGN_IN
+            # replay (fire_tign_in_time <= 0). SFIRE then ignites from the
+            # &fire fire_num_ignitions lines instead. TIGN_IN replay and line
+            # ignitions are mutually exclusive (module_fr_sfire_model.F:360).
+            fire_tign_in_time = 0.0
+        else:
+            # TIGN_IN replay mode: the threshold must sit just above the
+            # latest prescribed ignition time so every ignited cell qualifies.
+            ign = np.asarray(inputs["ignition_t0"], dtype="float32")
+            finite = ign[np.isfinite(ign) & (ign >= 0)]
+            max_ign = float(finite.max()) if finite.size else 0.0
+            fire_tign_in_time = max_ign + 1.0
+
         if scenario is not None:
             scenario.fire_tign_in_time = fire_tign_in_time
         path.write_text(self.namelist_builder.render())

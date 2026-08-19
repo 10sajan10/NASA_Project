@@ -236,18 +236,60 @@ class ProducerV2(ABC):
         from cube.entries import CubeEntry
 
         located = Path(ref.path)
-        digest = hashlib.sha256()
-        with located.open("rb") as stream:
-            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-                digest.update(block)
+        artifact_record = None
+        artifact_registry = getattr(cube, "artifact_registry", None)
+        if artifact_registry is not None:
+            if ref.descriptor is None:
+                raise ValueError(
+                    f"{self.name}:{spec.name}: automatic artifact registration "
+                    "requires DatasetRef.descriptor")
+            if ref.descriptor.concept_id != spec.name:
+                raise ValueError(
+                    "dataset descriptor concept does not match produced port")
+            if ref.descriptor.units != spec.units:
+                raise ValueError(
+                    "dataset descriptor units do not match producer contract")
+            from artifacts.records import ArtifactInput
+            artifact_record = artifact_registry.register_file(
+                located,
+                ref.descriptor,
+                media_type=ref.media_type,
+                producer_id=self.name,
+                producer_version=ref.producer_version,
+                output_port_id=ref.output_port_id,
+                inputs=tuple(ArtifactInput(*value)
+                             for value in ref.artifact_inputs),
+                evidence_profile_id=ref.evidence_profile_id,
+                metadata=ref.detail,
+            )
+            content_sha256 = artifact_record.content_sha256
+        else:
+            digest = hashlib.sha256()
+            with located.open("rb") as stream:
+                for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                    digest.update(block)
+            content_sha256 = digest.hexdigest()
         detail = dict(ref.detail)
         detail.setdefault("units", spec.units)
         detail.setdefault("description", spec.description)
+        if artifact_record is not None:
+            detail["artifact_record_id"] = artifact_record.record_id
+            detail["artifact_id"] = artifact_record.artifact_id
+            detail["artifact_descriptor_id"] = (
+                artifact_record.descriptor.descriptor_id)
+        descriptor = ref.descriptor
+        temporal = descriptor.temporal_support if descriptor is not None else None
+        time_start = temporal.start if temporal is not None and temporal.start else ""
+        time_end = temporal.end if temporal is not None and temporal.end else ""
         entry = CubeEntry.create(
             concept=spec.name, kind=spec.kind, producer=self.name,
-            content_sha256=digest.hexdigest(), grid=ref.grid,
+            content_sha256=content_sha256,
+            grid=(descriptor.grid if descriptor is not None else ref.grid),
             location=str(located.resolve()), media_type=ref.media_type,
-            detail=detail, inputs=tuple(ref.inputs))
+            detail=detail, inputs=tuple(ref.inputs),
+            time_start=time_start, time_end=time_end,
+            variables=(descriptor.component_names
+                       if descriptor is not None else ()))
         cube.catalog.register_dataset(entry, located)
         return 0
 

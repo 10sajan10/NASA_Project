@@ -32,6 +32,7 @@ from .types import (
 # controller state.
 from .controller import WorkflowController
 from .provider import LocalSubprocessProvider, SubmissionOutcomeUnknown
+from .native import NATIVE_FILE_POINTER_VALIDATOR_KIND, NativeFilePointer
 
 __all__ = [
     "ArtifactRecipe",
@@ -55,5 +56,7 @@ __all__ = [
     "WakeKind",
     "WorkflowController",
     "LocalSubprocessProvider",
+    "NATIVE_FILE_POINTER_VALIDATOR_KIND",
+    "NativeFilePointer",
     "SubmissionOutcomeUnknown",
 ]

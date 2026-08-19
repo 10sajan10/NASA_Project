@@ -178,6 +178,9 @@ runnable, and no stage may claim capability it has not demonstrated.
 | [8](stage8/) | Resource-aware scheduling policy, now driving the controller | policy + bridge |
 | [9A](stage9a/) | Conditional SLURM provider: token recovery, batched reconcile | simulated only |
 | [8R](stage8r/) | Cross-layer authority, replay, recovery, and projection remediation | bounded local gates pass; real-site evidence external |
+| [10A](stage10a/) | Automatic native-artifact registration and target-time discovery | bounded local implementation |
+| [10B](stage10b/) | Durable targets, output-event replay, and automatic re-planning | bounded local implementation |
+| [10C](stage10c/) | Stage-1 commit to durable native-artifact event bridge | bounded local implementation |
 | 9B | WRF integration behind a certified provider | |
 
 Stages 5–8 are deliberately labelled below "done". An external audit found
@@ -202,6 +205,23 @@ the labels now match what is demonstrated. The honest reading:
   expired packets can release only after an exclusive zero-launch proof while
   exact terminal runs remain recoverable. Real-site deployment evidence is
   still external and unclaimed.
+- **Stage 10A** keeps native files at their producer locations. A complete
+  typed `ArtifactRecord` is verified and indexed automatically when a
+  `DatasetRef` arrives; each target request refreshes those records and injects
+  compatible committed artifacts into the normal global resolver. It does not
+  copy, transform, reproject, or store the payload in Cube/Zarr.
+- **Stage 10B** persists typed target requests and native-output events. A
+  crash-safe `PENDING -> REGISTERED -> APPLIED` replay loop registers each
+  content-addressed artifact idempotently, automatically re-resolves durable
+  targets, and writes a portable identity-checked workflow manifest. Metadata
+  search is indexed and snapshot verification re-hashes on stat change. The
+  current bridge is same-node SQLite/local files; Stage-1 binary outputs do not
+  emit those records themselves.
+- **Stage 10C** connects the event stream to the authoritative Stage-1 commit.
+  A closed native-file pointer operation validates producer-owned bytes, the
+  controller commits its receipt under the normal fence, and a replayable
+  observer binds the exact scientific descriptor and runtime lineage before
+  emitting Stage 10B events. The native payload remains at its original path.
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_stage*.py tests/test_cube*.py

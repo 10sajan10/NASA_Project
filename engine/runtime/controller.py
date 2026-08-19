@@ -71,7 +71,9 @@ class WorkflowController:
                  ledger: "ReservationLedger | None" = None,
                  site_id: str | None = None,
                  priority_policy: "PriorityPolicy | None" = None,
-                 observations: "ObservationHistory | None" = None) -> None:
+                 observations: "ObservationHistory | None" = None,
+                 artifact_commit_observer: Callable[
+                     ["WorkflowController", str], None] | None = None) -> None:
         root, fs_type = validate_runtime_root(Path(runtime_root))
         if (isinstance(max_inflight, bool) or not isinstance(max_inflight, int)
                 or max_inflight < 1):
@@ -94,6 +96,7 @@ class WorkflowController:
         self.scheduling_site_id = site_id
         self.priority_policy = priority_policy
         self.observations = observations
+        self.artifact_commit_observer = artifact_commit_observer
         # attempt_id -> claim. Attempt identity includes run and fence, so the
         # same scientific task may execute concurrently in independent runs.
         self._reserved: dict[str, _LiveReservation] = {}
@@ -140,6 +143,7 @@ class WorkflowController:
         self._prune_ready_since()
         current = self.store.run_state(run_id)
         if current is not RunState.RUNNING:
+            self._observe_artifact_commits(run_id)
             return current
         self.store.heartbeat(self.controller_id)
         self.store.consume_due_retry_wakes(run_id)
@@ -188,7 +192,13 @@ class WorkflowController:
                 else:
                     self._release_claim(claim)
 
-        return self.store.finalize_run_state(run_id)
+        finalized = self.store.finalize_run_state(run_id)
+        self._observe_artifact_commits(run_id)
+        return finalized
+
+    def _observe_artifact_commits(self, run_id: str) -> None:
+        if self.artifact_commit_observer is not None:
+            self.artifact_commit_observer(self, run_id)
 
     def run_until_terminal(self, run_id: str, *,
                            timeout_s: float = 30.0) -> RunState:
