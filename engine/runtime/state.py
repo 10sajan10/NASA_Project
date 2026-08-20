@@ -1700,11 +1700,8 @@ class RuntimeStore:
             binding: RegisteredArtifactInputBinding, task: BoundTask):
         """Replay a native registry receipt and its current exact bytes."""
         from artifacts.records import ArtifactRecord
-        record = ArtifactRecord.from_dict(dict(binding.record))
-        if record.media_type != "application/json":
-            raise ValueError(
-                "registered runtime inputs currently support application/json "
-                "only")
+        record = ArtifactRecord.from_dict(strict_json_loads(
+            strict_canonical_json(binding.record)))
         pointer_operation = (
             task.component.operation_key == "native.file_pointer_identity.v1")
         if binding.delivery is RegisteredArtifactDelivery.NATIVE_FILE_POINTER:
@@ -1712,9 +1709,14 @@ class RuntimeStore:
                 raise ValueError(
                     "native pointer delivery is restricted to the closed "
                     "native pointer identity source port")
-        elif pointer_operation:
-            raise ValueError(
-                "native pointer identity requires explicit pointer delivery")
+        else:
+            if pointer_operation:
+                raise ValueError(
+                    "native pointer identity requires explicit pointer delivery")
+            if record.media_type != "application/json":
+                raise ValueError(
+                    "registered JSON_VALUE inputs currently support "
+                    "application/json only")
         verify_native_file(
             record.location,
             content_sha256=record.content_sha256,

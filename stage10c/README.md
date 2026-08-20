@@ -57,8 +57,9 @@ tamper refusal, and native-file mutation refusal.
   authority to be supplied to the new observer. Authority is not inferred from
   a stored graph or caller-authored scientific labels; missing authority fails
   closed.
-- It does not make a target request executable by itself. General
-  `ArtifactLeaf` external-input lowering and automatic target→bind→compile→run
-  orchestration remain future integration work.
+- Stage 10C does not make a target request executable by itself. Stage 10D now
+  implements bounded selected-`ArtifactLeaf` lowering and
+  target→bind→compile→run orchestration for closed supported operations.
+  Arbitrary adapter adoption and background target dispatch remain future work.
 - No WRF, MPI, Slurm, network, transformation, reprojection, Cube write, or
   heavy workload was run.

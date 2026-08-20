@@ -5,17 +5,17 @@ operations used by the Stage-2 conformance slice and independently checks the
 selected producer edges, implementation identities, output ports, deployment
 bindings, and plan identities before creating a runtime graph.
 
-Existing artifact leaves are never disguised as producer tasks.  A root-only
-leaf needs no execution, but the compiler cannot authenticate its commit from
-caller-supplied hashes and therefore reports that verification boundary.  A
-leaf feeding a task remains unsupported until the Stage-1 runtime grows an
-explicit committed-external-input binding.
+Existing artifact leaves are never disguised as producer tasks.  A leaf may
+feed a task only when its exact record is uniquely COMMITTED in the supplied
+registry snapshot and its producer-owned bytes survive a fresh stable,
+no-follow hash.  The resulting external binding remains distinct from a
+Stage-1 artifact commit and is replayed independently by the runtime.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from grid_convention import (
     FIELD_JSON_SCHEMA,
@@ -35,6 +35,7 @@ from engine.runtime.identity import strict_hash
 from engine.runtime.native import (
     NATIVE_FILE_POINTER_VALIDATOR_KIND,
     NativeFilePointer,
+    verify_native_file,
 )
 from engine.runtime.operations import operation_component
 from engine.runtime.types import (
@@ -42,6 +43,8 @@ from engine.runtime.types import (
     InputBinding,
     OutputSpec,
     ResourceRequest,
+    RegisteredArtifactDelivery,
+    RegisteredArtifactInputBinding,
     ScientificArtifactBinding,
     TaskTemplate,
 )
@@ -65,6 +68,9 @@ from acquisition.lowering import (
 )
 
 from .oracle import validate_compatibility_record
+
+if TYPE_CHECKING:
+    from artifacts.records import ArtifactRecord, ArtifactRegistrySnapshot
 
 
 class CompilationStatus(str, Enum):
@@ -93,6 +99,7 @@ class CompilationRecord:
     invocation_task_keys: tuple[tuple[str, str], ...]
     root_artifact_leaf_ids: tuple[str, ...]
     root_bindings: tuple[tuple[str, str, str, str], ...]
+    registered_root_bindings: tuple[tuple[str, str, str, str], ...]
     output_descriptor_bindings: tuple[tuple[str, str, str], ...]
     message: str
 
@@ -107,6 +114,24 @@ class CompilationRecord:
                 != len(self.output_descriptor_bindings)):
             raise ValueError(
                 "output descriptor bindings must be unique and canonical")
+        if (self.registered_root_bindings
+                != tuple(sorted(self.registered_root_bindings))
+                or len({value[0] for value in self.registered_root_bindings})
+                != len(self.registered_root_bindings)):
+            raise ValueError(
+                "registered root bindings must be unique and canonical")
+        root_by_use = {value[0]: value for value in self.root_bindings}
+        for use_id, snapshot_id, record_id, manifest_root \
+                in self.registered_root_bindings:
+            if (any(len(value) != 64
+                    or any(char not in "0123456789abcdef" for char in value)
+                    for value in (
+                        use_id, snapshot_id, record_id, manifest_root))
+                    or root_by_use.get(use_id) != (
+                        use_id, "VERIFIED_REGISTERED_ARTIFACT",
+                        record_id, manifest_root)):
+                raise ValueError(
+                    "registered root coordinate conflicts with root binding")
         if self.status is CompilationStatus.COMPILED:
             if (self.deployment_plan_id is None
                     or self.stage1_graph_id is None
@@ -116,8 +141,10 @@ class CompilationRecord:
                     != {value[0] for value in self.output_descriptor_bindings}):
                 raise ValueError(
                     "compiled record must describe every invocation output")
-        elif self.stage1_graph_id is not None:
-            raise ValueError("non-compiled result cannot name a Stage-1 graph")
+        elif (self.stage1_graph_id is not None
+              or self.registered_root_bindings):
+            raise ValueError(
+                "non-compiled result cannot name runtime artifact authority")
 
     @property
     def record_id(self) -> str:
@@ -131,6 +158,8 @@ class CompilationRecord:
                                      for value in self.invocation_task_keys],
             "root_artifact_leaf_ids": list(self.root_artifact_leaf_ids),
             "root_bindings": [list(value) for value in self.root_bindings],
+            "registered_root_bindings": [
+                list(value) for value in self.registered_root_bindings],
             "output_descriptor_bindings": [
                 list(value) for value in self.output_descriptor_bindings],
             "message": self.message,
@@ -267,6 +296,8 @@ def compile_bound_plan(
     execution_profiles: Iterable[ExecutionProfile] = (),
     root_uses: Iterable[RequirementUse] = (),
     artifact_leaves: Iterable[ArtifactLeaf] = (),
+    artifact_snapshot: ArtifactRegistrySnapshot | None = None,
+    artifact_records: Iterable[ArtifactRecord] = (),
     evidence_snapshot: EvidenceSnapshot | None = None,
 ) -> CompilationResult:
     """Compile a validated bound derivation to exactly one task per invocation."""
@@ -327,7 +358,7 @@ def compile_bound_plan(
     _validate_plan_shape(
         plan, invocation_by_id, satisfactions, selected, leaf_ids,
         root_use_by_id, artifact_leaf_by_id, evidence_snapshot)
-    leaf_consumed_by_invocation = False
+    artifact_record_values = tuple(artifact_records)
     for invocation in invocation_by_id.values():
         for use in invocation.input_uses:
             binding = satisfactions.get(use.requirement_use_id)
@@ -345,21 +376,34 @@ def compile_bound_plan(
                     invocation_by_id,
                     deployment_plan,
                 )
-            if binding.kind is SatisfactionKind.PRODUCERS and any(
-                    output.producer_kind is ProducerKind.ARTIFACT_LEAF
-                    for output in binding.outputs):
-                leaf_consumed_by_invocation = True
-
-    if leaf_consumed_by_invocation:
-        return _noncompiled(
+    # Every artifact selected beside executable work is part of the scientific
+    # result, even when it satisfies another root directly rather than feeding
+    # a task.  Authenticate the complete selected leaf set so a mixed-root run
+    # cannot report success after an unverified direct artifact disappears.
+    if selected and leaf_ids:
+        if artifact_snapshot is None or not artifact_record_values:
+            return _noncompiled(
+                plan,
+                CompilationStatus.BRIDGE_EXTERNAL_LEAF_UNSUPPORTED,
+                "Executable work was selected alongside ArtifactLeaf results, "
+                "but the compiler was not given their exact committed "
+                "registry snapshot and ArtifactRecord receipts.",
+                leaf_ids,
+                invocation_by_id,
+                deployment_plan,
+            )
+        artifact_record_by_leaf = _verify_external_artifacts(
             plan,
-            CompilationStatus.BRIDGE_EXTERNAL_LEAF_UNSUPPORTED,
-            "A selected ArtifactLeaf feeds an executable invocation; Stage 1 "
-            "does not yet have an exact external-committed-input binding.",
-            leaf_ids,
-            invocation_by_id,
-            deployment_plan,
+            artifact_leaf_by_id,
+            artifact_snapshot,
+            artifact_record_values,
         )
+    else:
+        if artifact_snapshot is not None or artifact_record_values:
+            raise ValueError(
+                "artifact registry receipts were supplied but no selected "
+                "leaf accompanies executable work")
+        artifact_record_by_leaf = {}
     if not selected:
         return _noncompiled(
             plan,
@@ -454,6 +498,7 @@ def compile_bound_plan(
             raise ValueError("attempt resources exceed the bound deployment envelope")
 
         input_bindings: list[InputBinding] = []
+        external_bindings: list[RegisteredArtifactInputBinding] = []
         for use in sorted(invocation.input_uses, key=lambda value: value.port_id):
             binding = satisfactions[use.requirement_use_id]
             if binding.kind is not SatisfactionKind.PRODUCERS:
@@ -464,8 +509,33 @@ def compile_bound_plan(
                 raise ValueError(
                     "Stage-1 scalar compiler requires one output per runtime slot")
             source = binding.outputs[0]
+            if source.producer_kind is ProducerKind.ARTIFACT_LEAF:
+                try:
+                    record = artifact_record_by_leaf[source.producer_id]
+                except KeyError as exc:
+                    raise ValueError(
+                        "artifact input has no verified registry receipt") from exc
+                delivery = (
+                    RegisteredArtifactDelivery.NATIVE_FILE_POINTER
+                    if (current_component.operation_key
+                        == _NATIVE_POINTER_IDENTITY_OPERATION
+                        and use.port_id == "source")
+                    else RegisteredArtifactDelivery.JSON_VALUE
+                )
+                if (delivery is RegisteredArtifactDelivery.JSON_VALUE
+                        and record.media_type != "application/json"):
+                    raise ValueError(
+                        "JSON_VALUE delivery requires an application/json "
+                        "ArtifactRecord")
+                external_bindings.append(RegisteredArtifactInputBinding(
+                    input_name=use.port_id,
+                    snapshot_id=artifact_snapshot.snapshot_id,
+                    record=record.to_dict(),
+                    delivery=delivery,
+                ))
+                continue
             if source.producer_kind is not ProducerKind.INVOCATION:
-                raise AssertionError("artifact leaves were rejected above")
+                raise ValueError("input references an unknown producer kind")
             if source.producer_id not in selected:
                 raise ValueError("input satisfaction references unselected producer")
             if source.output_port_id not in {
@@ -484,6 +554,7 @@ def compile_bound_plan(
             component=current_component,
             parameters=dict(invocation.parameters),
             inputs=tuple(input_bindings),
+            external_inputs=tuple(external_bindings),
             outputs=tuple(OutputSpec(
                 name=output.port_id,
                 media_type="application/json",
@@ -491,6 +562,9 @@ def compile_bound_plan(
                 scientific_binding=ScientificArtifactBinding(
                     bound_plan_id=plan.bound_plan_id,
                     invocation_id=invocation.invocation_key,
+                    capability_id=invocation.capability_id,
+                    capability_version=invocation.capability_version,
+                    evidence_profile_id=invocation.evidence_profile_id,
                     output_port=output.port_id,
                     descriptor_id=output.descriptor.descriptor_id,
                     descriptor=output.descriptor.to_dict(),
@@ -504,6 +578,9 @@ def compile_bound_plan(
         f"{deployment_plan.deployment_plan_id}",
         templates,
         schema_version="stage2-bound-to-stage1-graph-v1",
+        external_manifest_roots=tuple(sorted(
+            value.manifest_root_sha256
+            for value in artifact_record_by_leaf.values())),
     )
     mapping = tuple((invocation_id, task_key[invocation_id])
                     for invocation_id in sorted(selected))
@@ -515,7 +592,13 @@ def compile_bound_plan(
         stage1_graph_id=graph.plan_id,
         invocation_task_keys=mapping,
         root_artifact_leaf_ids=tuple(sorted(leaf_ids)),
-        root_bindings=_root_bindings(plan, task_key),
+        root_bindings=_root_bindings(
+            plan, task_key, artifact_record_by_leaf),
+        registered_root_bindings=_registered_root_bindings(
+            plan,
+            artifact_record_by_leaf,
+            artifact_snapshot.snapshot_id if artifact_record_by_leaf else None,
+        ),
         output_descriptor_bindings=_output_descriptor_bindings(
             invocation_by_id),
         message="The independently validated scientific plan compiled to "
@@ -533,6 +616,68 @@ def compile_bound_plan(
     )
     authority.verify(record, graph)
     return CompilationResult(record, graph, authority)
+
+
+def _verify_external_artifacts(
+    plan: BoundDerivationPlan,
+    leaves: dict[str, ArtifactLeaf],
+    snapshot: ArtifactRegistrySnapshot,
+    records: tuple[ArtifactRecord, ...],
+) -> dict[str, ArtifactRecord]:
+    """Authenticate every selected external leaf and its current native bytes."""
+    from artifacts.records import (
+        ArtifactAvailability,
+        ArtifactRecord,
+        ArtifactRegistrySnapshot,
+    )
+    if not isinstance(snapshot, ArtifactRegistrySnapshot):
+        raise TypeError("artifact_snapshot must be an ArtifactRegistrySnapshot")
+    if (not all(isinstance(value, ArtifactRecord) for value in records)
+            or len({value.record_id for value in records}) != len(records)):
+        raise ValueError("artifact_records must be unique ArtifactRecords")
+    snapshot_leaves: dict[str, list[object]] = {}
+    for entry in snapshot.entries:
+        snapshot_leaves.setdefault(
+            entry.record.leaf.leaf_id, []).append(entry)
+    by_leaf: dict[str, ArtifactRecord] = {}
+    for record in records:
+        leaf = record.leaf
+        if leaf.leaf_id in by_leaf:
+            raise ValueError("artifact records are ambiguous for one leaf")
+        by_leaf[leaf.leaf_id] = record
+        memberships = snapshot_leaves.get(leaf.leaf_id, [])
+        if (len(memberships) != 1
+                or memberships[0].record != record
+                or memberships[0].availability
+                is not ArtifactAvailability.COMMITTED):
+            raise ValueError(
+                "selected ArtifactRecord is not exactly COMMITTED in the "
+                "frozen registry snapshot")
+    if set(by_leaf) != set(leaves):
+        raise ValueError(
+            "artifact_records do not exactly cover selected artifact leaves")
+
+    plan_bindings = {value.leaf_id: value for value in plan.artifact_bindings}
+    if set(plan_bindings) != set(leaves):
+        raise ValueError("bound artifact records do not match selected leaves")
+    for leaf_id, declared_leaf in leaves.items():
+        record = by_leaf[leaf_id]
+        binding = plan_bindings[leaf_id]
+        if record.leaf != declared_leaf:
+            raise ValueError(
+                "ArtifactRecord does not reproduce the selected ArtifactLeaf")
+        if (binding.descriptor_id != record.descriptor.descriptor_id
+                or binding.manifest_root != record.manifest_root_sha256
+                or binding.content_digest != record.content_sha256):
+            raise ValueError(
+                "ArtifactLeafBinding does not match the selected record's "
+                "descriptor, manifest, and content digest")
+        verify_native_file(
+            record.location,
+            content_sha256=record.content_sha256,
+            size_bytes=record.size_bytes,
+        )
+    return by_leaf
 
 
 def _noncompiled(
@@ -553,6 +698,7 @@ def _noncompiled(
         invocation_task_keys=(),
         root_artifact_leaf_ids=tuple(sorted(leaf_ids)),
         root_bindings=_root_bindings(plan, {}),
+        registered_root_bindings=(),
         output_descriptor_bindings=_output_descriptor_bindings(invocations),
         message=message,
     ), None, None)
@@ -719,6 +865,7 @@ def _evidence_inputs(
 def _root_bindings(
     plan: BoundDerivationPlan,
     task_keys: dict[str, str],
+    registered: dict[str, ArtifactRecord] | None = None,
 ) -> tuple[tuple[str, str, str, str], ...]:
     bindings = {value.use_id: value
                 for value in plan.candidate_plan.satisfactions}
@@ -739,8 +886,46 @@ def _root_bindings(
             ))
         else:
             artifact = artifact_by_id[output.producer_id]
-            result.append((use_id, "DECLARED_ARTIFACT_MANIFEST_UNVERIFIED",
-                           artifact.leaf_id, artifact.manifest_root))
+            record = (registered or {}).get(output.producer_id)
+            if record is None:
+                result.append((
+                    use_id, "DECLARED_ARTIFACT_MANIFEST_UNVERIFIED",
+                    artifact.leaf_id, artifact.manifest_root))
+            else:
+                result.append((
+                    use_id, "VERIFIED_REGISTERED_ARTIFACT",
+                    record.record_id, record.manifest_root_sha256))
+    return tuple(result)
+
+
+def _registered_root_bindings(
+    plan: BoundDerivationPlan,
+    registered: dict[str, ArtifactRecord],
+    snapshot_id: str | None,
+) -> tuple[tuple[str, str, str, str], ...]:
+    """Retain snapshot/record/manifest coordinates for artifact roots."""
+    if not registered:
+        return ()
+    if snapshot_id is None:
+        raise ValueError("verified registered roots require a snapshot identity")
+    satisfactions = {
+        value.use_id: value for value in plan.candidate_plan.satisfactions}
+    result = []
+    for use_id in sorted(plan.candidate_plan.root_use_ids):
+        binding = satisfactions[use_id]
+        if (binding.kind is not SatisfactionKind.PRODUCERS
+                or len(binding.outputs) != 1):
+            continue
+        output = binding.outputs[0]
+        if output.producer_kind is not ProducerKind.ARTIFACT_LEAF:
+            continue
+        record = registered[output.producer_id]
+        result.append((
+            use_id,
+            snapshot_id,
+            record.record_id,
+            record.manifest_root_sha256,
+        ))
     return tuple(result)
 
 

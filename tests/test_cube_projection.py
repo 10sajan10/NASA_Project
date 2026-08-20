@@ -68,6 +68,9 @@ def test_compiler_binds_full_descriptor_and_plan_coordinates_to_recipes():
             assert binding is not None
             assert binding.bound_plan_id == demo.bound_plan.bound_plan_id
             assert binding.invocation_id == invocation_id
+            assert binding.capability_id == invocation.capability_id
+            assert binding.capability_version == invocation.capability_version
+            assert binding.evidence_profile_id == invocation.evidence_profile_id
             assert binding.output_port == output.port_id
             assert binding.descriptor_id == output.descriptor.descriptor_id
             assert binding.to_dict()["descriptor"] == output.descriptor.to_dict()
@@ -251,6 +254,9 @@ def test_precommitted_external_artifact_keeps_source_run_lineage(tmp_path):
         binding = ScientificArtifactBinding(
             bound_plan_id=strict_hash({"bound-plan": "external-fixture-v1"}),
             invocation_id=invocation_id,
+            capability_id="fixture.synthetic.identity",
+            capability_version="1.0.0",
+            evidence_profile_id="evidence:unknown",
             output_port="result",
             descriptor_id=source_recipe.scientific_binding.descriptor_id,
             descriptor=source_recipe.scientific_binding.to_dict()["descriptor"],
@@ -412,6 +418,9 @@ def test_an_authority_is_bound_to_the_exact_projection(tmp_path):
         binding = ScientificArtifactBinding(
             projection.bound_plan_id,
             projection.invocation_id,
+            "fixture.forgery-probe",
+            "1.0.0",
+            "evidence:unknown",
             projection.output_port,
             projection.descriptor_id,
             projection.descriptor,

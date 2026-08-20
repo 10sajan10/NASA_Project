@@ -325,8 +325,9 @@ class ScientificArtifactBinding:
     """Frozen Stage-2 meaning attached to one executable output.
 
     Stage 1 does not infer any of these values from payload bytes.  The
-    compiler supplies the complete descriptor snapshot and the three exact
-    scientific-plan coordinates which selected it.  Keeping the descriptor as
+    compiler supplies the complete descriptor snapshot and the exact
+    scientific-plan, invocation, capability, version, and evidence coordinates
+    which selected it.  Keeping the descriptor as
     strict JSON avoids importing the scientific-contract layer into the
     runtime's persisted data model; construction nevertheless replays that
     layer's closed decoder and content identity.
@@ -334,6 +335,9 @@ class ScientificArtifactBinding:
 
     bound_plan_id: str
     invocation_id: str
+    capability_id: str
+    capability_version: str
+    evidence_profile_id: str
     output_port: str
     descriptor_id: str
     descriptor: dict[str, Any]
@@ -341,6 +345,13 @@ class ScientificArtifactBinding:
     def __post_init__(self) -> None:
         _digest(self.bound_plan_id, "scientific binding bound_plan_id")
         _digest(self.invocation_id, "scientific binding invocation_id")
+        _required_text(self.capability_id, "scientific binding capability_id")
+        _required_text(
+            self.capability_version,
+            "scientific binding capability_version")
+        _required_text(
+            self.evidence_profile_id,
+            "scientific binding evidence_profile_id")
         _required_text(self.output_port, "scientific binding output_port")
         _digest(self.descriptor_id, "scientific binding descriptor_id")
         object.__setattr__(self, "descriptor", freeze_json(self.descriptor))
@@ -359,6 +370,9 @@ class ScientificArtifactBinding:
         return {
             "bound_plan_id": self.bound_plan_id,
             "invocation_id": self.invocation_id,
+            "capability_id": self.capability_id,
+            "capability_version": self.capability_version,
+            "evidence_profile_id": self.evidence_profile_id,
             "output_port": self.output_port,
             "descriptor_id": self.descriptor_id,
             "descriptor": strict_copy(self.descriptor),

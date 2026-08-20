@@ -13,12 +13,17 @@ from pathlib import Path
 from typing import Any
 
 from .identity import strict_canonical_json, strict_copy
-from .native import NativeFilePointer, read_verified_native_bytes
+from .native import (
+    NativeFilePointer,
+    read_verified_native_bytes,
+    verify_native_file,
+)
 from .operations import execute_component, operation_component
 from .types import (
     AttemptInputReceipt,
     AttemptSpec,
     RegisteredArtifactDelivery,
+    RegisteredArtifactInputBinding,
     RegisteredArtifactInputReceipt,
 )
 
@@ -114,6 +119,35 @@ def _verify_invocation(spec: AttemptSpec, token: str, stage: Path,
     }
     if set(spec.input_artifacts) != input_names:
         raise RuntimeError("attempt input artifact bindings do not match task ports")
+    registered = {
+        binding.input_name: binding
+        for binding in spec.task.external_inputs
+        if isinstance(binding, RegisteredArtifactInputBinding)
+    }
+    for name, receipt in spec.input_artifacts.items():
+        if name not in registered and not isinstance(
+                receipt, AttemptInputReceipt):
+            raise RuntimeError(
+                "Stage-1 committed input received a registered-artifact "
+                "receipt")
+    for name, binding in registered.items():
+        receipt = spec.input_artifacts[name]
+        if (not isinstance(receipt, RegisteredArtifactInputReceipt)
+                or receipt.snapshot_id != binding.snapshot_id
+                or receipt.record != binding.record
+                or receipt.delivery is not binding.delivery):
+            raise RuntimeError(
+                "registered attempt receipt disagrees with its bound input")
+        pointer_operation = (
+            spec.task.component.operation_key
+            == "native.file_pointer_identity.v1")
+        if binding.delivery is RegisteredArtifactDelivery.NATIVE_FILE_POINTER:
+            if not pointer_operation or name != "source":
+                raise RuntimeError(
+                    "pointer delivery is not authorized for this operation")
+        elif pointer_operation:
+            raise RuntimeError(
+                "native pointer identity requires pointer delivery")
     for recipe in spec.task.outputs:
         _validate_port(recipe.output_name)
 
@@ -208,15 +242,15 @@ def _load_registered_input(
     """Consume one registry record directly from its verified native path."""
     from artifacts.records import ArtifactRecord
     record = ArtifactRecord.from_dict(strict_copy(receipt.record))
-    if record.media_type != "application/json":
-        raise ValueError(
-            f"registered input for {name!r} has unsupported media type")
-    payload = read_verified_native_bytes(
-        record.location,
-        content_sha256=record.content_sha256,
-        size_bytes=record.size_bytes,
-    )
     if receipt.delivery is RegisteredArtifactDelivery.NATIVE_FILE_POINTER:
+        # Pointer delivery verifies the producer-owned file but never loads its
+        # potentially large payload into worker memory.  Only the small exact
+        # pointer envelope crosses the operation boundary.
+        verify_native_file(
+            record.location,
+            content_sha256=record.content_sha256,
+            size_bytes=record.size_bytes,
+        )
         return NativeFilePointer.bind(
             record.location,
             record.media_type,
@@ -230,6 +264,15 @@ def _load_registered_input(
         ).to_dict()
     if receipt.delivery is not RegisteredArtifactDelivery.JSON_VALUE:
         raise ValueError(f"unknown registered input delivery for {name!r}")
+    if record.media_type != "application/json":
+        raise ValueError(
+            f"registered JSON_VALUE input for {name!r} has unsupported "
+            "media type")
+    payload = read_verified_native_bytes(
+        record.location,
+        content_sha256=record.content_sha256,
+        size_bytes=record.size_bytes,
+    )
     try:
         decoded = json.loads(payload.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:

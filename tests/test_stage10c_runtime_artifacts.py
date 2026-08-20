@@ -261,6 +261,9 @@ def _manual_native_graph(native):
     binding = ScientificArtifactBinding(
         bound_plan_id="a" * 64,
         invocation_id="b" * 64,
+        capability_id="caller.manual.native-pointer",
+        capability_version="1.0.0",
+        evidence_profile_id="evidence:unknown",
         output_port="result",
         descriptor_id=descriptor.descriptor_id,
         descriptor=descriptor.to_dict(),
@@ -295,6 +298,8 @@ def test_compiled_native_chain_registers_stage10_lineage_namespace(tmp_path):
     invocation_by_operation = {
         value.implementation.operation_key: value.invocation_key
         for value in selected}
+    selected_by_operation = {
+        value.implementation.operation_key: value for value in selected}
     source_task = graph.task_by_key(mapping[
         invocation_by_operation["native.file_pointer.v1"]])
     downstream_task = graph.task_by_key(mapping[
@@ -322,6 +327,20 @@ def test_compiled_native_chain_registers_stage10_lineage_namespace(tmp_path):
         invocation_by_operation["native.file_pointer.v1"]]
     downstream_record = by_producer[
         invocation_by_operation["native.file_pointer_identity.v1"]]
+    downstream_invocation = selected_by_operation[
+        "native.file_pointer_identity.v1"]
+    assert downstream_record.producer_version == (
+        downstream_invocation.capability_version)
+    assert downstream_record.evidence_profile_id == (
+        downstream_invocation.evidence_profile_id)
+    assert downstream_record.metadata["scientific_provenance"] == {
+        "schema": "stage10d-scientific-provenance-v1",
+        "bound_plan_id": compilation.record.bound_plan_id,
+        "invocation_id": downstream_invocation.invocation_key,
+        "capability_id": downstream_invocation.capability_id,
+        "capability_version": downstream_invocation.capability_version,
+        "evidence_profile_id": downstream_invocation.evidence_profile_id,
+    }
     assert downstream_record.inputs == (
         ArtifactInput("source", source_record.artifact_id),)
     assert downstream_record.inputs[0].artifact_id != stage1_source_id

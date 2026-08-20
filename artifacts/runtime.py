@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING, Iterable
 
 from composition import CompilationAuthority
 from contracts import ArtifactDescriptor
-from engine.runtime import NATIVE_FILE_POINTER_VALIDATOR_KIND, NativeFilePointer
+from engine.runtime import (
+    InputArtifactSource,
+    NATIVE_FILE_POINTER_VALIDATOR_KIND,
+    NativeFilePointer,
+)
 
 from .coordinator import ArtifactTargetCoordinator, OutputEventStatus
 from .records import ArtifactInput
@@ -81,32 +85,46 @@ class RuntimeArtifactEventBridge:
             if any(row is None for _recipe, row in committed):
                 raise RuntimeError(
                     "native co-produced output set is only partially committed")
-            producer_ids = {
-                recipe.scientific_binding.invocation_id
+            producer_coordinates = {
+                (
+                    recipe.scientific_binding.capability_id,
+                    recipe.scientific_binding.capability_version,
+                    recipe.scientific_binding.invocation_id,
+                    recipe.scientific_binding.evidence_profile_id,
+                )
                 for recipe in native_recipes
                 if recipe.scientific_binding is not None
             }
-            if (len(producer_ids) != 1
+            if (len(producer_coordinates) != 1
                     or any(recipe.scientific_binding is None
                            for recipe in native_recipes)):
                 raise RuntimeError(
-                    "native output recipes need one exact scientific producer")
-            producer_id = next(iter(producer_ids))
-            stage1_inputs = controller.store.task_input_artifact_ids(
+                    "native output recipes need one exact capability, version, "
+                    "invocation, and evidence producer coordinate")
+            (capability_id, capability_version, invocation_id,
+             evidence_profile_id) = next(iter(producer_coordinates))
+            runtime_inputs = controller.store.task_input_lineage(
                 run_id, task.task_id)
-            if len({port for port, _ in stage1_inputs}) != len(stage1_inputs):
+            if (len({value.input_name for value in runtime_inputs})
+                    != len(runtime_inputs)):
                 raise RuntimeError(
                     "runtime task inputs are ambiguous by port")
             inputs = []
-            for port, stage1_artifact_id in stage1_inputs:
-                try:
-                    stage10_artifact_id = registry.runtime_artifact_id(
-                        run_id, stage1_artifact_id)
-                except KeyError as exc:
-                    raise RuntimeError(
-                        "native artifact input has no authoritative Stage-10 "
-                        "lineage mapping") from exc
-                inputs.append(ArtifactInput(port, stage10_artifact_id))
+            for value in runtime_inputs:
+                if value.source is InputArtifactSource.REGISTERED_ARTIFACT:
+                    # This ID was verified directly from the frozen Stage-10
+                    # registry record at run creation and again per attempt.
+                    stage10_artifact_id = value.artifact_id
+                else:
+                    try:
+                        stage10_artifact_id = registry.runtime_artifact_id(
+                            run_id, value.artifact_id)
+                    except KeyError as exc:
+                        raise RuntimeError(
+                            "native artifact input has no authoritative "
+                            "Stage-10 lineage mapping") from exc
+                inputs.append(ArtifactInput(
+                    value.input_name, stage10_artifact_id))
             input_values = tuple(inputs)
             records = []
             for recipe, row in committed:
@@ -119,6 +137,24 @@ class RuntimeArtifactEventBridge:
                     raise ValueError(
                         "native pointer media type disagrees with output descriptor")
                 metadata = dict(pointer.metadata)
+                if "scientific_provenance" in metadata:
+                    raise ValueError(
+                        "native pointer metadata uses reserved "
+                        "scientific_provenance field")
+                # ArtifactRecord.artifact_id currently binds producer_id but
+                # not metadata.  Keep producer_id as the exact invocation so
+                # distinct parameterized derivations cannot collapse merely
+                # because they produced identical bytes.  The stable
+                # capability coordinate is retained separately in the
+                # identity-bound ArtifactRecord metadata.
+                metadata["scientific_provenance"] = {
+                    "schema": "stage10d-scientific-provenance-v1",
+                    "bound_plan_id": binding.bound_plan_id,
+                    "invocation_id": invocation_id,
+                    "capability_id": capability_id,
+                    "capability_version": capability_version,
+                    "evidence_profile_id": evidence_profile_id,
+                }
                 # Run occurrence belongs in the durable namespace mapping
                 # below, not immutable artifact metadata.  Two runs that
                 # produce the same scientific derivation must replay the same
@@ -134,17 +170,18 @@ class RuntimeArtifactEventBridge:
                     pointer.path,
                     descriptor,
                     media_type=pointer.media_type,
-                    producer_id=producer_id,
-                    producer_version=task.component.version,
+                    producer_id=invocation_id,
+                    producer_version=capability_version,
                     output_port_id=recipe.output_name,
                     inputs=input_values,
+                    evidence_profile_id=evidence_profile_id,
                     metadata=metadata,
                     expected_content_sha256=pointer.content_sha256,
                 )
                 if record.size_bytes != pointer.size_bytes:
                     raise ValueError("native pointer size changed before event")
                 records.append(record)
-            event = self.coordinator.enqueue_records(producer_id, records)
+            event = self.coordinator.enqueue_records(invocation_id, records)
             status = self.coordinator.process_event(event.event_id)
             if status is not OutputEventStatus.APPLIED:
                 raise RuntimeError(

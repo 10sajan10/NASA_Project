@@ -1,6 +1,6 @@
 # Codex handoff
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 ## Repository state
 
@@ -30,15 +30,15 @@ Given a typed scientific target:
 5. automatically register a producer-owned native file after its authoritative
    commit, then reconsider durable targets.
 
-The active Stage-10 path does not copy, transform, reproject, resample, or
-ingest native payloads into Cube/Zarr.
+The Stage-10D end-to-end pointer path does not copy, transform, reproject,
+resample, or ingest native payloads into Cube/Zarr.
 
-Steps 1–3 and the post-commit part of step 5 exist as bounded services. Stage 1
-also executes already-compiled graphs durably. They are not yet one general
-automatic path: a target result does not itself bind, compile, authorize, and
-launch all missing producers, and an ordinary selected `ArtifactLeaf` cannot
-yet be lowered as a general external input to an arbitrary downstream
-invocation. A `WorkflowManifest` is a planning record, not an execution graph.
+Those five steps now form one bounded local path for plans made entirely from
+closed supported operations. `TargetExecutionService` accepts a durable target,
+not a caller-authored graph or portable manifest; requires a fresh complete and
+independently validated result; freezes binding, deployment, compiler, registry,
+and discovery inputs; and creates one deterministic Stage-1 run. A
+`WorkflowManifest` remains a planning record, not execution authority.
 
 ## Current implemented slices
 
@@ -68,10 +68,32 @@ The repaired compiler boundary now mints process-local compilation authority
 only after replaying the exact plan and compiled graph. The Stage-10C native
 pointer path is deliberately narrow: a closed identity operation can publish
 an exact native pointer, and authoritative Stage-1 input slots are mapped to
-their Stage-10 artifact identities for lineage. This does not provide the
-general `ArtifactLeaf` compiler bridge. A restarted observer must be supplied
-the exact compiler-issued authority again; it is not reconstructed from
-caller-authored graph labels, and absence fails closed.
+their Stage-10 artifact identities for lineage. Stage 10C alone does not
+provide the general `ArtifactLeaf` compiler bridge. A restarted observer must
+be supplied the exact compiler-issued authority again; it is not reconstructed
+from caller-authored graph labels, and absence fails closed.
+
+### Stage 10D
+
+`stage10d/service.py` supplies the durable target-to-execution application
+boundary. `composition/compiler.py` and the runtime lower exact committed
+registry records to typed registered-input receipts, re-hash bytes at run and
+attempt boundaries, and keep Stage-1 and Stage-10 lineage namespaces distinct.
+The context and terminal receipt replay every authority coordinate; service
+storage is durably bound to one canonical runtime root, target coordinator, and
+artifact registry. Terminal success, failure, and cancellation are typed.
+
+`artifacts/query.py` adds immutable snapshot-bound typed metadata queries and
+replayable results. `artifacts/publication.py` verifies a complete
+adapter-authored native declaration and produces a privately minted proposal,
+but that proposal cannot register anything and is not the runtime publication
+authority.
+
+The integration fixture uses the closed native-pointer identity producer. It
+selects one exact compatible native input in the presence of an incompatible
+same-concept record, runs it once, applies the output event, satisfies a waiting
+target, queries the exact output, and resumes after restart without a duplicate
+attempt. This establishes the application seam; it is not a domain-model run.
 
 ## Repairs in the current uncommitted tree
 
@@ -100,16 +122,20 @@ caller-authored graph labels, and absence fails closed.
   durable event actually reaches `APPLIED`.
 - `setup.sh` selects a supported Python 3.12+ interpreter instead of accepting
   the host's obsolete default.
+- Stage 10D adds the exact registry-input compiler/runtime bridge,
+  target-to-execution application service, adapter proposal surface, and
+  snapshot-bound full-metadata query receipts described above.
 
 These are working-tree facts, not a release claim. Preserve unrelated user
 edits and deletions and review the diff before any commit.
 
 ## Latest bounded evidence
 
-The final complete local run on this exact repaired tree was:
+The complete local run after the final Stage-10D provenance and native-pointer
+hardening was:
 
 ```text
-1098 passed, 1 skipped, 7 xfailed in 170.72 s
+1122 passed, 1 skipped, 7 xfailed in 178.07 s
 ```
 
 The seven strict expected failures remain visible work: four legacy Stage-0
@@ -117,6 +143,12 @@ runtime/tile/fencing defects, two quarantined WRF configuration-policy
 decisions, and the Stage-6 planning latency gate (7.06 s p95 against 5 s).
 The one skip is conditional environment evidence, not a silently passing
 deployment claim.
+
+The final focused Stage-10D application, external-input, publication, and query
+suites reported `24 passed in 7.79s`. The complete Stage-10A–D selection reported
+`55 passed in 14.84s`; the wider provenance-affected selection reported
+`183 passed`. The complete-tree result above was then run on the same final
+working tree.
 
 The Stage-10C demo showed Stage-1 `SUCCEEDED`, target cost changing from `1`
 to `0` after artifact publication, unchanged native location, two immutable
@@ -140,6 +172,8 @@ metadata/georeference evidence, not a model execution or site certification.
 - Solver output is independently validated.
 - Process exit is not publication; authoritative validation/commit is required.
 - Automatic artifact events originate only from committed Stage-1 outputs.
+- A durable target launches only after exact resolver, validator, binder,
+  deployment, compiler, registry, coordinator, and runtime identities agree.
 - Execution graphs admitted through the repaired compiler path carry exact
   compiler-minted authority; a caller-authored identity-valid graph cannot use
   that authority to publish a scientific native artifact.
@@ -157,6 +191,31 @@ metadata/georeference evidence, not a model execution or site certification.
   cryptographic signature or a cross-service trust protocol.
 - A restarted publication observer must retain or deterministically recompile
   the authoritative plan inputs and be supplied the exact authority again.
+- Stage-10D execution is execute-once per content-addressed target ID. A changed
+  plan is refused instead of silently becoming another run revision.
+- `TargetExecutionService.execute()` is an explicit application call. Output
+  events re-plan durable targets automatically, but no background dispatcher
+  launches every newly planned workflow.
+- Deterministic crash/restart replay is tested; clean convergence of
+  simultaneous callers is not claimed.
+- The execution database is permanently bound to canonical runtime,
+  coordinator, and registry paths. Relocation/rebinding is not implemented.
+- A runtime-terminal/application-nonterminal recovery must still recompile and
+  observe with its frozen selected inputs live. A completed terminal receipt
+  can be read after those inputs are archived.
+- Arbitrary producer side-effect files are not auto-discovered; publication
+  requires a declared closed output through authoritative Stage-1 commit.
+- General registered-input delivery supports strict JSON value decoding; the
+  no-materialization claim applies to the closed native-pointer delivery path.
+- The adapter proposal retains producer family/version and invocation identity
+  separately, but `ArtifactRecord` still has one `producer_id`; runtime output
+  records currently use the bound invocation key there. A closed
+  `scientific_provenance` metadata object makes compiler-bound capability and
+  invocation separately queryable, but they are not normalized first-class
+  record fields or indexes.
+- Legacy scientific bindings without the closed provenance fields fail closed
+  and require recompilation; legacy records do not match capability/invocation
+  filters unless they contain that exact provenance object.
 - Discovery replay currently proves one linear predecessor chain; merging
   independent discovery branches is not implemented.
 - Packet resource identity contains an exact deployment binding, but no
@@ -175,23 +234,29 @@ metadata/georeference evidence, not a model execution or site certification.
 
 ## Next stage
 
-Stage 10D is **target-to-execution integration and producer adoption**, not a
-new data store. The plan is maintained in the sibling documentation repository.
+Stage 10E should be **domain producer adoption and durable dispatch**, not a new
+data store.
 
-Required exit path:
+Required next slice:
 
-1. one ordinary producer is selected from a typed target;
-2. selected registry `ArtifactLeaf` values lower to exact, verified Stage-1
-   external-input receipts when needed by downstream tasks;
-3. an application service binds, compiles, authorizes, and launches the plan;
-4. the producer commits a native pointer with complete descriptor and lineage;
-5. the artifact event is emitted and applied automatically;
-6. every relevant metadata field can find it from a snapshot-bound query;
-7. a waiting durable target resolves to it after restart; and
-8. its native bytes remain unmodified and unmoved.
+1. onboard one lightweight real data/model adapter that creates a native output
+   through its normal path rather than republishing an input with the identity
+   operation;
+2. converge the proposal and compiler-authorized publication contracts so there
+   is one adapter path and no declaration can bypass Stage-1 commit;
+3. promote the closed capability/invocation provenance metadata into distinct
+   immutable first-class artifact fields and indexes, with an explicit
+   migration;
+4. add an idempotent durable dispatcher that can move an approved newly planned
+   target to `TargetExecutionService.execute()` without manual glue;
+5. expose the typed target and snapshot-query surfaces through a small
+   domain-facing API; and
+6. prove submit→dispatch→run→publish→query→dependent-target behavior
+   across restart, still on a lightweight local fixture.
 
-Do not start with WRF. Use a bounded non-heavy producer and include incompatible
-same-concept artifacts so query correctness is actually tested.
+Do not start with WRF or remote/HPC deployment. First remove the identity
+producer and programmatic-call limitations without weakening the Stage-10D
+authorities.
 
 ## Useful commands
 
@@ -208,7 +273,10 @@ cd /uufs/chpc.utah.edu/common/home/parashar-vdc/sajan/NASA_Project
 .venv/bin/python -m pytest -q \
   tests/test_stage10a_artifacts.py \
   tests/test_stage10b_automation.py \
-  tests/test_stage10c_runtime_artifacts.py
+  tests/test_stage10c_runtime_artifacts.py \
+  tests/test_stage10d_application.py \
+  tests/test_stage10d_external_bridge.py \
+  tests/test_stage10d_artifact_surface.py
 ```
 
 Use a fresh local `/tmp` runtime root for controller tests; the verified
@@ -218,9 +286,15 @@ SQLite/WAL durability boundary is local POSIX, not NFS/Lustre.
 
 The maintained design sources are:
 
-- `nasa_project_docs/design_explained.md`
-- `nasa_project_docs/scientific_workflow_composition_plan.md`
+- `docs/design_explained.md`
+- `docs/scientific_workflow_composition_plan.md`
+- `docs/nasa_technical_report.md`
+- `docs/agentic_plan.md`
 - this handoff for operational continuity
+
+The separate `nasa_project_docs` repository mirrors these sources for
+documentation-only distribution. The copies under `docs/` travel with branch
+`v2` and should be updated in the same change when either repository changes.
 
 Stage READMEs are bounded implementation evidence. Git history contains the
 removed slide decks, generated assets, Cube-authority diagrams, and old roadmap;

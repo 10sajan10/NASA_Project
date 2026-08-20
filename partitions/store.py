@@ -875,6 +875,12 @@ class PartitionStore:
                     bound_plan_id=registered_template.template_id,
                     invocation_id=(
                         registered_template.invocation.invocation_key),
+                    capability_id=(
+                        registered_template.invocation.capability_id),
+                    capability_version=(
+                        registered_template.invocation.capability_version),
+                    evidence_profile_id=(
+                        registered_template.invocation.evidence_profile_id),
                     output_port=port.port_id,
                     descriptor_id=port.descriptor.descriptor_id,
                     descriptor=port.descriptor.to_dict(),

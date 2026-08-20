@@ -44,11 +44,12 @@ decisions that matter. This project builds the system that assembles it for you
       └─────────────────────────────────────────┘
 ```
 
-The resolver-to-plan path and the commit-to-artifact feedback path are working
-bounded slices. One general application bridge is still missing: a selected
-plan containing ordinary producers and existing `ArtifactLeaf` inputs is not
-yet compiled and launched automatically from the target request. The planning
-manifest is therefore not execution permission.
+The resolver-to-plan path and the commit-to-artifact feedback path now meet in
+a bounded local application service. A durable target whose selected plan uses
+closed supported operations can carry exact registry `ArtifactLeaf` inputs
+through binding, compilation, authorization, Stage-1 execution, native-pointer
+publication, and target re-planning. The planning manifest remains an
+inspection record, not execution permission.
 
 Nothing in that pipeline knows what "asteroid", "fire", or "wind" *mean*. The
 domain enters entirely through declared contracts and capabilities — which is
@@ -188,6 +189,7 @@ runnable, and no stage may claim capability it has not demonstrated.
 | [10A](stage10a/) | Automatic native-artifact registration and target-time discovery | bounded local implementation |
 | [10B](stage10b/) | Durable targets, output-event replay, and automatic re-planning | bounded local implementation |
 | [10C](stage10c/) | Stage-1 commit to durable native-artifact event bridge | bounded local implementation |
+| [10D](stage10d/) | Durable target-to-execution service, exact registry inputs, typed snapshot queries | bounded local implementation |
 | [9B](stage9b/) | WRF integration behind a certified provider | blocked; placement prerequisite only |
 
 Stages 5–8 are deliberately labelled below "done". An external audit found
@@ -231,8 +233,19 @@ the labels now match what is demonstrated. The honest reading:
   observer binds the exact scientific descriptor and runtime lineage before
   emitting Stage 10B events. The narrow publication operation is authorized by
   the compiler and maps Stage-1 committed inputs to their Stage-10 artifact
-  identities. It is not the general `ArtifactLeaf` compiler bridge. The native
-  payload remains at its original path.
+  identities. Stage 10C alone is not the general `ArtifactLeaf` compiler
+  bridge; Stage 10D adds that bounded input path. The native payload remains at
+  its original path.
+- **Stage 10D** supplies that bounded bridge. `TargetExecutionService` accepts
+  a durable target, insists on a fresh complete and independently validated
+  result, freezes every plan/compiler input, lowers exact committed registry
+  artifacts into typed Stage-1 receipts, and records one deterministic run and
+  terminal receipt per target. A restart reconstructs compiler authority and
+  can replay a committed-but-unobserved output without launching another
+  attempt. Snapshot-bound queries cover the full typed descriptor, native
+  location, availability, and exact direct lineage. The end-to-end fixture
+  uses the closed native-pointer identity producer; it is not a domain-model
+  run.
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_stage*.py tests/test_cube*.py
@@ -268,10 +281,19 @@ none.
   when present, are checked only for command compatibility; Stage 9A uses a
   fake scheduler and is not site certification. Durability is same-node process
   recovery, not node-loss durability.
-- **A target request does not yet launch its missing producers automatically.**
-  Target planning, durable local execution, and post-commit registration all
-  exist, but the general target-to-execution service and ordinary
-  `ArtifactLeaf` external-input lowering remain to be built.
+- **Target execution is a bounded application call, not a background global
+  dispatcher.** Stage 10D launches an eligible frozen plan when
+  `TargetExecutionService.execute()` is called. Output events automatically
+  re-plan durable targets, but no policy automatically launches every newly
+  planned target. Only closed compiler/runtime operations are supported.
+- **The Stage-10D adapter proposal is not publication authority.** It verifies
+  a complete native-file declaration but cannot write the registry. Producer
+  family/version and bound invocation are retained separately in that proposal;
+  the current `ArtifactRecord` schema has one `producer_id`, and runtime output
+  records use the bound invocation key there. Compiler-bound capability and
+  invocation provenance is separately queryable from a closed metadata object,
+  but normalization into first-class record fields and indexes remains future
+  work.
 - **Agentic/LLM planning is out of scope** for the current architecture. The
   legacy [`agentic/`](agentic/) layer predates it and is parked, not extended.
 
@@ -305,6 +327,7 @@ composition/    exhaustive correctness oracle, blocker trees, Stage-1 compiler
 plans/          candidate / bound / deployment derivation identities
 engine/runtime/ durable controller, attempts, leases, fencing, atomic commit
 stage*/         bounded per-stage evidence, fixtures, and demonstrations
+docs/           maintained architecture, roadmap, NASA report, and agent plan
 
 cube/           retained optional projection/read model; not the Stage-10 payload path
 engine/         legacy orchestration substrate (retained as baseline)
@@ -315,3 +338,8 @@ agentic/        legacy LLM planning layer (parked; out of scope for v2)
 
 For the durable engineering handoff — invariants, per-stage detail, and the
 next stage's design constraints — see [`codex_handoff.md`](codex_handoff.md).
+The maintained design set is also versioned on this branch under
+[`docs/`](docs/README.md), including the
+[`scientific workflow plan`](docs/scientific_workflow_composition_plan.md),
+[`NASA technical report`](docs/nasa_technical_report.md), and
+[`agentic research plan`](docs/agentic_plan.md).

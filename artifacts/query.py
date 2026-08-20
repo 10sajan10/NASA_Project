@@ -14,6 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from contracts import (
+    BBoxSupport,
     GridDescriptor,
     IntrinsicUncertainty,
     Missingness,
@@ -21,6 +22,7 @@ from contracts import (
     OriginClass,
     SpatialScale,
     TemporalKind,
+    TemporalSupport,
     UncertaintyStatus,
     VerticalKind,
     VerticalSupport,
@@ -29,7 +31,12 @@ from contracts import (
     canonical_timestamp,
     canonical_unit,
 )
-from engine.runtime.identity import strict_hash
+from engine.runtime.identity import (
+    freeze_json,
+    require_object_fields,
+    strict_copy,
+    strict_hash,
+)
 
 from .records import (
     ArtifactAvailability,
@@ -90,13 +97,16 @@ class ArtifactSnapshotQuery:
     representation: str | None = None
     schema_version: str | None = None
     units: str | None = None
+    spatial_support: BBoxSupport | None = None
     spatial_crs: str | None = None
     intersects_bounds: tuple[str, str, str, str] | None = None
     grid_id: str | None = None
+    grid: GridDescriptor | None = None
     grid_crs: str | None = None
     grid_shape: tuple[int, int] | None = None
     native_resolution: SpatialScale | None = None
     temporal_kind: TemporalKind | None = None
+    temporal_support: TemporalSupport | None = None
     intersects_time: tuple[str, str] | None = None
     cadence_s: str | None = None
     vertical_support: VerticalSupport | None = None
@@ -107,12 +117,17 @@ class ArtifactSnapshotQuery:
     intrinsic_uncertainty: IntrinsicUncertainty | None = None
     uncertainty_status: UncertaintyStatus | None = None
     required_components: tuple[str, ...] = ()
+    ensemble_member: str | None = None
     evidence_profile_id: str | None = None
+    invocation_id: str | None = None
+    capability_id: str | None = None
     producer_id: str | None = None
     producer_version: str | None = None
     output_port_id: str | None = None
     media_type: str | None = None
     location: str | None = None
+    record_metadata: dict[str, object] | None = None
+    lineage_inputs: tuple[ArtifactInput, ...] = ()
     lineage_artifact_ids: tuple[str, ...] = ()
     lineage_port_ids: tuple[str, ...] = ()
     has_lineage: bool | None = None
@@ -121,12 +136,13 @@ class ArtifactSnapshotQuery:
     def __post_init__(self) -> None:
         for name in (
                 "record_id", "artifact_id", "content_sha256",
-                "descriptor_id", "grid_id"):
+                "descriptor_id", "grid_id", "invocation_id"):
             _optional_digest(getattr(self, name), f"artifact query {name}")
         for name in (
                 "concept_id", "representation", "schema_version",
-                "evidence_profile_id", "producer_id", "producer_version",
-                "output_port_id", "media_type"):
+                "ensemble_member", "evidence_profile_id", "capability_id",
+                "producer_id",
+                "producer_version", "output_port_id", "media_type"):
             _optional_text(getattr(self, name), f"artifact query {name}")
         if self.units is not None:
             object.__setattr__(self, "units", canonical_unit(self.units))
@@ -135,6 +151,13 @@ class ArtifactSnapshotQuery:
                 self, "spatial_crs", canonical_crs(self.spatial_crs))
         if self.grid_crs is not None:
             object.__setattr__(self, "grid_crs", canonical_crs(self.grid_crs))
+        for value, expected, label in (
+            (self.spatial_support, BBoxSupport, "spatial_support"),
+            (self.grid, GridDescriptor, "grid"),
+            (self.temporal_support, TemporalSupport, "temporal_support"),
+        ):
+            if value is not None and not isinstance(value, expected):
+                raise TypeError(f"artifact query {label} must be typed")
         if self.intersects_bounds is not None:
             if self.spatial_crs is None:
                 raise ValueError(
@@ -195,6 +218,16 @@ class ArtifactSnapshotQuery:
                 raise TypeError(f"artifact query {label} must be typed")
         _ordered_unique_text(
             self.required_components, "artifact query required_components")
+        if (not isinstance(self.lineage_inputs, tuple)
+                or not all(isinstance(value, ArtifactInput)
+                           for value in self.lineage_inputs)
+                or self.lineage_inputs != tuple(sorted(
+                    self.lineage_inputs,
+                    key=lambda value: (value.port_id, value.artifact_id)))
+                or len(self.lineage_inputs) != len(set(self.lineage_inputs))):
+            raise ValueError(
+                "artifact query lineage_inputs must be unique typed pairs "
+                "in canonical order")
         lineage_ids = _ordered_unique_text(
             self.lineage_artifact_ids,
             "artifact query lineage_artifact_ids",
@@ -203,6 +236,10 @@ class ArtifactSnapshotQuery:
             _optional_digest(value, "artifact query lineage artifact ID")
         _ordered_unique_text(
             self.lineage_port_ids, "artifact query lineage_port_ids")
+        if self.lineage_artifact_ids and self.lineage_port_ids:
+            raise ValueError(
+                "artifact and port lineage filters cannot express pairs; "
+                "use lineage_inputs")
         if self.has_lineage is not None and type(self.has_lineage) is not bool:
             raise TypeError("artifact query has_lineage must be bool")
         if (self.availability is not None
@@ -212,6 +249,12 @@ class ArtifactSnapshotQuery:
             _text(self.location, "artifact query location")
             if not Path(self.location).is_absolute():
                 raise ValueError("artifact query location must be absolute")
+        if self.record_metadata is not None:
+            metadata = freeze_json(self.record_metadata)
+            if not isinstance(metadata, dict):
+                raise TypeError(
+                    "artifact query record_metadata must be an object")
+            object.__setattr__(self, "record_metadata", metadata)
 
     @property
     def query_id(self) -> str:
@@ -228,11 +271,15 @@ class ArtifactSnapshotQuery:
             "representation": self.representation,
             "schema_version": self.schema_version,
             "units": self.units,
+            "spatial_support": (
+                self.spatial_support.to_dict()
+                if self.spatial_support is not None else None),
             "spatial_crs": self.spatial_crs,
             "intersects_bounds": (
                 list(self.intersects_bounds)
                 if self.intersects_bounds is not None else None),
             "grid_id": self.grid_id,
+            "grid": self.grid.to_dict() if self.grid is not None else None,
             "grid_crs": self.grid_crs,
             "grid_shape": (
                 list(self.grid_shape) if self.grid_shape is not None else None),
@@ -242,6 +289,9 @@ class ArtifactSnapshotQuery:
             "temporal_kind": (
                 self.temporal_kind.value
                 if self.temporal_kind is not None else None),
+            "temporal_support": (
+                self.temporal_support.to_dict()
+                if self.temporal_support is not None else None),
             "intersects_time": (
                 list(self.intersects_time)
                 if self.intersects_time is not None else None),
@@ -266,12 +316,20 @@ class ArtifactSnapshotQuery:
                 self.uncertainty_status.value
                 if self.uncertainty_status is not None else None),
             "required_components": list(self.required_components),
+            "ensemble_member": self.ensemble_member,
             "evidence_profile_id": self.evidence_profile_id,
+            "invocation_id": self.invocation_id,
+            "capability_id": self.capability_id,
             "producer_id": self.producer_id,
             "producer_version": self.producer_version,
             "output_port_id": self.output_port_id,
             "media_type": self.media_type,
             "location": self.location,
+            "record_metadata": (
+                strict_copy(self.record_metadata)
+                if self.record_metadata is not None else None),
+            "lineage_inputs": [
+                value.to_dict() for value in self.lineage_inputs],
             "lineage_artifact_ids": list(self.lineage_artifact_ids),
             "lineage_port_ids": list(self.lineage_port_ids),
             "has_lineage": self.has_lineage,
@@ -279,6 +337,53 @@ class ArtifactSnapshotQuery:
                 self.availability.value
                 if self.availability is not None else None),
         }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "ArtifactSnapshotQuery":
+        """Strictly decode a persisted query and re-establish its identity."""
+        raw = require_object_fields(
+            value,
+            set(cls().to_dict()),
+            "ArtifactSnapshotQuery",
+        )
+        if raw.pop("schema") != "stage10d-artifact-snapshot-query-v1":
+            raise ValueError("unsupported artifact snapshot query schema")
+        for name in (
+                "intersects_bounds", "grid_shape", "intersects_time",
+                "required_components", "lineage_inputs",
+                "lineage_artifact_ids",
+                "lineage_port_ids"):
+            if raw[name] is not None:
+                if not isinstance(raw[name], list):
+                    raise TypeError(f"ArtifactSnapshotQuery.{name} must be an array")
+                raw[name] = tuple(raw[name])
+        raw["lineage_inputs"] = tuple(
+            ArtifactInput.from_dict(item) for item in raw["lineage_inputs"])
+        for name, expected in (
+            ("spatial_support", BBoxSupport),
+            ("grid", GridDescriptor),
+            ("native_resolution", SpatialScale),
+            ("temporal_support", TemporalSupport),
+            ("vertical_support", VerticalSupport),
+            ("missingness", Missingness),
+            ("intrinsic_uncertainty", IntrinsicUncertainty),
+        ):
+            if raw[name] is not None:
+                if not isinstance(raw[name], dict):
+                    raise TypeError(
+                        f"ArtifactSnapshotQuery.{name} must be an object")
+                raw[name] = expected.from_dict(raw[name])
+        for name, expected in (
+            ("temporal_kind", TemporalKind),
+            ("vertical_kind", VerticalKind),
+            ("origin", OriginClass),
+            ("missingness_status", MissingnessStatus),
+            ("uncertainty_status", UncertaintyStatus),
+            ("availability", ArtifactAvailability),
+        ):
+            if raw[name] is not None:
+                raw[name] = expected(raw[name])
+        return cls(**raw)
 
 
 @dataclass(frozen=True)
@@ -380,6 +485,46 @@ class ArtifactSnapshotQueryResult:
                 self.query_id, self.snapshot_id, self.matches),
         }
 
+    @classmethod
+    def from_dict(
+        cls,
+        value: dict[str, object],
+        *,
+        query: ArtifactSnapshotQuery,
+        snapshot: ArtifactRegistrySnapshot,
+    ) -> "ArtifactSnapshotQueryResult":
+        """Replay a receipt by recomputing it from its query and snapshot.
+
+        Persisted matches never become authority merely by decoding.  The
+        supplied immutable query and snapshot are authoritative inputs; every
+        match and the result identity are recomputed and must equal the
+        receipt byte-for-byte at the strict JSON data-model level.
+        """
+        if not isinstance(query, ArtifactSnapshotQuery):
+            raise TypeError("artifact query replay requires a typed query")
+        if not isinstance(snapshot, ArtifactRegistrySnapshot):
+            raise TypeError("artifact query replay requires a typed snapshot")
+        raw = require_object_fields(
+            value,
+            {"schema", "result_id", "query_id", "snapshot_id", "matches"},
+            "ArtifactSnapshotQueryResult",
+        )
+        if raw["schema"] != "stage10d-artifact-snapshot-query-result-v1":
+            raise ValueError("unsupported artifact query result schema")
+        if not isinstance(raw["matches"], list):
+            raise TypeError("ArtifactSnapshotQueryResult.matches must be an array")
+        for match in raw["matches"]:
+            require_object_fields(match, {
+                "record_id", "artifact_id", "content_sha256",
+                "availability", "reason",
+            }, "ArtifactSnapshotQueryResult.match")
+        replayed = SnapshotArtifactCatalog(snapshot).search(query)
+        if raw != replayed.to_dict():
+            raise ValueError(
+                "artifact query receipt does not replay from the supplied "
+                "query and snapshot")
+        return replayed
+
 
 class SnapshotArtifactCatalog:
     """Read-only metadata search over exactly one registry snapshot."""
@@ -424,6 +569,30 @@ def _bounds_intersect(
     )
 
 
+def _scientific_provenance(
+        metadata: dict[str, object]) -> dict[str, object] | None:
+    """Decode only the closed compiler-published provenance metadata shape."""
+    value = metadata.get("scientific_provenance")
+    expected = {
+        "schema", "bound_plan_id", "invocation_id", "capability_id",
+        "capability_version", "evidence_profile_id",
+    }
+    if (not isinstance(value, dict) or set(value) != expected
+            or value.get("schema") != "stage10d-scientific-provenance-v1"):
+        return None
+    if any(not isinstance(value.get(name), str)
+           or not str(value[name]).strip()
+           for name in (
+               "capability_id", "capability_version",
+               "evidence_profile_id")):
+        return None
+    if any(not isinstance(value.get(name), str)
+           or _DIGEST.fullmatch(str(value[name])) is None
+           for name in ("bound_plan_id", "invocation_id")):
+        return None
+    return value
+
+
 def _matches(
     entry: ArtifactSnapshotEntry,
     query: ArtifactSnapshotQuery,
@@ -434,6 +603,13 @@ def _matches(
     temporal = descriptor.temporal_support
     vertical = descriptor.vertical_support
     inputs: tuple[ArtifactInput, ...] = record.inputs
+    scientific_provenance = _scientific_provenance(record.metadata)
+    invocation_id = (
+        scientific_provenance["invocation_id"]
+        if scientific_provenance is not None else None)
+    capability_id = (
+        scientific_provenance["capability_id"]
+        if scientific_provenance is not None else None)
     exact = (
         (query.record_id, record.record_id),
         (query.artifact_id, record.artifact_id),
@@ -443,11 +619,14 @@ def _matches(
         (query.representation, descriptor.representation),
         (query.schema_version, descriptor.schema_version),
         (query.units, descriptor.units),
+        (query.spatial_support, descriptor.spatial_support),
         (query.spatial_crs, descriptor.spatial_support.crs),
+        (query.grid, grid),
         (query.grid_crs, grid.crs if grid is not None else None),
         (query.grid_shape, grid.shape if grid is not None else None),
         (query.native_resolution, descriptor.native_resolution),
         (query.temporal_kind, temporal.kind),
+        (query.temporal_support, temporal),
         (query.cadence_s, temporal.cadence_s),
         (query.vertical_support, vertical),
         (query.vertical_kind, vertical.kind if vertical is not None else None),
@@ -457,12 +636,16 @@ def _matches(
         (query.intrinsic_uncertainty, descriptor.intrinsic_uncertainty),
         (query.uncertainty_status,
          descriptor.intrinsic_uncertainty.status),
+        (query.ensemble_member, descriptor.ensemble_member),
         (query.evidence_profile_id, record.evidence_profile_id),
+        (query.invocation_id, invocation_id),
+        (query.capability_id, capability_id),
         (query.producer_id, record.producer_id),
         (query.producer_version, record.producer_version),
         (query.output_port_id, record.output_port_id),
         (query.media_type, record.media_type),
         (query.location, record.location),
+        (query.record_metadata, record.metadata),
         (query.availability, entry.availability),
     )
     if any(sought is not None and sought != offered
@@ -483,6 +666,8 @@ def _matches(
             return False
     if not set(query.required_components).issubset(
             descriptor.component_names):
+        return False
+    if not set(query.lineage_inputs).issubset(set(inputs)):
         return False
     input_artifact_ids = {value.artifact_id for value in inputs}
     if not set(query.lineage_artifact_ids).issubset(input_artifact_ids):

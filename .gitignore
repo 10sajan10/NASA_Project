@@ -55,9 +55,6 @@ events/
 .DS_Store
 *.swp
 
-# Documentation / presentation artifacts (kept local)
-docs/
-
 # self-contained provisioning build outputs
 wrfdeps/
 WRF-SFIRE/
