@@ -131,13 +131,14 @@ def test_grid_contract_gate(tmp_path):
 
 
 def _partition_fixture(tmp_path):
-    from stage7.fixtures import resolve_one_selection
+    from stage7.fixtures import deployment_binding_for, resolve_one_selection
 
     spec = PartitionSetSpec.bind((
         PartitionAxis("tile", AxisKind.SPATIAL, ("t0", "t1")),
     ))
+    invocation = resolve_one_selection()
     template = PartitionTaskTemplate.bind(
-        resolve_one_selection(), retry_safe=True)
+        invocation, deployment_binding_for(invocation), retry_safe=True)
     manifest = CollectionManifest.bind(
         set_id=spec.set_id,
         template_id=template.template_id,

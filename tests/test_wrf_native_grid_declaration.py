@@ -45,6 +45,7 @@ def test_the_fire_grid_is_the_innermost_nest_refined():
     grid = native_grid_from_scenario(scenario, fire=True)
     assert tuple(grid.shape) == (inner.ny * inner.sr, inner.nx * inner.sr)
     assert float(grid.affine[0]) == inner.dx_m / inner.sr
+    assert float(grid.affine[4]) > 0
 
 
 def test_the_atmospheric_grid_is_the_innermost_mass_grid():
@@ -53,6 +54,7 @@ def test_the_atmospheric_grid_is_the_innermost_mass_grid():
     grid = native_grid_from_scenario(scenario, fire=False)
     assert tuple(grid.shape) == (inner.ny, inner.nx)
     assert float(grid.affine[0]) == inner.dx_m
+    assert float(grid.affine[4]) > 0
 
 
 def test_the_fire_mesh_is_a_clean_refinement_of_its_own_nest():

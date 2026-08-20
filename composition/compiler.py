@@ -32,6 +32,10 @@ from capabilities import (
     invocation_evidence_subject,
 )
 from engine.runtime.identity import strict_hash
+from engine.runtime.native import (
+    NATIVE_FILE_POINTER_VALIDATOR_KIND,
+    NativeFilePointer,
+)
 from engine.runtime.operations import operation_component
 from engine.runtime.types import (
     BoundExecutionGraph,
@@ -48,6 +52,7 @@ from plans import (
     SatisfactionKind,
 )
 from contracts import (
+    ArtifactDescriptor,
     EvidenceSnapshot,
     GRID_AFFINE_CONVENTION,
     RequirementUse,
@@ -67,6 +72,15 @@ class CompilationStatus(str, Enum):
     ARTIFACT_COMMIT_UNVERIFIED = "ARTIFACT_COMMIT_UNVERIFIED"
     BRIDGE_EXTERNAL_LEAF_UNSUPPORTED = "BRIDGE_EXTERNAL_LEAF_UNSUPPORTED"
     OPTIONAL_LOWERING_UNSUPPORTED = "OPTIONAL_LOWERING_UNSUPPORTED"
+
+
+_COMPILATION_AUTHORITY_MINT = object()
+_NATIVE_POINTER_OPERATION = "native.file_pointer.v1"
+_NATIVE_POINTER_IDENTITY_OPERATION = "native.file_pointer_identity.v1"
+_NATIVE_POINTER_OPERATIONS = frozenset({
+    _NATIVE_POINTER_OPERATION,
+    _NATIVE_POINTER_IDENTITY_OPERATION,
+})
 
 
 @dataclass(frozen=True)
@@ -123,18 +137,124 @@ class CompilationRecord:
         })
 
 
+@dataclass(frozen=True, init=False)
+class CompilationAuthority:
+    """Trusted-local receipt issued with one exact compiled runtime graph.
+
+    The private mint makes accidental caller-authored scientific labels
+    structurally insufficient at the Stage-10 publication boundary.  This is
+    deliberately not a cryptographic signature or a defense against code that
+    already executes inside this trusted Python process; verification replays
+    the content-addressed compilation record and graph instead.
+    """
+
+    authority_id: str
+    record: CompilationRecord
+
+    def __init__(
+            self, mint: object, *, authority_id: str,
+            record: CompilationRecord,
+    ) -> None:
+        if mint is not _COMPILATION_AUTHORITY_MINT:
+            raise PermissionError(
+                "CompilationAuthority is issued only by compile_bound_plan")
+        if (not isinstance(record, CompilationRecord)
+                or record.status is not CompilationStatus.COMPILED):
+            raise TypeError(
+                "compilation authority requires a compiled record")
+        object.__setattr__(self, "authority_id", authority_id)
+        object.__setattr__(self, "record", record)
+        if authority_id != self.expected_id():
+            raise ValueError("compilation authority identity does not verify")
+
+    def expected_id(self) -> str:
+        return strict_hash({
+            "schema": "stage10c-compilation-authority-v1",
+            "compilation_record_id": self.record.record_id,
+            "stage1_graph_id": self.record.stage1_graph_id,
+        })
+
+    @property
+    def stage1_graph_id(self) -> str:
+        assert self.record.stage1_graph_id is not None
+        return self.record.stage1_graph_id
+
+    def verify(
+            self, record: CompilationRecord,
+            graph: BoundExecutionGraph,
+    ) -> None:
+        """Replay the exact compiler record against a loaded runtime graph."""
+        if self.authority_id != self.expected_id():
+            raise ValueError("compilation authority identity does not verify")
+        if record != self.record or record.record_id != self.record.record_id:
+            raise ValueError("compilation authority covers another record")
+        if not isinstance(graph, BoundExecutionGraph):
+            raise TypeError("compilation authority requires a runtime graph")
+        graph.validate_identity()
+        if (graph.plan_id != self.stage1_graph_id
+                or graph.schema_version
+                != "stage2-bound-to-stage1-graph-v1"):
+            raise ValueError("compilation authority covers another graph")
+
+        mappings = self.record.invocation_task_keys
+        if (mappings != tuple(sorted(mappings))
+                or len({value[0] for value in mappings}) != len(mappings)
+                or len({value[1] for value in mappings}) != len(mappings)):
+            raise ValueError("compilation task mappings are not canonical")
+        invocation_by_task = {
+            task_key: invocation_id for invocation_id, task_key in mappings}
+        if set(invocation_by_task) != {task.key for task in graph.tasks}:
+            raise ValueError(
+                "compiled graph tasks disagree with the compilation record")
+        expected = {
+            (invocation_id, port_id): descriptor_id
+            for invocation_id, port_id, descriptor_id
+            in self.record.output_descriptor_bindings
+        }
+        observed: dict[tuple[str, str], str] = {}
+        for task in graph.tasks:
+            invocation_id = invocation_by_task[task.key]
+            for recipe in task.outputs:
+                binding = recipe.scientific_binding
+                if binding is None:
+                    raise ValueError(
+                        "compiled output lacks a scientific binding")
+                coordinate = (invocation_id, recipe.output_name)
+                descriptor_id = expected.get(coordinate)
+                if (descriptor_id is None
+                        or binding.bound_plan_id != self.record.bound_plan_id
+                        or binding.invocation_id != invocation_id
+                        or binding.output_port != recipe.output_name
+                        or binding.descriptor_id != descriptor_id
+                        or ArtifactDescriptor.from_dict(
+                            binding.descriptor).descriptor_id != descriptor_id):
+                    raise ValueError(
+                        "compiled output binding disagrees with the "
+                        "compilation record")
+                observed[coordinate] = descriptor_id
+        if observed != expected:
+            raise ValueError(
+                "compiled graph outputs disagree with the compilation record")
+
+
 @dataclass(frozen=True)
 class CompilationResult:
     record: CompilationRecord
     graph: BoundExecutionGraph | None
+    authority: CompilationAuthority | None = None
 
     def __post_init__(self) -> None:
         if ((self.record.status is CompilationStatus.COMPILED)
                 != (self.graph is not None)):
             raise ValueError("compilation record and graph disagree")
+        if ((self.record.status is CompilationStatus.COMPILED)
+                != (self.authority is not None)):
+            raise ValueError("compiled result and authority disagree")
         if (self.graph is not None
                 and self.record.stage1_graph_id != self.graph.plan_id):
             raise ValueError("compilation record names another graph")
+        if self.authority is not None:
+            self.authority.verify(self.record, self.graph)
 
 
 def compile_bound_plan(
@@ -178,6 +298,7 @@ def compile_bound_plan(
                 "deployment bindings do not match selected invocations")
     _validate_transformation_authorities(invocation_values)
     _validate_acquisition_authorities(invocation_values)
+    _validate_native_pointer_invocations(invocation_values)
     _validate_executable_output_representations(invocation_values)
 
     leaf_ids = set(plan.candidate_plan.selected_artifact_leaf_ids)
@@ -401,7 +522,17 @@ def compile_bound_plan(
                 "one Stage-1 task per selected invocation; exact output "
                 "descriptor bindings are retained by the compilation record.",
     )
-    return CompilationResult(record, graph)
+    authority = CompilationAuthority(
+        _COMPILATION_AUTHORITY_MINT,
+        authority_id=strict_hash({
+            "schema": "stage10c-compilation-authority-v1",
+            "compilation_record_id": record.record_id,
+            "stage1_graph_id": graph.plan_id,
+        }),
+        record=record,
+    )
+    authority.verify(record, graph)
+    return CompilationResult(record, graph, authority)
 
 
 def _noncompiled(
@@ -424,7 +555,7 @@ def _noncompiled(
         root_bindings=_root_bindings(plan, {}),
         output_descriptor_bindings=_output_descriptor_bindings(invocations),
         message=message,
-    ), None)
+    ), None, None)
 
 
 def _resource_request(value: dict[str, object]) -> ResourceRequest:
@@ -630,12 +761,50 @@ def _validate_executable_output_representations(
     """Reject descriptors the finite-JSON Stage-1 lowering cannot preserve."""
     for invocation in invocations:
         for output in invocation.outputs:
-            if output.descriptor.representation != "application/json":
+            if (invocation.implementation.operation_key
+                    not in _NATIVE_POINTER_OPERATIONS
+                    and output.descriptor.representation
+                    != "application/json"):
                 raise ValueError(
                     "unsupported executable output representation "
                     f"{output.descriptor.representation!r} for invocation "
                     f"{invocation.invocation_key} port {output.port_id!r}; "
                     "Stage-2 finite_json lowering requires application/json")
+
+
+def _validate_native_pointer_invocations(
+    invocations: tuple[BoundInvocation, ...],
+) -> None:
+    """Replay the two closed no-copy pointer contracts before graph minting."""
+    for invocation in invocations:
+        operation = invocation.implementation.operation_key
+        if operation == _NATIVE_POINTER_OPERATION:
+            if (len(invocation.outputs) != 1
+                    or invocation.outputs[0].port_id != "result"):
+                raise ValueError(
+                    "native pointer producer has an invalid output contract")
+            try:
+                pointer = NativeFilePointer.from_dict(
+                    invocation.parameters["pointer"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "native pointer producer has an invalid bound pointer") \
+                    from exc
+            if (pointer.media_type
+                    != invocation.outputs[0].descriptor.representation):
+                raise ValueError(
+                    "native pointer media type disagrees with its output "
+                    "descriptor")
+        elif operation == _NATIVE_POINTER_IDENTITY_OPERATION:
+            if (len(invocation.input_uses) != 1
+                    or len(invocation.outputs) != 1
+                    or invocation.input_uses[0].port_id != "source"
+                    or invocation.outputs[0].port_id != "result"
+                    or invocation.input_uses[0].requirement.exact_descriptor_id
+                    != invocation.outputs[0].descriptor.descriptor_id):
+                raise ValueError(
+                    "native pointer identity must preserve one exact "
+                    "descriptor")
 
 
 def _validate_transformation_authorities(
@@ -677,6 +846,10 @@ def _validate_acquisition_authorities(
 def _output_validation(invocation: BoundInvocation, output) -> dict[str, object]:
     """Lower a typed field descriptor to the narrow Stage-4 commit validator."""
     descriptor = output.descriptor
+    operation_key = getattr(
+        getattr(invocation, "implementation", None), "operation_key", None)
+    if operation_key in _NATIVE_POINTER_OPERATIONS:
+        return {"kind": NATIVE_FILE_POINTER_VALIDATOR_KIND}
     if descriptor.schema_version == LEGACY_FIELD_JSON_SCHEMA:
         raise ValueError(
             "legacy field-json-v1 lacks the canonical axis/grid contract and "

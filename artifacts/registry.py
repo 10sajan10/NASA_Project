@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import sqlite3
+import stat
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -80,43 +83,99 @@ CREATE TABLE IF NOT EXISTS artifact_verifications (
     stat_inode      INTEGER NOT NULL,
     stat_size       INTEGER NOT NULL,
     stat_mtime_ns   INTEGER NOT NULL,
+    stat_ctime_ns   INTEGER NOT NULL DEFAULT 0,
     content_sha256  TEXT NOT NULL,
     available       INTEGER NOT NULL,
     reason          TEXT NOT NULL,
     verified_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS runtime_artifact_bindings (
+    run_id              TEXT NOT NULL,
+    stage1_artifact_id  TEXT NOT NULL,
+    task_id             TEXT NOT NULL,
+    output_port_id      TEXT NOT NULL,
+    record_id           TEXT NOT NULL REFERENCES artifact_records(record_id),
+    stage10_artifact_id TEXT NOT NULL,
+    bound_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (run_id, stage1_artifact_id),
+    UNIQUE (run_id, task_id, output_port_id)
+);
+CREATE INDEX IF NOT EXISTS runtime_artifact_bindings_stage10
+    ON runtime_artifact_bindings(stage10_artifact_id);
 """
 
 
-def _hash_file(path: Path) -> tuple[str, int]:
-    """Hash one stable regular file and reject mutation during registration."""
-    if path.is_symlink():
-        raise ValueError("artifact location cannot be a symbolic link")
-    before = path.stat()
-    if not path.is_file():
-        raise FileNotFoundError(f"artifact location is not a file: {path}")
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-            digest.update(block)
-    after = path.stat()
-    stable = (
-        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
-    ) == (
-        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+_Fingerprint = tuple[int, int, int, int, int]
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _runtime_text(value: str, label: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be non-empty text")
+
+
+def _runtime_digest(value: str, label: str) -> None:
+    if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+
+
+def _fingerprint(value: os.stat_result) -> _Fingerprint:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
     )
-    if not stable:
-        raise RuntimeError("artifact changed while its content was being verified")
-    return digest.hexdigest(), after.st_size
 
 
-def _stat_fingerprint(path: Path) -> tuple[int, int, int, int]:
-    if path.is_symlink():
+def _hash_file_with_fingerprint(
+    path: Path,
+) -> tuple[str, int, _Fingerprint]:
+    """Hash stable regular-file bytes without following a replaced symlink."""
+    path_before = path.lstat()
+    if stat.S_ISLNK(path_before.st_mode):
         raise ValueError("artifact location cannot be a symbolic link")
-    value = path.stat()
-    if not path.is_file():
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise FileNotFoundError(
+                f"artifact location is not a file: {path}")
+        if _fingerprint(path_before) != _fingerprint(before):
+            raise RuntimeError(
+                "artifact location changed while it was being opened")
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
+    finally:
+        os.close(descriptor)
+    observed = _fingerprint(after)
+    if (observed != _fingerprint(before)
+            or observed != _fingerprint(path_after)):
+        raise RuntimeError("artifact changed while its content was being verified")
+    return digest.hexdigest(), after.st_size, observed
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    """Return the verified digest and byte count for one native artifact."""
+    digest, size, _ = _hash_file_with_fingerprint(path)
+    return digest, size
+
+
+def _stat_fingerprint(path: Path) -> _Fingerprint:
+    value = path.lstat()
+    if stat.S_ISLNK(value.st_mode):
+        raise ValueError("artifact location cannot be a symbolic link")
+    if not stat.S_ISREG(value.st_mode):
         raise FileNotFoundError(f"artifact location is not a file: {path}")
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+    return _fingerprint(value)
 
 
 class VerificationPolicy(str, Enum):
@@ -169,6 +228,9 @@ class ArtifactQuery:
                 raise ValueError(f"artifact query {name} must be text")
         if ((self.temporal_start is None) != (self.temporal_end is None)):
             raise ValueError("artifact query time interval needs start and end")
+        if self.intersects_bounds is not None and self.spatial_crs is None:
+            raise ValueError(
+                "artifact query intersects_bounds requires spatial_crs")
         if self.temporal_start is not None:
             start = datetime.fromisoformat(
                 self.temporal_start.replace("Z", "+00:00"))
@@ -208,8 +270,10 @@ class ArtifactRegistry:
     """Immutable-record registry; payloads stay at their native locations.
 
     Registration verifies exact bytes and stores only canonical metadata.
-    Every snapshot re-verifies the file, so disappearance or mutation becomes
-    an explicit UNAVAILABLE state rather than a stale committed candidate.
+    The authoritative snapshot default re-hashes every file, so disappearance
+    or mutation becomes an explicit UNAVAILABLE state rather than a stale
+    committed candidate. Stat-cached verification is an explicit non-planning
+    optimization.
     """
 
     def __init__(self, path: str | Path):
@@ -217,11 +281,18 @@ class ArtifactRegistry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
+            columns = {row["name"] for row in connection.execute(
+                "PRAGMA table_info(artifact_verifications)")}
+            if "stat_ctime_ns" not in columns:
+                connection.execute(
+                    "ALTER TABLE artifact_verifications ADD COLUMN "
+                    "stat_ctime_ns INTEGER NOT NULL DEFAULT 0")
             self._backfill_indexes(connection)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path), timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA synchronous = FULL")
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection
@@ -267,15 +338,17 @@ class ArtifactRegistry:
     @classmethod
     def _write_verification(cls, connection: sqlite3.Connection,
                             record: ArtifactRecord, *, available: bool,
-                            reason: str = "") -> None:
-        device, inode, size, mtime_ns = _stat_fingerprint(
-            Path(record.location))
+                            reason: str = "",
+                            fingerprint: _Fingerprint | None = None) -> None:
+        (device, inode, size, mtime_ns, ctime_ns) = (
+            fingerprint if fingerprint is not None else
+            _stat_fingerprint(Path(record.location)))
         connection.execute(
             "INSERT OR REPLACE INTO artifact_verifications "
             "(record_id,stat_device,stat_inode,stat_size,stat_mtime_ns,"
-            "content_sha256,available,reason,verified_at) "
-            "VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
-            (record.record_id, device, inode, size, mtime_ns,
+            "stat_ctime_ns,content_sha256,available,reason,verified_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+            (record.record_id, device, inode, size, mtime_ns, ctime_ns,
              record.content_sha256, int(available), reason),
         )
 
@@ -372,11 +445,14 @@ class ArtifactRegistry:
             raise ValueError("artifact registration set cannot repeat records")
         if len({value.leaf.leaf_id for value in values}) != len(values):
             raise ValueError("artifact registration set cannot repeat leaves")
+        fingerprints: dict[str, _Fingerprint] = {}
         for record in values:
-            available, reason = self.verify_record(record)
+            available, reason, fingerprint = self._verify_record_receipt(record)
             if not available:
                 raise ValueError(
                     "prepared artifact is no longer available: " + reason)
+            assert fingerprint is not None
+            fingerprints[record.record_id] = fingerprint
         published: list[ArtifactRecord] = []
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -390,6 +466,9 @@ class ArtifactRegistry:
                     if existing["record_json"] != encoded:
                         raise ValueError(
                             "artifact record identity has conflicting durable bytes")
+                    self._write_verification(
+                        connection, record, available=True,
+                        fingerprint=fingerprints[record.record_id])
                     published.append(ArtifactRecord.from_dict(
                         json.loads(existing["record_json"])))
                     continue
@@ -415,7 +494,8 @@ class ArtifactRegistry:
                 )
                 self._write_index(connection, record)
                 self._write_verification(
-                    connection, record, available=True)
+                    connection, record, available=True,
+                    fingerprint=fingerprints[record.record_id])
                 published.append(record)
             connection.commit()
         return tuple(published)
@@ -442,6 +522,103 @@ class ArtifactRegistry:
             rows = connection.execute(sql, values).fetchall()
         return tuple(ArtifactRecord.from_dict(json.loads(row["record_json"]))
                      for row in rows)
+
+    def bind_runtime_outputs(
+        self,
+        run_id: str,
+        task_id: str,
+        outputs: Iterable[tuple[str, str, ArtifactRecord]],
+    ) -> None:
+        """Durably bind Stage-1 output IDs to registered Stage-10 identities.
+
+        This is a namespace boundary, not an aliasing convenience.  Exact
+        replay is idempotent; either a reused runtime slot or a reused Stage-1
+        artifact ID that names different Stage-10 provenance is refused.
+        """
+        _runtime_text(run_id, "runtime binding run_id")
+        _runtime_digest(task_id, "runtime binding task_id")
+        values = tuple(sorted(outputs, key=lambda value: value[0]))
+        if not values:
+            raise ValueError("runtime output binding set cannot be empty")
+        for value in values:
+            if (not isinstance(value, tuple) or len(value) != 3
+                    or not isinstance(value[0], str) or not value[0]
+                    or not isinstance(value[2], ArtifactRecord)):
+                raise TypeError(
+                    "runtime output bindings need port, Stage-1 ID, and record")
+            _runtime_digest(
+                value[1], "runtime binding Stage-1 artifact_id")
+        if (len({value[0] for value in values}) != len(values)
+                or len({value[1] for value in values}) != len(values)):
+            raise ValueError(
+                "runtime output bindings must be unique by port and Stage-1 ID")
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for port_id, stage1_artifact_id, record in values:
+                encoded = strict_canonical_json(record.to_dict())
+                registered = connection.execute(
+                    "SELECT record_json,artifact_id FROM artifact_records "
+                    "WHERE record_id=?", (record.record_id,),
+                ).fetchone()
+                if (registered is None
+                        or registered["record_json"] != encoded
+                        or registered["artifact_id"] != record.artifact_id):
+                    raise ValueError(
+                        "runtime mapping requires the exact registered record")
+                by_artifact = connection.execute(
+                    "SELECT * FROM runtime_artifact_bindings "
+                    "WHERE run_id=? AND stage1_artifact_id=?",
+                    (run_id, stage1_artifact_id),
+                ).fetchone()
+                by_slot = connection.execute(
+                    "SELECT * FROM runtime_artifact_bindings "
+                    "WHERE run_id=? AND task_id=? AND output_port_id=?",
+                    (run_id, task_id, port_id),
+                ).fetchone()
+                expected = (
+                    run_id, stage1_artifact_id, task_id, port_id,
+                    record.record_id, record.artifact_id,
+                )
+                for existing in (by_artifact, by_slot):
+                    if existing is not None and tuple(existing[name] for name in (
+                            "run_id", "stage1_artifact_id", "task_id",
+                            "output_port_id", "record_id",
+                            "stage10_artifact_id")) != expected:
+                        raise ValueError(
+                            "runtime artifact mapping is conflicting or ambiguous")
+                if by_artifact is None and by_slot is None:
+                    connection.execute(
+                        "INSERT INTO runtime_artifact_bindings "
+                        "(run_id,stage1_artifact_id,task_id,output_port_id,"
+                        "record_id,stage10_artifact_id) VALUES (?,?,?,?,?,?)",
+                        expected,
+                    )
+            connection.commit()
+
+    def runtime_artifact_id(
+        self, run_id: str, stage1_artifact_id: str,
+    ) -> str:
+        """Resolve one run-local Stage-1 ID into exactly one Stage-10 ID."""
+        _runtime_text(run_id, "runtime binding run_id")
+        _runtime_digest(
+            stage1_artifact_id, "runtime binding Stage-1 artifact_id")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT b.stage10_artifact_id,b.record_id,r.artifact_id "
+                "FROM runtime_artifact_bindings b JOIN artifact_records r "
+                "ON r.record_id=b.record_id WHERE b.run_id=? "
+                "AND b.stage1_artifact_id=?",
+                (run_id, stage1_artifact_id),
+            ).fetchall()
+        if not rows:
+            raise KeyError(
+                "unknown Stage-1 artifact at the Stage-10 lineage boundary")
+        if (len(rows) != 1
+                or rows[0]["stage10_artifact_id"] != rows[0]["artifact_id"]):
+            raise ValueError(
+                "runtime artifact mapping is conflicting or ambiguous")
+        return rows[0]["stage10_artifact_id"]
 
     def query_records(self, query: ArtifactQuery) -> tuple[ArtifactRecord, ...]:
         """Use normalized metadata columns without opening payload files."""
@@ -476,8 +653,7 @@ class ArtifactRegistry:
         if query.intersects_bounds is not None:
             sought = tuple(Decimal(value) for value in query.intersects_bounds)
             records = tuple(record for record in records if (
-                (query.spatial_crs is None
-                 or record.descriptor.spatial_support.crs == query.spatial_crs)
+                record.descriptor.spatial_support.crs == query.spatial_crs
                 and (lambda offered: not (
                     offered[2] <= sought[0] or offered[0] >= sought[2]
                     or offered[3] <= sought[1] or offered[1] >= sought[3]))(
@@ -500,49 +676,60 @@ class ArtifactRegistry:
         return records
 
     @staticmethod
-    def verify_record(record: ArtifactRecord) -> tuple[bool, str]:
+    def _verify_record_receipt(
+        record: ArtifactRecord,
+    ) -> tuple[bool, str, _Fingerprint | None]:
         try:
             location = Path(record.location)
-            digest, size = _hash_file(location)
+            digest, size, fingerprint = _hash_file_with_fingerprint(location)
         except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
-            return False, f"LOCATION_UNAVAILABLE:{type(exc).__name__}"
+            return False, f"LOCATION_UNAVAILABLE:{type(exc).__name__}", None
         if size != record.size_bytes:
-            return False, "SIZE_CHANGED"
+            return False, "SIZE_CHANGED", None
         if digest != record.content_sha256:
-            return False, "CONTENT_CHANGED"
-        return True, ""
+            return False, "CONTENT_CHANGED", None
+        return True, "", fingerprint
+
+    @classmethod
+    def verify_record(cls, record: ArtifactRecord) -> tuple[bool, str]:
+        available, reason, _ = cls._verify_record_receipt(record)
+        return available, reason
 
     def _verify_cached(
         self, record: ArtifactRecord, policy: VerificationPolicy,
     ) -> tuple[bool, str]:
-        try:
-            fingerprint = _stat_fingerprint(Path(record.location))
-        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
-            return False, f"LOCATION_UNAVAILABLE:{type(exc).__name__}"
-        with self._connect() as connection:
-            receipt = connection.execute(
-                "SELECT * FROM artifact_verifications WHERE record_id=?",
-                (record.record_id,),
-            ).fetchone()
-        unchanged = receipt is not None and fingerprint == (
-            receipt["stat_device"], receipt["stat_inode"],
-            receipt["stat_size"], receipt["stat_mtime_ns"])
-        if (policy is VerificationPolicy.REHASH_ON_STAT_CHANGE and unchanged
-                and receipt["content_sha256"] == record.content_sha256
-                and receipt["available"]):
-            return True, ""
-        available, reason = self.verify_record(record)
+        if policy is VerificationPolicy.REHASH_ON_STAT_CHANGE:
+            try:
+                fingerprint = _stat_fingerprint(Path(record.location))
+            except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+                return False, f"LOCATION_UNAVAILABLE:{type(exc).__name__}"
+            with self._connect() as connection:
+                receipt = connection.execute(
+                    "SELECT * FROM artifact_verifications WHERE record_id=?",
+                    (record.record_id,),
+                ).fetchone()
+            unchanged = receipt is not None and fingerprint == (
+                receipt["stat_device"], receipt["stat_inode"],
+                receipt["stat_size"], receipt["stat_mtime_ns"],
+                receipt["stat_ctime_ns"])
+            if (unchanged
+                    and receipt["content_sha256"] == record.content_sha256
+                    and receipt["available"]):
+                return True, ""
+        available, reason, fingerprint = self._verify_record_receipt(record)
         if available:
+            assert fingerprint is not None
             with self._connect() as connection:
                 self._write_verification(
-                    connection, record, available=True)
+                    connection, record, available=True,
+                    fingerprint=fingerprint)
         return available, reason
 
     def snapshot(
         self,
         *,
         verification_policy: VerificationPolicy =
-            VerificationPolicy.REHASH_ON_STAT_CHANGE,
+            VerificationPolicy.ALWAYS_REHASH,
     ) -> ArtifactRegistrySnapshot:
         if not isinstance(verification_policy, VerificationPolicy):
             raise TypeError("verification_policy must be typed")

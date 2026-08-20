@@ -1,13 +1,17 @@
 """Stage-7 partition space, template identity, packets, and completeness.
 
 The claims under test are that a partition space is addressed without being
-materialised, that logical task identity is stable against deployment churn,
+materialised, that logical task identity binds the selected deployment,
 that fusion never merges identity, and that a partial result cannot pass as a
 complete collection.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
+
+from engine.runtime.types import ResourceRequest
 
 from partitions import (
     AxisKind,
@@ -43,12 +47,18 @@ def _invocation(index: int = 0):
     return resolve_all_selected()[index]
 
 
+def _deployment(index: int = 0):
+    from stage7.fixtures import deployment_binding_for
+    return deployment_binding_for(_invocation(index))
+
+
 def _template(index: int = 0, **overrides) -> PartitionTaskTemplate:
     base = dict(estimated_cost_units=1, retry_safe=True)
     if "retry_policy" in overrides:
         base.pop("retry_safe")
     base.update(overrides)
-    return PartitionTaskTemplate.bind(_invocation(index), **base)
+    return PartitionTaskTemplate.bind(
+        _invocation(index), _deployment(index), **base)
 
 
 # -- the partition space --------------------------------------------------
@@ -140,21 +150,59 @@ def test_the_same_partition_under_a_different_selection_is_a_different_task():
             != second.logical_task_key(spec.key_at(0)))
 
 
-def test_logical_keys_ignore_deployment_and_cost_churn():
-    """Revising a resource envelope must not rename unaffected logical tasks."""
+def test_template_and_task_identity_bind_cost_and_deployment():
     spec = _spec()
     cheap = _template(estimated_cost_units=1)
     dear = _template(estimated_cost_units=64)
-    # Cost is part of the template's own identity...
     assert cheap.template_id != dear.template_id
-    # ...but a logical task key carries no deployment binding or attempt.
-    key = cheap.logical_task_key(spec.key_at(0))
-    assert "binding" not in key and "attempt" not in key
+    assert (cheap.logical_task_key(spec.key_at(0))
+            != dear.logical_task_key(spec.key_at(0)))
+
+    request = dict(cheap.deployment_binding.resource_request)
+    request["memory_mb"] += 1
+    revised_binding = replace(
+        cheap.deployment_binding, resource_request=request)
+    revised = PartitionTaskTemplate.bind(
+        cheap.invocation, revised_binding,
+        estimated_cost_units=cheap.estimated_cost_units,
+        retry_policy=cheap.retry_policy)
+    assert revised.template_id != cheap.template_id
+    assert (revised.logical_task_key(spec.key_at(0))
+            != cheap.logical_task_key(spec.key_at(0)))
 
 
 def test_template_round_trips():
     template = _template()
     assert PartitionTaskTemplate.from_dict(template.to_dict()) == template
+
+
+def test_template_refuses_invocation_and_execution_profile_mismatches():
+    invocation = _invocation(0)
+    binding = _deployment(0)
+    other = _invocation(1)
+
+    with pytest.raises(ValueError, match="another bound invocation"):
+        PartitionTaskTemplate.bind(
+            invocation,
+            replace(binding, invocation_id=other.invocation_key))
+    with pytest.raises(ValueError, match="another execution profile"):
+        PartitionTaskTemplate.bind(
+            invocation,
+            replace(binding,
+                    execution_profile_id=other.execution_profile_id))
+
+
+def test_deployment_binding_roundtrip_is_strict_and_tamper_evident():
+    template = _template()
+    forged = template.to_dict()
+    forged["deployment_binding"]["resource_request"]["memory_mb"] += 1
+    with pytest.raises(ValueError, match="identity does not verify"):
+        PartitionTaskTemplate.from_dict(forged)
+
+    incomplete = template.to_dict()
+    incomplete["deployment_binding"]["resource_request"].pop("walltime_s")
+    with pytest.raises(ValueError, match="ResourceRequest fields"):
+        PartitionTaskTemplate.from_dict(incomplete)
 
 
 def test_retry_policy_is_typed_and_part_of_collection_identity():
@@ -199,6 +247,26 @@ def _members(count: int, template: PartitionTaskTemplate,
         PacketMember(template.logical_task_key(spec.key_at(index)), index,
                      "binding:example")
         for index in range(count))
+
+
+def test_packet_compilation_uses_bound_resources_and_retry_ceiling():
+    from partitions import compile_packet
+    from stage7.fixtures import make_stage7_fixture
+
+    fixture = make_stage7_fixture(tiles=1, windows=2, retry_safe=True)
+    packet = WorkPacket.bind(
+        _COLLECTION_ID,
+        fixture.template.template_id,
+        _members(2, fixture.template, fixture.spec),
+    )
+    graph = compile_packet(fixture.template, packet)
+    expected = ResourceRequest.from_dict(
+        dict(fixture.deployment_binding.resource_request))
+
+    assert fixture.template.deployment_binding == fixture.deployment_binding
+    assert all(task.resources == expected for task in graph.tasks)
+    assert all(task.max_attempts == fixture.template.max_attempts
+               for task in graph.tasks)
 
 
 def test_fusion_bundles_neighbours_without_merging_identity():

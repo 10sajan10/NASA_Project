@@ -9,8 +9,9 @@ most misleading thing this system could do, because it looks like science.
 So comparability is decided explicitly and conservatively.  Every alternative
 must carry a *known* claim for the same metric, produced by the same evaluator
 and protocol against the same reference manifest, in the same unit and the same
-bound kind, with applicability that actually covers the request.  Anything else
-is reported as incomparable with a typed reason.
+bound kind, with applicability that actually covers the request. Confidence
+intervals must additionally use the same confidence level and uncertainty
+method. Anything else is reported as incomparable with a typed reason.
 
 Even when the metrics are comparable, overlapping confidence intervals mean the
 evidence did not separate the alternatives, and the report says so rather than
@@ -28,6 +29,7 @@ from capabilities.implementation import _required_text
 from contracts import (
     BoundKind,
     EvidenceProfile,
+    EvidenceSnapshot,
     EvidenceStatus,
     Requirement,
     UncertaintyStatus,
@@ -49,6 +51,8 @@ class ComparabilityCode(str, Enum):
     PROTOCOL_DIFFERS = "PROTOCOL_DIFFERS"
     UNIT_DIFFERS = "UNIT_DIFFERS"
     BOUND_KIND_DIFFERS = "BOUND_KIND_DIFFERS"
+    UNCERTAINTY_CONFIDENCE_DIFFERS = "UNCERTAINTY_CONFIDENCE_DIFFERS"
+    UNCERTAINTY_METHOD_DIFFERS = "UNCERTAINTY_METHOD_DIFFERS"
     APPLICABILITY_DOES_NOT_COVER_REQUEST = (
         "APPLICABILITY_DOES_NOT_COVER_REQUEST")
 
@@ -119,6 +123,7 @@ class MetricReading:
 
 
 def read_metric(producer_id: str, profile: EvidenceProfile | None,
+                evidence_snapshot: EvidenceSnapshot | None,
                 metric_definition_id: str,
                 requirement: Requirement) -> MetricReading:
     """Extract one alternative's metric claim without interpreting it."""
@@ -135,6 +140,23 @@ def read_metric(producer_id: str, profile: EvidenceProfile | None,
             metric_definition_id=metric_definition_id,
             status=EvidenceStatus.UNKNOWN, unit="1",
             reason="the evidence profile carries no claim for this metric")
+    definition = (evidence_snapshot.evaluator.definition_for(
+        metric_definition_id) if evidence_snapshot is not None else None)
+    if (definition is None
+            or claim.evaluator_id
+            != evidence_snapshot.evaluator.evaluator_id
+            or claim.protocol_id != definition.method_id
+            or claim.unit != definition.unit):
+        # A report-only metric may not have participated in direct_match().
+        # Replay the frozen evaluator contract here so two consistently
+        # malformed claims can never appear comparable merely because they
+        # agree with each other.
+        return MetricReading(
+            producer_id=producer_id,
+            metric_definition_id=metric_definition_id,
+            status=EvidenceStatus.UNKNOWN,
+            unit=(definition.unit if definition is not None else claim.unit),
+            reason="the claim does not match the frozen metric definition")
     covers = (claim.applicability is not None and _applicability_contains(
         claim.applicability, requirement, requirement.required_regimes))
     uncertainty = claim.estimate_uncertainty
@@ -296,6 +318,22 @@ def assess_comparability(readings: Iterable[MetricReading],
             ("unit", ComparabilityCode.UNIT_DIFFERS, "unit"),
             ("bound_kind", ComparabilityCode.BOUND_KIND_DIFFERS, "bound kind")):
         distinct = {getattr(item, attribute) for item in known}
+        if len(distinct) > 1:
+            codes.append(code)
+            details.append(f"alternatives were evaluated with a different {label}")
+
+    interval_readings = [
+        item for item in known
+        if item.uncertainty_status is UncertaintyStatus.KNOWN
+    ]
+    for attribute, code, label in (
+            ("uncertainty_confidence_level",
+             ComparabilityCode.UNCERTAINTY_CONFIDENCE_DIFFERS,
+             "uncertainty confidence level"),
+            ("uncertainty_method_id",
+             ComparabilityCode.UNCERTAINTY_METHOD_DIFFERS,
+             "uncertainty method")):
+        distinct = {getattr(item, attribute) for item in interval_readings}
         if len(distinct) > 1:
             codes.append(code)
             details.append(f"alternatives were evaluated with a different {label}")

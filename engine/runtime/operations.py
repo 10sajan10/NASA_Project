@@ -99,6 +99,18 @@ def _native_file_pointer(parameters: dict[str, Any],
     return {"result": pointer.to_dict()}
 
 
+def _native_file_pointer_identity(
+        parameters: dict[str, Any], inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Forward exactly one verified native pointer without relabelling it."""
+    _exact_keys(parameters, set(), "native file pointer identity parameters")
+    _exact_keys(inputs, {"source"}, "native file pointer identity inputs")
+    from .native import NativeFilePointer
+    pointer = NativeFilePointer.from_dict(inputs["source"])
+    pointer.verify_file()
+    return {"result": pointer.to_dict()}
+
+
 # Stage 4 intentionally uses one small, strict interchange value for local
 # gridded-field transformations.  Component tensors are indexed [time][y][x].
 # This is an execution format, not a claim that JSON is an appropriate storage
@@ -1011,6 +1023,8 @@ _OPERATIONS: dict[str, tuple[str, Operation, bool]] = {
     "synthetic.fail_once.v1": ("1.0.0", _fail_once, True),
     "synthetic.identity.v1": ("1.0.0", _identity, True),
     "native.file_pointer.v1": ("1.0.0", _native_file_pointer, True),
+    "native.file_pointer_identity.v1": (
+        "1.0.0", _native_file_pointer_identity, True),
     "transform.unit_affine.v1": ("1.0.0", _unit_affine, True),
     "transform.spatial_subset.v1": ("1.0.0", _spatial_subset, True),
     "transform.temporal_subset.v1": ("1.0.0", _temporal_subset, True),

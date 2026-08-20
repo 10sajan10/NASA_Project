@@ -74,6 +74,7 @@ from . import fixtures as fx
 @dataclass(frozen=True)
 class Stage5DemoPlan:
     acquisition: AcquisitionExpansion
+    acquisition_base_catalog: CapabilityCatalog
     coarse_bound: BoundAssetManifest
     local_bound: BoundAssetManifest
     support_bound: BoundAssetManifest
@@ -224,7 +225,7 @@ def build_demo_plan(root: Path, *, session_id: str = "stage5-demo") -> Stage5Dem
         discovery_universe=discovery_universe,
         discovery_replays=(
             AcquisitionDiscoveryReplay(
-                acquisition, session_store, shards),
+                acquisition, authored_content, session_store, shards),
             TransformationDiscoveryReplay.bind(
                 base_catalog, transformation_catalog,
                 limits=transform_limits),
@@ -287,6 +288,7 @@ def build_demo_plan(root: Path, *, session_id: str = "stage5-demo") -> Stage5Dem
 
     return Stage5DemoPlan(
         acquisition=acquisition,
+        acquisition_base_catalog=authored_content,
         coarse_bound=coarse,
         local_bound=pinned,
         support_bound=support,

@@ -109,8 +109,40 @@ def test_a_coarser_aligned_source_is_reported_as_coarsening():
     coarse = _grid((100, 100), 1800, origin=(0, 180_000))
     assessment = assess_placement(coarse, _cube())
     assert assessment.status is PlacementStatus.INTEGER_COARSENING
-    assert assessment.placeable
+    assert not assessment.placeable
+    assert assessment.resolvable_by_declared_transformation
     assert assessment.refinement_x == 2
+
+
+def test_opposite_y_directions_require_declared_reorientation():
+    target = _grid((2, 2), 10, origin=(0, 20))
+    south_up = GridDescriptor(
+        target.crs, target.axis_order, target.shape,
+        ("10", "0", "5", "0", "10", "5"), target.spacing)
+    assessment = assess_placement(south_up, target)
+    assert assessment.status is PlacementStatus.AXIS_DIRECTION_MISMATCH
+    assert not assessment.placeable
+    assert assessment.resolvable_by_declared_transformation
+    assert "reorientation" in assessment.detail
+
+
+def test_opposite_x_directions_require_declared_reorientation():
+    target = _grid((2, 2), 10, origin=(0, 20))
+    westward = GridDescriptor(
+        target.crs, target.axis_order, target.shape,
+        ("-10", "0", "15", "0", "-10", "15"), target.spacing)
+    assessment = assess_placement(westward, target)
+    assert assessment.status is PlacementStatus.AXIS_DIRECTION_MISMATCH
+    assert not assessment.placeable
+    assert "x" in assessment.detail
+
+
+def test_coarsening_is_blocked_by_the_publication_gate():
+    coarse = _grid((100, 100), 1800, origin=(0, 180_000))
+    assessment = assess_placement(coarse, _cube())
+    with pytest.raises(PlacementUndefined) as caught:
+        require_placement("arrival_s", assessment)
+    assert caught.value.assessment.status is PlacementStatus.INTEGER_COARSENING
 
 
 # -- the ways placement is refused ---------------------------------------

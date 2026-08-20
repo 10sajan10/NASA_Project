@@ -35,6 +35,21 @@ _BINDER_RULES: dict[str, BinderRule] = {
         output_ports=("result",),
         parameter_names=("content_binding",),
     ),
+    # Stage 10.  These are deliberately closed native-pointer producers, not
+    # generic file adapters: one binds an exact pointer value and the other
+    # forwards that same verified pointer through an exact provenance edge.
+    "native.file_pointer.bind.v1": BinderRule(
+        operation_key="native.file_pointer.v1",
+        input_ports=(),
+        output_ports=("result",),
+        parameter_names=("pointer",),
+    ),
+    "native.file_pointer_identity.bind.v1": BinderRule(
+        operation_key="native.file_pointer_identity.v1",
+        input_ports=("source",),
+        output_ports=("result",),
+        parameter_names=(),
+    ),
     # Stage 6.  A lightweight model producer and a four-input reduced
     # consequence model; both are ordinary capabilities with declared evidence,
     # not transformations.

@@ -481,6 +481,10 @@ def direct_match(
                              and claim.protocol_id == definition.method_id)
                 checks.append(_check(f"evidence_method:{metric_id}", method_ok,
                                      MatchCode.EVIDENCE_METHOD_MISMATCH))
+                checks.append(_check(
+                    f"evidence_definition_units:{metric_id}",
+                    definition is not None and claim.unit == definition.unit,
+                    MatchCode.EVIDENCE_UNITS_MISMATCH))
             if hard_bound:
                 bound = requirement.max_effective_resolution
                 checks.append(_check(f"evidence_units:{metric_id}",

@@ -215,6 +215,27 @@ def test_runner_failure_blocks_dependents_unreachable():
     assert "upstream" in by["b"].error
 
 
+def test_runner_failure_propagates_through_multiple_dependent_levels():
+    reg = ProducerRegistry()
+    reg.register(MiniProducer("a", produces=("x",),
+                              side_effect=RuntimeError("boom")))
+    reg.register(MiniProducer("b", produces=("y",), requires=("x",)))
+    reg.register(MiniProducer("c", produces=("z",), requires=("y",)))
+    pipe = (Pipeline()
+            .add("a")
+            .add("b", after="a")
+            .add("c", after="b"))
+
+    result = PipelineRunner(
+        reg, backend=SerialBackend(), verbose=False).run(CubeStub(), pipe)
+
+    assert not result.ok
+    by_name = result.by_name()
+    assert by_name["a"].status == "error"
+    assert by_name["b"].error == "upstream dependency failed"
+    assert by_name["c"].error == "upstream dependency failed"
+
+
 def test_runner_fail_fast_stops_immediately():
     reg = ProducerRegistry()
     reg.register(MiniProducer("a", produces=("x",),

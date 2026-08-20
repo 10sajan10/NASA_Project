@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,81 @@ from .identity import (
 
 
 NATIVE_FILE_POINTER_VALIDATOR_KIND = "native_file_pointer_v1"
+
+
+def _fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_verified(
+        path: str | Path, *, content_sha256: str, size_bytes: int,
+        retain_bytes: bool,
+) -> bytes | None:
+    """Open one stable regular file without following its final component."""
+    location = Path(path)
+    before_path = location.lstat()
+    if stat.S_ISLNK(before_path.st_mode):
+        raise ValueError("native artifact cannot be a symbolic link")
+    flags = os.O_RDONLY | int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(location, flags)
+    blocks: list[bytes] | None = [] if retain_bytes else None
+    digest = hashlib.sha256()
+    observed_size = 0
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("native artifact is not a regular file")
+        if _fingerprint(before_path) != _fingerprint(before):
+            raise RuntimeError("native artifact changed while it was opened")
+        while True:
+            block = os.read(descriptor, 4 * 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+            observed_size += len(block)
+            if blocks is not None:
+                blocks.append(block)
+        after = os.fstat(descriptor)
+        after_path = location.lstat()
+    finally:
+        os.close(descriptor)
+    observed = _fingerprint(after)
+    if (observed != _fingerprint(before)
+            or observed != _fingerprint(after_path)):
+        raise RuntimeError("native artifact changed during verification")
+    if (isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
+            or size_bytes < 0 or observed_size != size_bytes):
+        raise ValueError("native artifact size does not verify")
+    if digest.hexdigest() != content_sha256:
+        raise ValueError("native artifact content does not verify")
+    return b"".join(blocks) if blocks is not None else None
+
+
+def verify_native_file(
+        path: str | Path, *, content_sha256: str, size_bytes: int,
+) -> None:
+    """Verify exact stable bytes without retaining or relocating them."""
+    _read_verified(
+        path, content_sha256=content_sha256, size_bytes=size_bytes,
+        retain_bytes=False)
+
+
+def read_verified_native_bytes(
+        path: str | Path, *, content_sha256: str, size_bytes: int,
+) -> bytes:
+    """Read the exact bytes verified by the same no-follow file descriptor."""
+    value = _read_verified(
+        path, content_sha256=content_sha256, size_bytes=size_bytes,
+        retain_bytes=True)
+    assert value is not None
+    return value
 
 
 @dataclass(frozen=True)
@@ -79,24 +156,11 @@ class NativeFilePointer:
         }))
 
     def verify_file(self) -> None:
-        path = Path(self.path)
-        if path.is_symlink():
-            raise ValueError("native output cannot be a symbolic link")
-        before = path.stat()
-        if not path.is_file():
-            raise ValueError("native output is not a regular file")
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-                digest.update(block)
-        after = path.stat()
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-            raise RuntimeError("native output changed during verification")
-        if after.st_size != self.size_bytes:
-            raise ValueError("native output size does not verify")
-        if digest.hexdigest() != self.content_sha256:
-            raise ValueError("native output content does not verify")
+        verify_native_file(
+            self.path,
+            content_sha256=self.content_sha256,
+            size_bytes=self.size_bytes,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -116,4 +180,9 @@ class NativeFilePointer:
         }, "NativeFilePointer"))
 
 
-__all__ = ["NATIVE_FILE_POINTER_VALIDATOR_KIND", "NativeFilePointer"]
+__all__ = [
+    "NATIVE_FILE_POINTER_VALIDATOR_KIND",
+    "NativeFilePointer",
+    "read_verified_native_bytes",
+    "verify_native_file",
+]

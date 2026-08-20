@@ -193,6 +193,19 @@ def plan_resampling(variable: str,
                     placement: PlacementAssessment) -> ResamplingPlan:
     """The admissible plan for this variable under this placement, or refuse."""
     rule = resampling_rule(variable)
+    if placement.status is PlacementStatus.INTEGER_COARSENING:
+        raise ResamplingNotAdmissible(
+            variable,
+            "the source is coarser than the target, so this is replication "
+            "rather than aggregation; it would manufacture spatial detail the "
+            "source does not contain and requires an explicit upsampling "
+            "transformation")
+    if placement.status is PlacementStatus.AXIS_DIRECTION_MISMATCH:
+        raise ResamplingNotAdmissible(
+            variable,
+            "source and target array axes run in opposite directions; an "
+            "explicit reorientation transformation must reverse the affected "
+            "axis before any cell correspondence can be used")
     if placement.resolvable_by_declared_transformation:
         # Placement is decidable but not yet decided: say what would settle it.
         raise ResamplingNotAdmissible(
@@ -202,12 +215,6 @@ def plan_resampling(variable: str,
             variable,
             f"placement is {placement.status.value}, so there is no defined "
             "correspondence between fine and coarse cells to aggregate over")
-    if placement.status is PlacementStatus.INTEGER_COARSENING:
-        raise ResamplingNotAdmissible(
-            variable,
-            "the source is coarser than the target, so this is replication "
-            "rather than aggregation; it would manufacture spatial detail the "
-            "source does not contain")
     if rule.requires_equal_area_blocks and not equal_area_blocks_guaranteed(
             placement):
         raise ResamplingNotAdmissible(

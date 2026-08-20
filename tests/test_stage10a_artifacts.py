@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -96,7 +97,10 @@ def test_every_resolution_refreshes_file_availability(tmp_path):
     selected = service.resolve(fixture.root_uses)
     assert selected.selected_artifacts
 
+    original_stat = native.stat()
     native.write_text("43", encoding="utf-8")
+    # Restoring size and mtime used to fool a stat-only planning snapshot.
+    os.utime(native, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
     refreshed = service.resolve(fixture.root_uses)
     assert refreshed.selected_artifacts == ()
     assert refreshed.resolution.selection.plan.total_cost_units == 3

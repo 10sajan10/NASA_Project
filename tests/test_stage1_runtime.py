@@ -20,7 +20,11 @@ from engine.runtime.artifacts import (
 from engine.runtime.controller import WorkflowController
 from engine.runtime.fixtures import retry_graph, sleeping_graph, two_task_graph
 from engine.runtime.operations import operation_component
-from engine.runtime.site import current_private_site, validate_runtime_root
+from engine.runtime.site import (
+    _cgroup_memory_limit_bytes,
+    current_private_site,
+    validate_runtime_root,
+)
 from engine.runtime.types import (
     BoundExecutionGraph,
     ResourceRequest,
@@ -297,3 +301,32 @@ def test_site_snapshot_is_explicitly_private_node():
     assert site.site_id.startswith("private-node:")
     assert site.source == "current-process-envelope"
     assert site.memory_mb == 128
+
+
+def test_cgroup_v2_memory_limit_is_part_of_the_site_envelope(tmp_path):
+    root = tmp_path / "cgroup"
+    member = root / "job.slice"
+    member.mkdir(parents=True)
+    (member / "memory.max").write_text("536870912\n", encoding="ascii")
+    proc = tmp_path / "self.cgroup"
+    proc.write_text("0::/job.slice\n", encoding="ascii")
+
+    assert _cgroup_memory_limit_bytes(
+        cgroup_root=root,
+        proc_cgroup=proc,
+        physical_bytes=8 * 1024 * 1024 * 1024,
+    ) == 512 * 1024 * 1024
+
+
+def test_unlimited_cgroup_v2_memory_is_not_a_false_constraint(tmp_path):
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    (root / "memory.max").write_text("max\n", encoding="ascii")
+    proc = tmp_path / "self.cgroup"
+    proc.write_text("0::/\n", encoding="ascii")
+
+    assert _cgroup_memory_limit_bytes(
+        cgroup_root=root,
+        proc_cgroup=proc,
+        physical_bytes=8 * 1024 * 1024 * 1024,
+    ) is None

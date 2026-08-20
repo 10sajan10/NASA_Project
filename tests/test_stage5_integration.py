@@ -118,6 +118,7 @@ def test_acquisition_replay_reconstructs_coverage_from_durable_rows():
         with pytest.raises(ValueError, match="manifests disagree"):
             AcquisitionDiscoveryReplay(
                 forged,
+                demo.acquisition_base_catalog,
                 PlanningSessionStore(root / "planning.sqlite3"),
                 ManifestShardStore(root / "manifest-shards"),
             ).verify(demo.catalog, layer)

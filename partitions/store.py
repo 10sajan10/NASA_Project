@@ -897,8 +897,11 @@ class PartitionStore:
                     parameters=dict(registered_template.parameters),
                     external_inputs=observed_task.external_inputs,
                     outputs=expected_outputs,
-                    resources=ResourceRequest(
-                        cpu_cores=1, memory_mb=128, walltime_s=60),
+                    resources=ResourceRequest.from_dict(dict(
+                        registered_template.deployment_binding
+                        .resource_request)),
+                    max_attempts=(
+                        registered_template.retry_policy.max_attempts),
                 ))
             expected_graph = BoundExecutionGraph.bind(
                 f"partition-packet-{packet.packet_id[:12]}",
@@ -1271,9 +1274,14 @@ class PartitionStore:
             raise ValueError("limit must be positive")
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT logical_task_key, partition_index FROM logical_tasks "
-                "WHERE collection_id=? AND state='ADMITTED' "
-                "ORDER BY partition_index LIMIT ?",
+                "SELECT t.logical_task_key, t.partition_index "
+                "FROM logical_tasks AS t "
+                "WHERE t.collection_id=? AND t.state='ADMITTED' "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM packet_member_leases AS l "
+                "  WHERE l.collection_id=t.collection_id "
+                "  AND l.logical_task_key=t.logical_task_key"
+                ") ORDER BY t.partition_index LIMIT ?",
                 (collection_id, limit)).fetchall()
         for key, index in rows:
             yield (key, int(index))

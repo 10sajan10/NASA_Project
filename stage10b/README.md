@@ -31,8 +31,9 @@ representation, units, spatial/time/vertical summaries, grid CRS, native
 resolution, origin, component names, producer/version, and output port.
 Scientific acceptance remains `direct_match`; the index only narrows search.
 Snapshot verification retains a durable stat fingerprint and content digest.
-The default re-hashes when device/inode/size/mtime changes; callers may request
-`ALWAYS_REHASH` for stronger local verification.
+The planning default is `ALWAYS_REHASH`; stat-fingerprint caching is an explicit
+performance opt-in with a weaker hostile-writer boundary. Hashing uses stable,
+no-follow regular-file reads.
 
 ## Acceptance
 
@@ -58,7 +59,8 @@ a cost-0 native artifact pointer.
   native file and provide the complete descriptor.
 - Target refresh currently scans all durable targets after each output event.
   Metadata lookup is indexed, but event-to-target fanout is a bounded MVP.
-- A stat fingerprint can miss hostile same-metadata mutation. Use
-  `ALWAYS_REHASH` where that threat is in scope.
+- Stat-fingerprint caching can miss hostile same-metadata mutation. It is not
+  the planning default and must be enabled explicitly where that weaker threat
+  model is acceptable.
 - No payload is copied, transformed, reprojected, resampled, or written to
   Cube. No WRF, MPI, Slurm, network provider, or heavy workload was run.

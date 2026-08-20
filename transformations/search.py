@@ -459,19 +459,28 @@ class TransformationDiscoveryReplay:
         catalog: CapabilityCatalog,
         layer: DiscoveryLayerCertificate,
     ) -> None:
-        replayed = expand_transform_catalog(
-            self.base_catalog,
-            self.transformation_catalog,
-            seed_descriptors=self.seed_descriptors,
-            artifact_leaves=self.artifact_leaves,
-            limits=self.limits,
-        )
+        replayed = self.replay()
         if replayed.discovery_layer() != layer:
             raise ValueError(
                 "transformation discovery layer disagrees with independent replay")
         if replayed.augmented_catalog != catalog:
             raise ValueError(
                 "transformation discovery catalog disagrees with independent replay")
+
+    def replay(self) -> TransformationExpansion:
+        """Recompute this one exact catalog step from its trusted inputs.
+
+        The resolver uses the returned predecessor/output pair to assemble a
+        chain.  This is intentionally distinct from :meth:`verify`, whose
+        direct-call contract still requires the replay output itself.
+        """
+        return expand_transform_catalog(
+            self.base_catalog,
+            self.transformation_catalog,
+            seed_descriptors=self.seed_descriptors,
+            artifact_leaves=self.artifact_leaves,
+            limits=self.limits,
+        )
 
 
 def _expansion_payload(

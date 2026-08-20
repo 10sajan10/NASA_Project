@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -178,7 +179,12 @@ def test_indexed_metadata_query_does_not_require_payload_open(tmp_path):
     assert snapshot.committed_records == ()
 
 
-def test_stat_receipt_avoids_rehash_until_fingerprint_changes(
+def test_bounds_query_requires_an_explicit_spatial_crs():
+    with pytest.raises(ValueError, match="requires spatial_crs"):
+        ArtifactQuery(intersects_bounds=("0", "0", "1", "1"))
+
+
+def test_cached_policy_is_opt_in_and_planning_default_always_rehashes(
         tmp_path, monkeypatch):
     import artifacts.registry as registry_module
 
@@ -190,16 +196,81 @@ def test_stat_receipt_avoids_rehash_until_fingerprint_changes(
         media_type="application/json", producer_id="source",
         producer_version="1", output_port_id="result")
 
-    real = registry_module._hash_file
+    real = registry_module._hash_file_with_fingerprint
     calls = []
     monkeypatch.setattr(
-        registry_module, "_hash_file",
+        registry_module, "_hash_file_with_fingerprint",
         lambda path: (calls.append(path), real(path))[1])
-    assert registry.snapshot().committed_records
-    assert calls == []
     assert registry.snapshot(
-        verification_policy=VerificationPolicy.ALWAYS_REHASH).committed_records
+        verification_policy=VerificationPolicy.REHASH_ON_STAT_CHANGE
+    ).committed_records
+    assert calls == []
+    assert registry.snapshot().committed_records
     assert len(calls) == 1
+
+
+def test_transient_registration_failure_recovers_on_a_later_pass(
+        tmp_path, monkeypatch):
+    fixture, registry, resolver, coordinator = _system(tmp_path)
+    target = coordinator.submit_target(fixture.root_uses)
+    native = tmp_path / "sum.json"
+    native.write_text("42", encoding="utf-8")
+    event = coordinator.enqueue_output_event(
+        producer_id="sum-file-producer",
+        outputs={"result": _sum_output(native)},
+    )
+    real_register = registry.register_records
+    calls = 0
+
+    def flaky_register(records):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is temporarily locked")
+        return real_register(records)
+
+    monkeypatch.setattr(registry, "register_records", flaky_register)
+    with pytest.raises(sqlite3.OperationalError, match="temporarily locked"):
+        coordinator.process_event(event.event_id)
+    assert coordinator.event_status(event.event_id) is \
+        OutputEventStatus.RETRYABLE
+    assert registry.records() == ()
+
+    restarted = ArtifactTargetCoordinator(
+        tmp_path / "targets.sqlite", resolver)
+    assert restarted.recover() == (event.event_id,)
+    assert restarted.event_status(event.event_id) is OutputEventStatus.APPLIED
+    assert restarted.target(target.request.target_id).status is \
+        TargetStatus.SATISFIED_BY_ARTIFACT
+    assert calls == 2
+
+
+def test_transient_registration_retries_are_bounded_and_then_terminal(
+        tmp_path, monkeypatch):
+    _fixture, registry, _resolver, coordinator = _system(tmp_path)
+    native = tmp_path / "sum.json"
+    native.write_text("42", encoding="utf-8")
+    event = coordinator.enqueue_output_event(
+        producer_id="sum-file-producer",
+        outputs={"result": _sum_output(native)},
+    )
+
+    def unavailable(_records):
+        raise sqlite3.OperationalError("temporary registry outage")
+
+    monkeypatch.setattr(registry, "register_records", unavailable)
+    with pytest.raises(sqlite3.OperationalError):
+        coordinator.process_event(event.event_id)
+    assert coordinator.event_status(event.event_id) is \
+        OutputEventStatus.RETRYABLE
+    assert coordinator.recover() == (event.event_id,)
+    assert coordinator.event_status(event.event_id) is \
+        OutputEventStatus.RETRYABLE
+    assert coordinator.recover() == (event.event_id,)
+    assert coordinator.event_status(event.event_id) is OutputEventStatus.FAILED
+    assert coordinator.recover() == ()
+    with pytest.raises(ValueError, match="only a RETRYABLE"):
+        coordinator.retry_event(event.event_id)
 
 
 def test_changed_bytes_fail_pending_event_without_false_target_refresh(tmp_path):
@@ -218,3 +289,26 @@ def test_changed_bytes_fail_pending_event_without_false_target_refresh(tmp_path)
     assert registry.records() == ()
     assert coordinator.target(target.request.target_id).status is \
         TargetStatus.PLANNED_WORKFLOW
+
+    # A terminal scientific refusal never enters automatic recovery.  An
+    # operator can reset the *same* event only after its originally prepared
+    # bytes return and every record freshly re-verifies.
+    with pytest.raises(ValueError, match="do not re-verify"):
+        coordinator.requeue_failed_event(event.event_id)
+    native.write_text("42", encoding="utf-8")
+
+    # Re-reporting restored bytes recreates the same immutable event.  A
+    # terminal event must never look like a successful output-arrival call;
+    # only the explicit operator requeue below may reopen it.
+    with pytest.raises(RuntimeError, match="was not applied: FAILED"):
+        coordinator.output_arrived(
+            producer_id="sum-file-producer",
+            outputs={"result": _sum_output(native)},
+        )
+    assert coordinator.event_status(event.event_id) is OutputEventStatus.FAILED
+
+    assert coordinator.requeue_failed_event(event.event_id) is \
+        OutputEventStatus.PENDING
+    assert coordinator.process_event(event.event_id) is OutputEventStatus.APPLIED
+    assert coordinator.target(target.request.target_id).status is \
+        TargetStatus.SATISFIED_BY_ARTIFACT

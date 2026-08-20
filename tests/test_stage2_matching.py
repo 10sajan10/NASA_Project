@@ -429,6 +429,52 @@ def test_effective_resolution_requires_applicable_frozen_evidence() -> None:
     assert MatchCode.EVIDENCE_NOT_APPLICABLE in codes(outside_proof)
 
 
+def test_generic_required_metric_rejects_wrong_definition_unit() -> None:
+    metric_id = "generic-error-v1"
+    applicability = EvidenceApplicability(
+        bbox(), "2019-09-01T00:00:00Z", "2019-09-10T00:00:00Z",
+        VerticalKind.HEIGHT_AGL, "m", "local-ground", ("10",),
+        ("warm-season",))
+    wrong_claim = EvidenceClaim.known(
+        metric_id, "2", "s", bound_kind=BoundKind.POINT_ESTIMATE,
+        reference_manifest_id="obs-manifest-sha256",
+        protocol_id="generic-error-method-v1",
+        evaluator_id="wind-evaluator-v1", applicability=applicability)
+    wrong_profile = EvidenceProfile(
+        "WindEvidencePack-v1", subject(), (wrong_claim,))
+    evaluator = MetricEvaluator(
+        "wind-evaluator-v1", "1",
+        (MetricDefinition(
+            metric_id, "1", "m", "generic-error-method-v1"),))
+    wrong_snapshot = EvidenceSnapshot(
+        "2026-08-13T00:00:00Z", evaluator, (wrong_profile,))
+    needed = replace(
+        requirement(),
+        minimum_evidence=EvidenceRequirement(
+            "WindEvidencePack-v1", False, (metric_id,)),
+        required_regimes=("warm-season",),
+    )
+
+    rejected = direct_match(
+        descriptor(), needed, wrong_profile,
+        evidence_snapshot=wrong_snapshot, evidence_subject=subject())
+    assert not rejected.satisfied
+    assert MatchCode.EVIDENCE_UNITS_MISMATCH in rejected.rejection_codes
+
+    correct_claim = EvidenceClaim.known(
+        metric_id, "2", "m", bound_kind=BoundKind.POINT_ESTIMATE,
+        reference_manifest_id="obs-manifest-sha256",
+        protocol_id="generic-error-method-v1",
+        evaluator_id="wind-evaluator-v1", applicability=applicability)
+    correct_profile = EvidenceProfile(
+        "WindEvidencePack-v1", subject(), (correct_claim,))
+    correct_snapshot = EvidenceSnapshot(
+        "2026-08-13T00:00:00Z", evaluator, (correct_profile,))
+    assert direct_match(
+        descriptor(), needed, correct_profile,
+        evidence_snapshot=correct_snapshot, evidence_subject=subject()).satisfied
+
+
 def test_evidence_regimes_are_requirement_identity_not_match_side_channel() -> None:
     profile, snapshot = evidence()
     warm = quality_requirement()

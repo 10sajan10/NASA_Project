@@ -1,8 +1,8 @@
 # Stage 6 — Dataset-versus-model slice, evidence gating, and the latency gate
 
 Status: **prototype** — implemented and acceptance-tested on 2026-08-15,
-revised 2026-08-16 after an external audit. Two exit gates do not hold: the
-Section 9.5 planning-latency budget is **measured and missed** by roughly 1.4x
+revised 2026-08-19 after correctness repairs. Two exit gates do not hold: the
+Section 9.5 planning-latency budget is **measured and missed** by 1.41x
 (see "The latency gate fails"), and the evidence driving the whole
 dataset-versus-model contest is **synthetic fixture data** — no real held-out
 reference observations exist. What the stage demonstrates is the decision
@@ -12,7 +12,8 @@ provider was run.
 **Audit corrections (2026-08-16).** Interval separation was decided by asking
 whether all intervals shared one common intersection, which is not the same as
 asking whether any pair overlaps; with A=[0,2], B=[1,3], C=[4,5] it reported
-separation while A and B plainly overlap. It is now a pairwise sweep. The
+separation while A and B plainly overlap. It is now a pairwise sweep, and
+confidence levels and uncertainty methods must also agree. The
 decision report also accepted an evidence snapshot and then ignored it, trusting
 a caller-supplied profile dictionary; readings are now resolved by deriving each
 producer's evidence subject and matching it against the frozen snapshot, and the
@@ -95,6 +96,7 @@ reported, not just the first:
 | `REFERENCE_MANIFEST_DIFFERS` | measured against different reference data |
 | `EVALUATOR_DIFFERS` / `PROTOCOL_DIFFERS` | different measuring apparatus |
 | `UNIT_DIFFERS` / `BOUND_KIND_DIFFERS` | point estimate versus conservative bound |
+| `CONFIDENCE_LEVEL_DIFFERS` / `UNCERTAINTY_METHOD_DIFFERS` | intervals were not constructed on a common basis |
 | `APPLICABILITY_DOES_NOT_COVER_REQUEST` | valid evidence, wrong place or time |
 
 Even when comparable, overlapping confidence intervals set
@@ -162,10 +164,10 @@ presolve cannot turn a feasible problem into UNSAT — the guard was the fix, an
 disabling presolve on top of it was paying twice. That bought 23.3 s → 15.1 s,
 a 37% reduction at identical cost and proven optimality.
 
-It is not enough. The remaining cost is structural: solver calls scale with
-graph width because deterministic tie-breaking freezes producer bits in
-30-bit lexicographic chunks, so a 126-invocation graph needs 11 solves rather
-than one. Closing the gate means changing that formulation or accepting a
+It is not enough. Instrumentation shows that one primary cost-MILP solve is the
+bottleneck; deterministic tie-break calls account for only about 1.4% of
+solver time. The cause of the primary solve's scaling is still unidentified.
+Closing the gate means improving that formulation or explicitly accepting a
 larger budget — both are decisions for the MVP review, not silent edits.
 
 **This result is recorded, not engineered around.** Shrinking the graph until
@@ -216,8 +218,8 @@ runtime_root=$(mktemp -d /tmp/nasa-stage6-demo.XXXXXX)
 
 ## Current limitations and non-claims
 
-- **The Section 9.5 latency gate is not met.** See above. Planning latency is
-  the largest known gap at the MVP boundary.
+- **The Section 9.5 latency gate is not met.** See above. It remains a measured
+  MVP-boundary gap.
 - The evidence in this fixture is **synthetic**. Real wind evidence remains
   unavailable: `stage2/wind_evidence_pack_v1.json` is still frozen at
   `status: UNAVAILABLE` with `NO_REVIEWED_IMMUTABLE_HELD_OUT_REFERENCE`,

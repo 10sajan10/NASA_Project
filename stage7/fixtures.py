@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from capabilities import BoundInvocation
+from plans import InvocationDeploymentBinding
 from partitions import (
     AxisKind,
     CollectionManifest,
@@ -23,13 +24,7 @@ from partitions import (
     PartitionSetSpec,
     PartitionTaskTemplate,
 )
-from resolution import (
-    DiscoveryCertificate,
-    DiscoveryUniverseContract,
-    ResolutionStatus,
-    WorkflowResolver,
-)
-from stage3.fixtures import make_composition_fixture
+from stage3.demo import Stage3DemoPlan, build_demo_plan
 
 TILE_COUNT = 100
 WINDOW_COUNT = 100
@@ -44,6 +39,7 @@ class Stage7Fixture:
     invocation_key: str
     selected_capability_id: str
     bound_invocation: BoundInvocation
+    deployment_binding: InvocationDeploymentBinding
 
 
 def make_partition_space(*, tiles: int = TILE_COUNT,
@@ -58,46 +54,30 @@ def make_partition_space(*, tiles: int = TILE_COUNT,
     ))
 
 
-_SELECTION_CACHE: BoundInvocation | None = None
+_STAGE3_PLAN_CACHE: Stage3DemoPlan | None = None
+
+
+def _stage3_plan() -> Stage3DemoPlan:
+    """One validated Stage-3 scientific and deployment selection."""
+    global _STAGE3_PLAN_CACHE
+    if _STAGE3_PLAN_CACHE is None:
+        _STAGE3_PLAN_CACHE = build_demo_plan()
+    return _STAGE3_PLAN_CACHE
 
 
 def resolve_one_selection() -> BoundInvocation:
     """Resolve once and return the exact selected root invocation."""
-    global _SELECTION_CACHE
-    if _SELECTION_CACHE is not None:
-        # The point of Stage 7 is that this resolves *once*; re-solving per
-        # partition space would contradict the property being demonstrated.
-        return _SELECTION_CACHE
-    fixture = make_composition_fixture()
-    outcome = WorkflowResolver(
-        fixture.catalog, fixture.deployment_snapshot,
-        discovery_certificate=DiscoveryCertificate.for_base_catalog(
-            fixture.catalog),
-        discovery_universe=DiscoveryUniverseContract.declare(
-            fixture.catalog.catalog_id),
-    ).resolve(fixture.root_uses)
-    if (outcome.status is not ResolutionStatus.READY
-            or outcome.selection.plan is None):
-        raise RuntimeError(
-            f"Stage-7 fixture could not resolve a selection: "
-            f"{outcome.status.value}")
-    chosen = set(outcome.selection.plan.selected_invocation_ids)
     # example-pair is genuinely selected by the resolver *and* consumes no
     # upstream inputs, so a partition of it is executable standalone. That
     # matters: a template whose inputs are unbound could not be run without
     # inventing them, which is exactly what this stage must not do.
     roots = [
-        item.invocation for item in outcome.hypergraph.invocation_nodes
-        if (item.invocation_id in chosen
-            and item.invocation.capability_id == "example-pair")]
+        invocation for invocation in _stage3_plan().selected_invocations
+        if invocation.capability_id == "example-pair"]
     if len(roots) != 1:
         raise RuntimeError(
             "Stage-7 fixture expected exactly one selected example-pair root")
-    _SELECTION_CACHE = roots[0]
-    return _SELECTION_CACHE
-
-
-_ALL_SELECTED_CACHE: tuple[BoundInvocation, ...] | None = None
+    return roots[0]
 
 
 def resolve_all_selected() -> tuple[BoundInvocation, ...]:
@@ -107,26 +87,36 @@ def resolve_all_selected() -> tuple[BoundInvocation, ...]:
     one cannot be confused with partitioning another. Fabricating a second
     invocation would reintroduce exactly the restatement this stage removed.
     """
-    global _ALL_SELECTED_CACHE
-    if _ALL_SELECTED_CACHE is not None:
-        return _ALL_SELECTED_CACHE
-    fixture = make_composition_fixture()
-    outcome = WorkflowResolver(
-        fixture.catalog, fixture.deployment_snapshot,
-        discovery_certificate=DiscoveryCertificate.for_base_catalog(
-            fixture.catalog),
-        discovery_universe=DiscoveryUniverseContract.declare(
-            fixture.catalog.catalog_id),
-    ).resolve(fixture.root_uses)
-    if (outcome.status is not ResolutionStatus.READY
-            or outcome.selection.plan is None):
-        raise RuntimeError("Stage-7 fixture could not resolve a selection")
-    chosen = set(outcome.selection.plan.selected_invocation_ids)
-    _ALL_SELECTED_CACHE = tuple(sorted(
-        (item.invocation for item in outcome.hypergraph.invocation_nodes
-         if item.invocation_id in chosen),
-        key=lambda item: item.invocation_key))
-    return _ALL_SELECTED_CACHE
+    return _stage3_plan().selected_invocations
+
+
+def deployment_binding_for(
+    invocation: BoundInvocation,
+) -> InvocationDeploymentBinding:
+    """Return Stage 3's exact placement for one selected invocation.
+
+    This deliberately does not synthesize a resource envelope in Stage 7.
+    The invocation and placement are looked up together in the validated
+    Stage-3 demo plan, and a caller cannot ask for a binding for an invocation
+    outside that frozen selection.
+    """
+    if not isinstance(invocation, BoundInvocation):
+        raise TypeError("deployment binding lookup requires a BoundInvocation")
+    plan = _stage3_plan()
+    selected = {
+        value.invocation_key: value for value in plan.selected_invocations
+    }
+    if selected.get(invocation.invocation_key) != invocation:
+        raise ValueError("invocation is not part of the Stage-3 selection")
+    bindings = {
+        value.invocation_id: value
+        for value in plan.deployment_plan.invocation_bindings
+    }
+    try:
+        return bindings[invocation.invocation_key]
+    except KeyError as exc:
+        raise RuntimeError(
+            "Stage-3 deployment plan omitted a selected invocation") from exc
 
 
 def make_stage7_fixture(
@@ -141,8 +131,9 @@ def make_stage7_fixture(
 ) -> Stage7Fixture:
     spec = make_partition_space(tiles=tiles, windows=windows)
     invocation = resolve_one_selection()
+    deployment_binding = deployment_binding_for(invocation)
     template = PartitionTaskTemplate.bind(
-        invocation,
+        invocation, deployment_binding,
         estimated_cost_units=estimated_cost_units,
         retry_safe=retry_safe)
     manifest = CollectionManifest.bind(
@@ -152,7 +143,7 @@ def make_stage7_fixture(
         minimum_fraction=minimum_fraction)
     return Stage7Fixture(
         spec, template, manifest, invocation.invocation_key,
-        invocation.capability_id, invocation)
+        invocation.capability_id, invocation, deployment_binding)
 
 
 __all__ = [
@@ -160,6 +151,7 @@ __all__ = [
     "Stage7Fixture",
     "TILE_COUNT",
     "WINDOW_COUNT",
+    "deployment_binding_for",
     "make_partition_space",
     "make_stage7_fixture",
     "resolve_all_selected",

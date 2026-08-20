@@ -119,6 +119,21 @@ def test_a_declared_1000m_nest_is_reported_as_needing_a_declared_regrid():
     assert assessment.resolvable_by_declared_transformation
 
 
+def test_a_coarser_source_is_not_directly_publishable_on_a_finer_cube():
+    """An aligned lattice cannot justify manufacturing finer values."""
+    grid = _cube_grid()
+    coarse = grid_descriptor(SimulationGrid(
+        crs_epsg=32610, pixel_m=1800.0, width=100, height=100,
+        x0=0.0, y1=180_000.0))
+    result = preflight_publications(
+        grid, [PlannedPublication("arrival_s", (100, 100), coarse)])
+    assert not result.ok
+    _, assessment = result.blocking[0]
+    assert assessment.status is PlacementStatus.INTEGER_COARSENING
+    assert assessment.resolvable_by_declared_transformation
+    assert "upsampling" in result.report()
+
+
 # -- properties ----------------------------------------------------------
 
 

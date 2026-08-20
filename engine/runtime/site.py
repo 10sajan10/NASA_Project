@@ -73,7 +73,7 @@ def current_private_site(*, memory_limit_mb: int | None = None,
     pages = os.sysconf("SC_PHYS_PAGES")
     page_size = os.sysconf("SC_PAGE_SIZE")
     physical_mb = int(pages * page_size / (1024 * 1024))
-    cgroup_limit = _cgroup_v1_memory_limit_bytes()
+    cgroup_limit = _cgroup_memory_limit_bytes()
     detected_memory_mb = min(
         physical_mb,
         int(cgroup_limit / (1024 * 1024)) if cgroup_limit else physical_mb,
@@ -137,28 +137,67 @@ def preflight_request(request: ResourceRequest,
                 f"lifetime {remaining:.1f}s")
 
 
-def _cgroup_v1_memory_limit_bytes() -> int | None:
-    """Return an effective cgroup-v1 memory limit when one is configured."""
-    cgroup_path: str | None = None
+def _cgroup_memory_limit_bytes(
+        *, cgroup_root: Path = Path("/sys/fs/cgroup"),
+        proc_cgroup: Path = Path("/proc/self/cgroup"),
+        physical_bytes: int | None = None) -> int | None:
+    """Return the effective cgroup-v2/v1 memory limit, when constrained.
+
+    Modern batch/container allocations commonly use cgroup v2.  Reading only
+    the legacy v1 controller made the site snapshot advertise host RAM even
+    when the process was confined to a much smaller ``memory.max``.
+    """
+    if physical_bytes is None:
+        try:
+            physical_bytes = (
+                os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+        except (AttributeError, OSError, ValueError):
+            physical_bytes = None
+
+    v2_path: str | None = None
+    v1_path: str | None = None
     try:
-        for line in Path("/proc/self/cgroup").read_text().splitlines():
+        for line in proc_cgroup.read_text().splitlines():
             _hierarchy, controllers, path = line.split(":", 2)
-            if "memory" in controllers.split(","):
-                cgroup_path = path.lstrip("/")
+            if controllers == "":
+                v2_path = path.lstrip("/")
+            elif "memory" in controllers.split(","):
+                v1_path = path.lstrip("/")
                 break
     except (OSError, ValueError):
-        return None
-    if cgroup_path is None:
-        return None
-    limit_path = (Path("/sys/fs/cgroup/memory") / cgroup_path
-                  / "memory.limit_in_bytes")
-    try:
-        limit = int(limit_path.read_text().strip())
-        physical = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError):
-        return None
-    # Kernels commonly encode "unlimited" as a huge value near LONG_MAX.
-    return limit if 0 < limit < physical else None
+        pass
+
+    candidates: list[Path] = []
+    if v2_path is not None:
+        candidates.append(cgroup_root / v2_path / "memory.max")
+    # The root file is useful in simple containers whose proc membership is
+    # unavailable in a restricted test/runtime environment.
+    candidates.append(cgroup_root / "memory.max")
+    if v1_path is not None:
+        candidates.append(
+            cgroup_root / "memory" / v1_path / "memory.limit_in_bytes")
+
+    limits: list[int] = []
+    for path in candidates:
+        try:
+            raw = path.read_text().strip()
+            if raw == "max":
+                continue
+            value = int(raw)
+        except (OSError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        # Kernels commonly encode a v1 "unlimited" value near LONG_MAX.
+        if physical_bytes is not None and value >= physical_bytes:
+            continue
+        limits.append(value)
+    return min(limits) if limits else None
+
+
+def _cgroup_v1_memory_limit_bytes() -> int | None:
+    """Compatibility alias retained for private callers."""
+    return _cgroup_memory_limit_bytes()
 
 
 def _device_gpu_ids() -> tuple[str, ...]:

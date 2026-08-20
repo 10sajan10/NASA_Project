@@ -242,7 +242,18 @@ class ReservationLedger:
         return self.site(site_id).capacity.minus(self.used(site_id))
 
     def can_fit(self, site_id: str, envelope: ResourceEnvelopeSpec) -> bool:
-        return envelope.fits_within(self.available(site_id))
+        site = self.site(site_id)
+        if not envelope.fits_within(self.available(site_id)):
+            return False
+        # Placement is a promise that reserve() can immediately keep.  A
+        # per-site-only answer is false when several logical sites share one
+        # physical host whose aggregate capacity is already exhausted.
+        if site.host_id is not None:
+            assert site.host_capacity is not None
+            host_free = site.host_capacity.minus(self.host_used(site.host_id))
+            if not envelope.fits_within(host_free):
+                return False
+        return True
 
     def reserve(self, task_key: str, site_id: str,
                 envelope: ResourceEnvelopeSpec) -> Reservation:
@@ -424,7 +435,16 @@ def detect_capacity(*, memory_mb: int | None = None,
         try:
             pages = os.sysconf("SC_PHYS_PAGES")
             page_size = os.sysconf("SC_PAGE_SIZE")
-            memory_mb = max(1, (pages * page_size) // (1024 * 1024))
+            physical_bytes = pages * page_size
+            # Keep the generic scheduling helper aligned with the live
+            # SiteSnapshot: cgroup-v2 memory.max is an allocation boundary,
+            # not an advisory figure.
+            from engine.runtime.site import _cgroup_memory_limit_bytes
+            cgroup_bytes = _cgroup_memory_limit_bytes(
+                physical_bytes=physical_bytes)
+            effective = (physical_bytes if cgroup_bytes is None
+                         else min(physical_bytes, cgroup_bytes))
+            memory_mb = max(1, effective // (1024 * 1024))
         except (AttributeError, OSError, ValueError):
             memory_mb = 1024
     return ResourceEnvelopeSpec(cpu_cores=max(1, cores), memory_mb=memory_mb,

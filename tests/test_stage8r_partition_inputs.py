@@ -40,14 +40,15 @@ from partitions import (
     execute_packet,
 )
 from stage3.fixtures import make_composition_fixture
-from stage7.fixtures import resolve_all_selected
+from stage7.fixtures import deployment_binding_for, resolve_all_selected
 
 
 def _add_template() -> PartitionTaskTemplate:
     invocation = next(
         value for value in resolve_all_selected()
         if value.capability_id == "example-add")
-    return PartitionTaskTemplate.bind(invocation, retry_safe=True)
+    return PartitionTaskTemplate.bind(
+        invocation, deployment_binding_for(invocation), retry_safe=True)
 
 
 def _collection(tmp_path):

@@ -53,6 +53,7 @@ class PlacementStatus(str, Enum):
     REQUIRES_DECLARED_RESAMPLING = "REQUIRES_DECLARED_RESAMPLING"
     CRS_MISMATCH = "CRS_MISMATCH"
     AXIS_ORDER_MISMATCH = "AXIS_ORDER_MISMATCH"
+    AXIS_DIRECTION_MISMATCH = "AXIS_DIRECTION_MISMATCH"
     UNDEFINED_NO_GEOREFERENCE = "UNDEFINED_NO_GEOREFERENCE"
     ROTATED_OR_SKEWED = "ROTATED_OR_SKEWED"
     DEGENERATE_GRID = "DEGENERATE_GRID"
@@ -83,16 +84,22 @@ class PlacementAssessment:
         ``REQUIRES_DECLARED_RESAMPLING`` is deliberately *not* placeable: the
         data may well be usable, but only through a declared transformation,
         and saying yes here is how a silent regrid gets back in.
+        ``INTEGER_COARSENING`` likewise describes a real lattice relationship
+        without authorizing publication: filling its finer target would invent
+        values and therefore needs an explicit upsampling transformation.
         """
         return self.status in (
             PlacementStatus.EXACT_MATCH,
             PlacementStatus.INTEGER_REFINEMENT,
-            PlacementStatus.INTEGER_COARSENING,
         )
 
     @property
     def resolvable_by_declared_transformation(self) -> bool:
-        return self.status is PlacementStatus.REQUIRES_DECLARED_RESAMPLING
+        return self.status in (
+            PlacementStatus.REQUIRES_DECLARED_RESAMPLING,
+            PlacementStatus.INTEGER_COARSENING,
+            PlacementStatus.AXIS_DIRECTION_MISMATCH,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = dataclasses.asdict(self)
@@ -209,6 +216,18 @@ def assess_placement(source: GridDescriptor,
     source_origin = _origin(source)
     target_origin = _origin(target)
 
+    reversed_axes = tuple(
+        axis for axis, source_step, target_step in zip(
+            ("x", "y"), source_cell, target_cell)
+        if (source_step < 0) != (target_step < 0))
+    if reversed_axes:
+        return PlacementAssessment(
+            PlacementStatus.AXIS_DIRECTION_MISMATCH,
+            f"source and target traverse the {'/'.join(reversed_axes)} array "
+            "axis in opposite directions; their footprints may coincide, "
+            "but cell indexes name mirrored locations until an explicit "
+            "reorientation transformation reverses the affected axis")
+
     if source.shape == target.shape and source_cell == target_cell and \
             source_origin == target_origin:
         return PlacementAssessment(
@@ -244,7 +263,9 @@ def assess_placement(source: GridDescriptor,
     elif all(item is not None and item > 1 for item in coarsening) and aligned:
         integral = (PlacementStatus.INTEGER_COARSENING, coarsening,
                     f"source is an aligned {coarsening[0]}x{coarsening[1]} "
-                    "coarsening of the target")
+                    "coarsening of the target; publishing it on the finer "
+                    "target would manufacture spatial detail, so it requires "
+                    "an explicitly declared upsampling transformation")
 
     if integral is not None and integral[0] is \
             PlacementStatus.INTEGER_REFINEMENT:

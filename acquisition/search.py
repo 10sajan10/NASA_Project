@@ -567,12 +567,19 @@ class AcquisitionDiscoveryReplay:
     """
 
     expansion: AcquisitionExpansion
+    base_catalog: "CapabilityCatalog"
     session_store: PlanningSessionStore
     shard_store: ManifestShardStore
 
     def __post_init__(self) -> None:
         if not isinstance(self.expansion, AcquisitionExpansion):
             raise TypeError("acquisition replay expansion is invalid")
+        # Import locally so acquisition remains below the capability catalog
+        # in normal module initialization while the authority boundary still
+        # requires an exact typed predecessor catalog.
+        from capabilities import CapabilityCatalog
+        if not isinstance(self.base_catalog, CapabilityCatalog):
+            raise TypeError("acquisition replay base catalog is invalid")
         if not isinstance(self.session_store, PlanningSessionStore):
             raise TypeError("acquisition replay session store is invalid")
         if not isinstance(self.shard_store, ManifestShardStore):
@@ -582,7 +589,7 @@ class AcquisitionDiscoveryReplay:
         self,
         catalog: "CapabilityCatalog",
         layer: DiscoveryLayerCertificate,
-    ) -> None:
+    ) -> "CapabilityCatalog":
         # Imports stay local so acquisition does not otherwise depend on the
         # capability catalog implementation.
         from capabilities import CapabilityCatalog
@@ -738,22 +745,91 @@ class AcquisitionDiscoveryReplay:
         authoritative_roots = {
             item.manifest_root for item in replayed_bound
         }
-        catalog_roots = {
-            item.acquisition_authority.bound_manifest["manifest"][
-                "manifest_root"]
-            for item in catalog.capabilities
-            if item.acquisition_authority is not None
-        }
-        if catalog_roots != authoritative_roots:
-            raise ValueError(
-                "acquisition catalog capabilities do not exactly project "
-                "the replayed manifests")
         if self.expansion.discovery_layer() != layer:
             raise ValueError(
                 "acquisition discovery layer disagrees with session replay")
         if layer not in catalog.discovery_provenance.layers:
             raise ValueError(
                 "acquisition discovery layer is absent from the final catalog")
+
+        # Project exactly one catalog step from the trusted predecessor.  A
+        # replay may account for one capability per manifest root, never for
+        # arbitrary siblings that merely share the same layer kind.  All base
+        # content must survive byte-for-byte; additions must be self-verifying
+        # acquisition capabilities present in the final catalog.
+        if layer in self.base_catalog.discovery_provenance.layers:
+            raise ValueError(
+                "acquisition discovery layer is already present in its base")
+        final_capabilities = {
+            item.spec_id: item for item in catalog.capabilities
+        }
+        final_profiles = {
+            item.profile_id: item for item in catalog.execution_profiles
+        }
+        if any(final_capabilities.get(item.spec_id) != item
+               for item in self.base_catalog.capabilities):
+            raise ValueError(
+                "final catalog removed or changed acquisition replay base content")
+        if any(final_profiles.get(item.profile_id) != item
+               for item in self.base_catalog.execution_profiles):
+            raise ValueError(
+                "final catalog removed or changed acquisition replay base profiles")
+
+        def by_manifest_root(subject: "CapabilityCatalog"):
+            values = {}
+            for capability in subject.capabilities:
+                authority = capability.acquisition_authority
+                if authority is None:
+                    continue
+                root = authority.bound_manifest["manifest"]["manifest_root"]
+                if root in values:
+                    raise ValueError(
+                        "acquisition catalog contains multiple capabilities "
+                        "for one replayed manifest")
+                values[root] = capability
+            return values
+
+        base_by_root = by_manifest_root(self.base_catalog)
+        final_by_root = by_manifest_root(catalog)
+        additions = []
+        for root in sorted(authoritative_roots):
+            base_capability = base_by_root.get(root)
+            final_capability = final_by_root.get(root)
+            if base_capability is not None:
+                if final_capability != base_capability:
+                    raise ValueError(
+                        "final catalog changed a replayed acquisition capability")
+                continue
+            if final_capability is None:
+                raise ValueError(
+                    "acquisition catalog omits a replayed manifest")
+            additions.append(final_capability)
+
+        capabilities = {
+            item.spec_id: item for item in self.base_catalog.capabilities
+        }
+        profiles = {
+            item.profile_id: item
+            for item in self.base_catalog.execution_profiles
+        }
+        for capability in additions:
+            previous = capabilities.setdefault(
+                capability.spec_id, capability)
+            if previous != capability:
+                raise ValueError(
+                    "acquisition replay capability identity collision")
+            profile = final_profiles[capability.execution_profile_id]
+            previous_profile = profiles.setdefault(profile.profile_id, profile)
+            if previous_profile != profile:
+                raise ValueError(
+                    "acquisition replay profile identity collision")
+
+        return CapabilityCatalog.freeze(
+            capabilities.values(), profiles.values(),
+            discovery_base_catalog_id=self.base_catalog.catalog_id,
+            discovery_layers=(
+                *self.base_catalog.discovery_provenance.layers, layer),
+        )
 
 
 class AcquisitionSearch:

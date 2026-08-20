@@ -16,13 +16,18 @@ from .types import (
     ExternalArtifactInputBinding,
     ExternalHandle,
     InputBinding,
+    InputArtifactSource,
     OutputSpec,
     ProviderObservation,
     ResourceRequest,
+    RegisteredArtifactInputBinding,
+    RegisteredArtifactDelivery,
+    RegisteredArtifactInputReceipt,
     RunState,
     ScientificArtifactBinding,
     SiteSnapshot,
     TaskState,
+    TaskInputLineage,
     TaskTemplate,
     WakeKind,
 )
@@ -32,7 +37,12 @@ from .types import (
 # controller state.
 from .controller import WorkflowController
 from .provider import LocalSubprocessProvider, SubmissionOutcomeUnknown
-from .native import NATIVE_FILE_POINTER_VALIDATOR_KIND, NativeFilePointer
+from .native import (
+    NATIVE_FILE_POINTER_VALIDATOR_KIND,
+    NativeFilePointer,
+    read_verified_native_bytes,
+    verify_native_file,
+)
 
 __all__ = [
     "ArtifactRecipe",
@@ -45,18 +55,25 @@ __all__ = [
     "ExternalArtifactInputBinding",
     "ExternalHandle",
     "InputBinding",
+    "InputArtifactSource",
     "OutputSpec",
     "ProviderObservation",
     "ResourceRequest",
+    "RegisteredArtifactInputBinding",
+    "RegisteredArtifactDelivery",
+    "RegisteredArtifactInputReceipt",
     "RunState",
     "ScientificArtifactBinding",
     "SiteSnapshot",
     "TaskState",
+    "TaskInputLineage",
     "TaskTemplate",
     "WakeKind",
     "WorkflowController",
     "LocalSubprocessProvider",
     "NATIVE_FILE_POINTER_VALIDATOR_KIND",
     "NativeFilePointer",
+    "read_verified_native_bytes",
+    "verify_native_file",
     "SubmissionOutcomeUnknown",
 ]

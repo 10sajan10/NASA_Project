@@ -94,7 +94,23 @@ def _synthetic(*, cols: int = 21, rows: int = 21, cell: float = 900.0,
     elif sr is not None:
         dimensions["south_north_subgrid"] = _Dim((rows + 1) * sr)
         dimensions["west_east_subgrid"] = _Dim((cols + 1) * sr)
+        fire_cell = cell / sr
+        fire_xs = -5_000.0 + (np.arange((cols + 1) * sr) + 0.5) * fire_cell
+        fire_ys = -6_000.0 + (np.arange((rows + 1) * sr) + 0.5) * fire_cell
+        fire_x, fire_y = np.meshgrid(fire_xs, fire_ys)
+        fire_lon, fire_lat = inverse.transform(fire_x, fire_y)
+        variables["FXLONG"] = np.asarray(fire_lon)[None, ...]
+        variables["FXLAT"] = np.asarray(fire_lat)[None, ...]
     return _Dataset(attrs, variables, dimensions)
+
+
+def _replay_coordinates(grid, projection: str):
+    """Coordinate fields obtained from the descriptor's exact affine."""
+    inverse = Transformer.from_crs(
+        CRS.from_proj4(projection), 4326, always_xy=True)
+    xs = float(grid.affine[2]) + np.arange(grid.shape[1]) * float(grid.affine[0])
+    ys = float(grid.affine[5]) + np.arange(grid.shape[0]) * float(grid.affine[4])
+    return inverse.transform(*np.meshgrid(xs, ys))
 
 
 # -- real WRF output -----------------------------------------------------
@@ -178,6 +194,39 @@ def test_the_real_fire_mesh_is_a_tenth_of_the_atmospheric_cell():
     assert float(georeference.fire.affine[0]) == 90.0
 
 
+def test_the_real_fire_affine_replays_native_row_coordinates():
+    """The fire descriptor indexes the same cells as FXLONG/FXLAT.
+
+    Sampling both y extremes makes this a regression for a vertical mirror,
+    while avoiding allocation of another full 2130x2130 coordinate field.
+    """
+    netCDF4 = pytest.importorskip("netCDF4")
+    path = _real("d03")
+    georeference = read_wrf_georeference(path)
+    dataset = netCDF4.Dataset(str(path))
+    inverse = Transformer.from_crs(
+        CRS.from_proj4(georeference.proj4), 4326, always_xy=True)
+    samples = ((0, 0), (0, 2129), (1065, 1065),
+               (2129, 0), (2129, 2129))
+    try:
+        native_lon = dataset.variables["FXLONG"][0]
+        native_lat = dataset.variables["FXLAT"][0]
+        for row, col in samples:
+            x = (float(georeference.fire.affine[2])
+                 + col * float(georeference.fire.affine[0]))
+            y = (float(georeference.fire.affine[5])
+                 + row * float(georeference.fire.affine[4]))
+            replay_lon, replay_lat = inverse.transform(x, y)
+            metres_per_degree = np.pi * WRF_EARTH_RADIUS_M / 180.0
+            dy = (replay_lat - float(native_lat[row, col])) * metres_per_degree
+            dx = ((replay_lon - float(native_lon[row, col]))
+                  * metres_per_degree
+                  * np.cos(np.radians(float(native_lat[row, col]))))
+            assert np.hypot(dx, dy) < 10.0
+    finally:
+        dataset.close()
+
+
 def test_the_real_outer_domains_carry_no_fire_grid():
     """Fire lives only on the innermost nest; nothing is invented for d01/d02."""
     for domain, shape in (("d01", (148, 148)), ("d02", (177, 177))):
@@ -250,6 +299,31 @@ def test_a_consistent_synthetic_file_verifies():
     assert georeference.valid_fire_shape == (210, 210)
     assert georeference.subgrid_ratio == (10, 10)
     assert georeference.max_coordinate_residual_m < 1.0
+
+
+def test_atmospheric_affine_replays_native_array_coordinates():
+    dataset = _synthetic()
+    georeference = georeference_from_dataset(dataset)
+    replay_lon, replay_lat = _replay_coordinates(
+        georeference.atmospheric, georeference.proj4)
+    np.testing.assert_allclose(replay_lon, dataset.variables["XLONG"][0],
+                               atol=1e-9)
+    np.testing.assert_allclose(replay_lat, dataset.variables["XLAT"][0],
+                               atol=1e-9)
+    assert float(georeference.atmospheric.affine[4]) > 0
+
+
+def test_fire_affine_replays_native_array_coordinates():
+    dataset = _synthetic()
+    georeference = georeference_from_dataset(dataset)
+    replay_lon, replay_lat = _replay_coordinates(
+        georeference.fire, georeference.proj4)
+    rows, cols = georeference.valid_fire_slice()
+    np.testing.assert_allclose(
+        replay_lon, dataset.variables["FXLONG"][0, rows, cols], atol=1e-9)
+    np.testing.assert_allclose(
+        replay_lat, dataset.variables["FXLAT"][0, rows, cols], atol=1e-9)
+    assert float(georeference.fire.affine[4]) > 0
 
 
 def test_a_grid_that_misses_the_files_own_coordinates_is_refused():

@@ -60,6 +60,91 @@ def _resolver(expansion, fixture, **kwargs):
     )
 
 
+def _two_transformation_layers():
+    fixture = make_unit_bridge_fixture()
+    catalog = TransformationCatalog.freeze(fixture.transformations)
+    first = expand_transform_catalog(fixture.base_catalog, catalog)
+    second = expand_transform_catalog(first.augmented_catalog, catalog)
+    scope = DiscoveryLayerScope.bind(
+        "TRANSFORMATION_EXPANSION",
+        source_ids=(catalog.catalog_id,),
+        limits=TransformationSearchLimits().to_dict(),
+    )
+    universe = DiscoveryUniverseContract.declare(
+        first.augmented_catalog.catalog_id, (scope, scope))
+    replays = (
+        TransformationDiscoveryReplay.bind(fixture.base_catalog, catalog),
+        TransformationDiscoveryReplay.bind(first.augmented_catalog, catalog),
+    )
+    return fixture, catalog, first, second, universe, replays
+
+
+def test_two_same_kind_layers_replay_by_exact_expansion_identity():
+    fixture, _catalog, first, second, universe, replays = (
+        _two_transformation_layers())
+    assert first.expansion_id != second.expansion_id
+    assert len(second.discovery_certificate().layers) == 2
+
+    outcome = WorkflowResolver(
+        second.augmented_catalog,
+        fixture.deployment_snapshot,
+        discovery_certificate=second.discovery_certificate(),
+        discovery_universe=universe,
+        # Deliberately reverse them: mapping is by exact replay output, not
+        # tuple position or the non-unique TRANSFORMATION_EXPANSION label.
+        discovery_replays=tuple(reversed(replays)),
+    ).resolve(fixture.root_uses)
+
+    assert outcome.status is ResolutionStatus.READY
+    assert outcome.eligible_for_binding
+
+
+def test_one_replay_cannot_cover_two_same_kind_layers():
+    fixture, _catalog, _first, second, universe, replays = (
+        _two_transformation_layers())
+    with pytest.raises(
+            ValueError, match="every discovered catalog layer requires"):
+        WorkflowResolver(
+            second.augmented_catalog,
+            fixture.deployment_snapshot,
+            discovery_certificate=second.discovery_certificate(),
+            discovery_universe=universe,
+            discovery_replays=(replays[1],),
+        )
+
+
+def test_replay_chain_rejects_an_unaccounted_final_capability():
+    from stage3.fixtures import make_composition_fixture
+
+    fixture, _catalog, _first, second, universe, replays = (
+        _two_transformation_layers())
+    donor = make_composition_fixture().catalog
+    extra = donor.capabilities[0]
+    extra_profile = donor.profile(extra.execution_profile_id)
+    profiles = {
+        item.profile_id: item
+        for item in second.augmented_catalog.execution_profiles
+    }
+    profiles[extra_profile.profile_id] = extra_profile
+    forged = CapabilityCatalog.freeze(
+        (*second.augmented_catalog.capabilities, extra),
+        profiles.values(),
+        discovery_base_catalog_id=(
+            second.augmented_catalog.discovery_provenance.base_catalog_id),
+        discovery_layers=(
+            second.augmented_catalog.discovery_provenance.layers),
+    )
+
+    with pytest.raises(ValueError, match="exact chain to the final catalog"):
+        WorkflowResolver(
+            forged,
+            fixture.deployment_snapshot,
+            discovery_certificate=DiscoveryCertificate.for_catalog(forged),
+            discovery_universe=universe,
+            discovery_replays=replays,
+        )
+
+
 def test_explicit_transformation_beats_a_more_expensive_direct_source():
     demo = build_demo_plan()
 

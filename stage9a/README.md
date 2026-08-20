@@ -2,9 +2,11 @@
 
 Status: **implemented against a simulated scheduler; not validated against a
 real one.** No job was ever submitted to any cluster during this work, and this
-node is not a SLURM submit environment. Every behavioural test drives a fake
-SLURM through the provider's command seam. Treat this as a provider that is
-*ready to be validated*, not one that has been.
+work records no authorized site/allocation on which to certify it. Every
+behavioural test drives a fake Slurm service through the provider's command
+seam. Installed client binaries, when present, are consulted only for `--help`
+compatibility and do not establish scheduler reachability or authorization.
+Treat this as a provider ready for site validation, not one that has passed it.
 
 The stage is explicitly conditional in the roadmap: it is required only when a
 chosen execution profile cannot run in a verified fixed allocation, or when
@@ -65,7 +67,7 @@ provider re-queries before concluding.
 
 ## Test coverage
 
-`tests/test_stage9a_slurm.py` — 20 tests against a fake scheduler covering the
+`tests/test_stage9a_slurm.py` exercises the fake scheduler across the
 crash window after `sbatch`, recovery of an already-finished job, `sbatch`
 failing after the job landed, a wholly unreachable cluster, a partially
 reachable one, every terminal SLURM state, completion without a result
@@ -77,19 +79,21 @@ queues no work when they are present.
 
 ## What this does not do
 
-- **It has never talked to a real scheduler.** No `sbatch` has been run. Every
-  assertion here is about behaviour against a fake, so real-cluster quirks —
+- **It has never talked to a real scheduler.** No real `sbatch` has been run by
+  the acceptance path. Every assertion here is about behaviour against a fake,
+  so real-cluster quirks —
   accounting lag, `sacct` purge windows, partition policy, QOS rejection,
   federation job-ID suffixes — are unverified.
-- **It is not wired into `WorkflowController`.** The provider implements the
-  submit/reconcile/cancel boundary but the controller still uses the local
-  subprocess provider; selecting a provider per execution profile is unbuilt.
+- **Provider choice is not automatic.** `WorkflowController` can execute and
+  commit through a caller-supplied `SlurmProvider`, and that path is exercised
+  against the fake scheduler. The target/deployment service does not yet choose
+  and configure this provider from an execution profile.
 - **No MPI gang task.** The roadmap asks that an MPI invocation be represented
   as one SLURM-managed gang task. `SlurmSubmitOptions` carries `nodes` and
   `ntasks`, but no MPI fixture exists and none has been run.
-- **No job script generation.** `submit()` expects a script at
-  `<stage_dir>/supervisor/job.sh`; producing that from a `TaskTemplate` is part
-  of the controller integration and is not written.
+- **Job scripts are deliberately narrow.** The provider writes a deterministic
+  one-node, one-task closed-worker script from the immutable `AttemptSpec`. It
+  does not generate arbitrary user scripts, MPI launchers, or site modules.
 - **No 9A-Scale array support** — stable index manifests, `MaxArraySize`
   chunking, batched element reconciliation, failed-element-only retry. The
   roadmap puts that after Stage 7 and a measured need.

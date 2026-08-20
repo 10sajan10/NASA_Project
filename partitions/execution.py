@@ -88,6 +88,8 @@ def compile_packet(template: PartitionTaskTemplate,
     if component != invocation.implementation.verify_current():
         raise PartitionNotExecutable(
             "the template's implementation is stale against the closed registry")
+    resources = ResourceRequest.from_dict(
+        dict(template.deployment_binding.resource_request))
 
     parameters = dict(template.parameters)
     outputs = tuple(OutputSpec(
@@ -153,8 +155,8 @@ def compile_packet(template: PartitionTaskTemplate,
             parameters=parameters,
             external_inputs=external_inputs,
             outputs=outputs,
-            resources=ResourceRequest(cpu_cores=1, memory_mb=128,
-                                      walltime_s=60),
+            resources=resources,
+            max_attempts=template.retry_policy.max_attempts,
         ))
     return BoundExecutionGraph.bind(
         f"partition-packet-{packet.packet_id[:12]}", tuple(tasks))

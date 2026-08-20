@@ -13,9 +13,10 @@ Consumes:
 Produces:
   ``arrival_s`` from ``TIGN_G``, ``fire_area`` from ``FIRE_AREA``.
 
-Setup notes (cloning WRF-SFIRE / WPS / WPS_GEOG, compile flags,
-``module load`` recipes, WRFx context) live in ``docs/wrf_sfire.md``;
-keeping them there lets this file stay focused on runtime translation.
+Current integration limits and placement requirements live in
+``stage9b/README.md``. Reproducible build guidance lives in
+``provision/README.md``; keeping those concerns out of this module lets it
+stay focused on the retained legacy runtime translation path.
 """
 from __future__ import annotations
 
@@ -234,7 +235,7 @@ class WRFSFireAdapter(ModelAdapter):
 
         Thin pass-through to
         ``models.wrf_sfire_bootstrap.bootstrap_wrf_sfire_stack``. See
-        ``docs/wrf_sfire.md`` for what the bootstrap does.
+        ``provision/README.md`` for the bounded provisioning contract.
         """
         from .wrf_sfire_bootstrap import bootstrap_wrf_sfire_stack
         return bootstrap_wrf_sfire_stack(

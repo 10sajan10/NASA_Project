@@ -14,20 +14,25 @@ existing cubes keep working unchanged.
 """
 from __future__ import annotations
 import dataclasses
-import hashlib
 import json
+import os
+import stat
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 import duckdb
 
+from artifacts.registry import _hash_file_with_fingerprint
 from engine.runtime.identity import strict_canonical_json, strict_json_loads
 
 from .entries import (
     CubeEntry,
     bbox_lonlat_from_grid,
+    DatasetLocatorConflict,
+    DatasetMetadataConflict,
+    EntryLocator,
     ProjectionAuthority,
     EntryInput,
     EntryNotFound,
@@ -114,6 +119,27 @@ CREATE TABLE IF NOT EXISTS entry_inputs (
 );
 CREATE INDEX IF NOT EXISTS entry_inputs_input ON entry_inputs (input_entry_id);
 
+-- v3.3: scientific identity and retrieval location have different lifetimes.
+-- Locator rows are immutable verification receipts.  The one mutable head is
+-- explicit and contains no scientific metadata; moving a file therefore does
+-- not rewrite the entry or invalidate cascade edges that name its entry_id.
+CREATE TABLE IF NOT EXISTS entry_locators (
+    locator_id      TEXT PRIMARY KEY,
+    entry_id        TEXT NOT NULL,
+    location        TEXT NOT NULL,
+    content_sha256  TEXT NOT NULL,
+    media_type      TEXT NOT NULL,
+    registered_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (entry_id, location)
+);
+CREATE INDEX IF NOT EXISTS entry_locators_entry
+    ON entry_locators (entry_id, registered_at);
+
+CREATE TABLE IF NOT EXISTS entry_locator_heads (
+    entry_id    TEXT PRIMARY KEY,
+    locator_id  TEXT NOT NULL UNIQUE
+);
+
 -- Stage 8R: authoritative RuntimeStore -> Cube projection receipts.  This is
 -- additive to the v3 immutable-entry model.  The receipt stores the complete
 -- scientific descriptor and exact runtime/artifact/lineage identities; it is
@@ -144,8 +170,9 @@ ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS source_url    TEXT DEFAULT '';
 ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS license       TEXT DEFAULT '';
 ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS checksum      TEXT DEFAULT '';
 ALTER TABLE tiles     ADD COLUMN IF NOT EXISTS run_id        TEXT DEFAULT '';
--- v3.1: an entry must say WHERE it is and in WHAT format, or it can be
--- described but never retrieved. Additive, so existing cubes keep working.
+-- v3.1 legacy inline locator columns. v3.3 registrations use immutable
+-- entry_locators plus an explicit head, but these remain as an additive
+-- fallback so existing cubes keep working.
 ALTER TABLE entries   ADD COLUMN IF NOT EXISTS location      TEXT DEFAULT '';
 ALTER TABLE entries   ADD COLUMN IF NOT EXISTS media_type    TEXT DEFAULT '';
 ALTER TABLE entries   ADD COLUMN IF NOT EXISTS detail_json   TEXT DEFAULT '';
@@ -351,15 +378,15 @@ class Catalog:
                 "VALUES (?, ?, ?)",
                 [entry.entry_id, edge.port, edge.entry_id])
 
-    def _commit_entry_for_test_fixture(self, entry: CubeEntry) -> CubeEntry:
-        """Internal-only constructor for isolated Cube semantic tests.
+    def _commit_semantic_entry(self, entry: CubeEntry) -> CubeEntry:
+        """Commit one scientific entry after its caller established authority.
 
-        Runtime or application code must never use this path.  Its leading
-        underscore and explicit name make that non-authoritative scope visible
-        at every call site; no public alias exists.
+        Fixture construction and verified native-dataset registration share
+        this lineage/depth implementation.  The authoritative projection path
+        additionally proves exact projected parents before using the lower
+        level ``_insert_entry_rows`` primitive; its stronger checks are not
+        weakened or duplicated here.
         """
-        if not isinstance(entry, CubeEntry):
-            raise TypeError("fixture publication requires a typed CubeEntry")
         existing = self.entry(entry.entry_id)
         if existing is not None:
             return existing
@@ -373,7 +400,160 @@ class Catalog:
                     "committed; a cascade edge cannot point at nothing")
             depth = max(depth, parent.depth + 1)
         self._insert_entry_rows(entry, depth)
-        return self.entry(entry.entry_id)
+        committed = self.entry(entry.entry_id)
+        if committed is None:  # pragma: no cover - insertion invariant
+            raise RuntimeError("Cube entry insert produced no entry")
+        return committed
+
+    def _commit_entry_for_test_fixture(self, entry: CubeEntry) -> CubeEntry:
+        """Internal-only constructor for isolated Cube semantic tests.
+
+        Runtime or application code must never use this path.  Its leading
+        underscore and explicit name make that non-authoritative scope visible
+        at every call site; no public alias exists.
+        """
+        if not isinstance(entry, CubeEntry):
+            raise TypeError("fixture publication requires a typed CubeEntry")
+        return self._commit_semantic_entry(entry)
+
+    @staticmethod
+    def _dataset_digest(path: Path) -> str:
+        """Digest one stable regular file without following its final link.
+
+        The shared verifier compares lexical-path, open-descriptor, and
+        post-read fingerprints. A symlink, non-regular file, replacement, or
+        mutation therefore cannot mint a locator receipt.
+        """
+        lexical = path.lstat()
+        if stat.S_ISLNK(lexical.st_mode):
+            raise ValueError("dataset location cannot be a symbolic link")
+        if not stat.S_ISREG(lexical.st_mode):
+            raise FileNotFoundError(
+                f"dataset location is not a regular file: {path}")
+        digest, _, _ = _hash_file_with_fingerprint(path)
+        return digest
+
+    @staticmethod
+    def _absolute_lexical(path) -> Path:
+        """Absolute spelling without resolving away a final symbolic link."""
+        return Path(os.path.abspath(os.fspath(path)))
+
+    @staticmethod
+    def _registration_metadata(entry: CubeEntry) -> dict:
+        """Immutable discovery metadata excluded from scientific identity."""
+        return {
+            "media_type": entry.media_type,
+            "detail": entry.detail,
+            "time_start": entry.time_start,
+            "time_end": entry.time_end,
+            "variables": entry.variables,
+            "bbox_lonlat": entry.bbox_lonlat,
+        }
+
+    def _require_registration_metadata_match(
+            self, stored: CubeEntry, proposed: CubeEntry) -> None:
+        old = self._registration_metadata(stored)
+        new = self._registration_metadata(proposed)
+        differing = sorted(name for name in old if old[name] != new[name])
+        if differing:
+            raise DatasetMetadataConflict(
+                f"entry {stored.entry_id[:12]} is already registered with "
+                f"different immutable discovery metadata: "
+                f"{', '.join(differing)}")
+
+    def _insert_locator(self, locator: EntryLocator) -> EntryLocator:
+        existing = self.con.execute(
+            "SELECT locator_id,entry_id,location,content_sha256,media_type,"
+            "registered_at FROM entry_locators WHERE entry_id=? AND location=?",
+            [locator.entry_id, locator.location],
+        ).fetchone()
+        if existing is not None:
+            persisted = EntryLocator(*existing)
+            if persisted.locator_id != locator.locator_id:
+                raise DatasetMetadataConflict(
+                    "one entry location is already bound to different locator "
+                    "metadata")
+            return persisted
+        registered_at = locator.registered_at or datetime.now()
+        latest = self.con.execute(
+            "SELECT MAX(registered_at) FROM entry_locators WHERE entry_id=?",
+            [locator.entry_id],
+        ).fetchone()[0]
+        if latest is not None and registered_at <= latest:
+            registered_at = latest + timedelta(microseconds=1)
+        self.con.execute(
+            "INSERT INTO entry_locators "
+            "(locator_id,entry_id,location,content_sha256,media_type,"
+            "registered_at) VALUES(?,?,?,?,?,?)",
+            [locator.locator_id, locator.entry_id, locator.location,
+             locator.content_sha256, locator.media_type, registered_at],
+        )
+        row = self.con.execute(
+            "SELECT locator_id,entry_id,location,content_sha256,media_type,"
+            "registered_at FROM entry_locators WHERE locator_id=?",
+            [locator.locator_id],
+        ).fetchone()
+        if row is None:  # pragma: no cover - insertion invariant
+            raise RuntimeError("Cube locator insert produced no receipt")
+        return EntryLocator(*row)
+
+    def _set_locator_head(self, locator: EntryLocator) -> None:
+        self.con.execute(
+            "INSERT INTO entry_locator_heads(entry_id,locator_id) VALUES(?,?) "
+            "ON CONFLICT(entry_id) DO UPDATE SET locator_id=excluded.locator_id",
+            [locator.entry_id, locator.locator_id])
+
+    def current_locator(self, entry_id: str) -> EntryLocator | None:
+        """The explicit current locator receipt for one scientific entry."""
+        head = self.con.execute(
+            "SELECT locator_id FROM entry_locator_heads WHERE entry_id=?",
+            [entry_id],
+        ).fetchone()
+        if head is None:
+            return None
+        row = self.con.execute(
+            "SELECT locator_id,entry_id,location,content_sha256,media_type,"
+            "registered_at FROM entry_locators WHERE locator_id=?", [head[0]],
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"entry {entry_id[:12]} has a locator head without its receipt")
+        locator = EntryLocator(*row)
+        if locator.entry_id != entry_id:
+            raise RuntimeError("entry locator head points at another entry")
+        scientific = self.con.execute(
+            "SELECT content_sha256 FROM entries WHERE entry_id=?", [entry_id],
+        ).fetchone()
+        if scientific is None:
+            raise RuntimeError("entry locator head has no scientific entry")
+        if locator.content_sha256 != scientific[0]:
+            raise RuntimeError(
+                "entry locator content does not match its scientific entry")
+        return locator
+
+    def locator_history(self, entry_id: str) -> tuple[EntryLocator, ...]:
+        """Immutable registration history, oldest receipt first."""
+        rows = self.con.execute(
+            "SELECT locator_id,entry_id,location,content_sha256,media_type,"
+            "registered_at FROM entry_locators WHERE entry_id=? "
+            "ORDER BY registered_at,locator_id", [entry_id],
+        ).fetchall()
+        return tuple(EntryLocator(*row) for row in rows)
+
+    def _materialize_legacy_locator(self, entry: CubeEntry) -> EntryLocator | None:
+        """Lift a pre-v3.3 inline location into explicit locator history."""
+        current = self.current_locator(entry.entry_id)
+        if current is not None:
+            return current
+        if not entry.location or not entry.media_type:
+            return None
+        locator = self._insert_locator(EntryLocator.create(
+            entry_id=entry.entry_id,
+            location=str(self._absolute_lexical(entry.location)),
+            content_sha256=entry.content_sha256,
+            media_type=entry.media_type))
+        self._set_locator_head(locator)
+        return locator
 
     def register_dataset(self, entry: CubeEntry, path) -> CubeEntry:
         """Catalog a file that already exists, without copying or converting it.
@@ -389,23 +569,27 @@ class Catalog:
         proves this system produced the bytes. Registration proves only that a
         file exists at a path with the recorded digest, which is what a catalog
         of external outputs can honestly claim.
+
+        Re-registering the same scientific entry is idempotent at one path. A
+        new path becomes current only after exact digest verification and only
+        when the previous locator is missing or no longer contains those
+        bytes. Two simultaneously content-valid paths are an ambiguity and are
+        refused. Discovery metadata is immutable and must agree exactly.
         """
-        located = Path(path).resolve()
+        if not isinstance(entry, CubeEntry):
+            raise TypeError("dataset registration requires a typed CubeEntry")
+        located = self._absolute_lexical(path)
         if not entry.location:
             raise ValueError(
                 "a registered dataset must record its location, or it can be "
                 "described but never retrieved")
-        recorded_location = Path(entry.location).resolve()
+        recorded_location = self._absolute_lexical(entry.location)
         if recorded_location != located:
             raise ValueError(
                 "registered dataset path must equal the catalogued location")
-        if not located.is_file():
-            raise FileNotFoundError(f"no dataset at {located}")
-        digest = hashlib.sha256()
-        with located.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        if digest.hexdigest() != entry.content_sha256:
+        if not entry.media_type:
+            raise ValueError("a registered dataset must declare its media type")
+        if self._dataset_digest(located) != entry.content_sha256:
             raise ValueError(
                 f"{located} does not match its recorded content digest; "
                 "the catalog would point at bytes that changed")
@@ -415,7 +599,55 @@ class Catalog:
             derived = bbox_lonlat_from_grid(entry.grid)
             if derived is not None:
                 entry = dataclasses.replace(entry, bbox_lonlat=derived)
-        return self._commit_entry_for_test_fixture(entry)
+
+        proposed_locator = EntryLocator.create(
+            entry_id=entry.entry_id,
+            location=str(located),
+            content_sha256=entry.content_sha256,
+            media_type=entry.media_type)
+
+        self.con.execute("BEGIN TRANSACTION")
+        try:
+            stored = self.entry(entry.entry_id)
+            if stored is not None:
+                self._require_registration_metadata_match(stored, entry)
+                current = self._materialize_legacy_locator(stored)
+                if (current is not None
+                        and current.location != proposed_locator.location):
+                    previous = Path(current.location)
+                    try:
+                        previous_is_valid = (
+                            self._dataset_digest(previous)
+                            == current.content_sha256)
+                    except (FileNotFoundError, ValueError):
+                        # Missing, non-regular, and symlink replacements are no
+                        # longer valid locators. A concurrent mutation instead
+                        # raises RuntimeError and fails closed.
+                        previous_is_valid = False
+                    if previous_is_valid:
+                        raise DatasetLocatorConflict(
+                            f"entry {entry.entry_id[:12]} already has a live, "
+                            f"content-valid locator at {current.location}; "
+                            f"refusing ambiguous second locator "
+                            f"{proposed_locator.location}")
+            else:
+                # Location and format belong to the locator receipt, not the
+                # immutable scientific row. Legacy columns remain only as a
+                # backwards-compatible fallback for old catalogs.
+                semantic_entry = dataclasses.replace(
+                    entry, location="", media_type="")
+                self._commit_semantic_entry(semantic_entry)
+
+            persisted_locator = self._insert_locator(proposed_locator)
+            self._set_locator_head(persisted_locator)
+            self.con.execute("COMMIT")
+        except BaseException:
+            self.con.execute("ROLLBACK")
+            raise
+        registered = self.entry(entry.entry_id)
+        if registered is None:  # pragma: no cover - transaction invariant
+            raise RuntimeError("dataset registration committed without an entry")
+        return registered
 
     def search(self, *, concept: str | None = None,
                producer: str | None = None, media_type: str | None = None,
@@ -428,6 +660,8 @@ class Catalog:
         Every filter is optional and they compose; omitting all of them lists
         the catalog. Time and bbox use *overlap*, not containment, because a
         consumer asking for a window wants everything intersecting it.
+        Returned locations and media types come from each entry's explicit
+        current locator receipt rather than its legacy inline columns.
 
         Entries that declare no coverage are not silently excluded by a
         coverage filter -- an unstated extent is unknown, not empty, and
@@ -436,7 +670,7 @@ class Catalog:
         clauses: list[str] = []
         params: list[object] = []
         for column, value in (("concept", concept), ("producer", producer),
-                              ("media_type", media_type), ("kind", kind)):
+                              ("kind", kind)):
             if value is not None:
                 clauses.append(f"{column} = ?")
                 params.append(value)
@@ -446,6 +680,8 @@ class Catalog:
         ).fetchall()
         found = [self._entry_from_row(row) for row in rows]
 
+        if media_type is not None:
+            found = [item for item in found if item.media_type == media_type]
         if variable is not None:
             found = [item for item in found
                      if variable in item.variables or not item.variables]
@@ -498,16 +734,15 @@ class Catalog:
             raise PermissionError(
                 "authoritative Cube publication requires a minted "
                 "ProjectionAuthority; internal consistency is not authority")
-        if not authority.authorizes(projection.run_id, projection.artifact_id,
-                                    projection.content_sha256):
+        encoded = strict_canonical_json(projection.to_dict())
+        if not authority.authorizes(projection.projection_id, encoded):
             raise PermissionError(
-                "ProjectionAuthority was minted for a different artifact")
+                "ProjectionAuthority was minted for a different projection")
         # The constructor verifies both projection_id and entry_id, but replay
         # at this boundary protects against object construction tricks.
         if (projection.expected_id() != projection.projection_id
                 or projection.entry().entry_id != projection.entry_id):
             raise ValueError("authoritative Cube projection identity is invalid")
-        encoded = strict_canonical_json(projection.to_dict())
         entry = projection.entry()
 
         self.con.execute("BEGIN TRANSACTION")
@@ -632,12 +867,15 @@ class Catalog:
             EntryInput(port, input_id) for port, input_id in self.con.execute(
                 "SELECT port, input_entry_id FROM entry_inputs "
                 "WHERE entry_id = ? ORDER BY port", [row[0]]).fetchall())
+        locator = self.current_locator(row[0])
         return CubeEntry(
             entry_id=row[0], concept=row[1], kind=row[2], producer=row[3],
             content_sha256=row[4], grid=grid_from_json(row[5] or ""),
             depth=int(row[6]), inputs=edges, run_id=row[7] or "",
-            committed_at=row[8], location=row[9] or "",
-            media_type=row[10] or "",
+            committed_at=row[8],
+            location=(locator.location if locator is not None else row[9] or ""),
+            media_type=(locator.media_type
+                        if locator is not None else row[10] or ""),
             detail=json.loads(row[11]) if row[11] else {},
             time_start=row[12] or "", time_end=row[13] or "",
             variables=tuple(json.loads(row[14])) if row[14] else (),

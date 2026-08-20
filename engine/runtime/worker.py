@@ -13,8 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from .identity import strict_canonical_json, strict_copy
+from .native import NativeFilePointer, read_verified_native_bytes
 from .operations import execute_component, operation_component
-from .types import AttemptSpec
+from .types import (
+    AttemptInputReceipt,
+    AttemptSpec,
+    RegisteredArtifactDelivery,
+    RegisteredArtifactInputReceipt,
+)
 
 
 _SAFE_PORT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -147,6 +153,11 @@ def _claim_worker(supervisor: Path, spec: AttemptSpec) -> None:
 def _load_inputs(spec: AttemptSpec, runtime_root: Path) -> dict[str, Any]:
     values: dict[str, Any] = {}
     for name, receipt in sorted(spec.input_artifacts.items()):
+        if isinstance(receipt, RegisteredArtifactInputReceipt):
+            values[name] = _load_registered_input(name, receipt)
+            continue
+        if not isinstance(receipt, AttemptInputReceipt):
+            raise TypeError(f"unknown input receipt type for {name!r}")
         manifest_path = Path(receipt.manifest_path)
         if manifest_path.is_symlink():
             raise ValueError(f"input manifest for {name!r} cannot be a symlink")
@@ -190,6 +201,41 @@ def _load_inputs(spec: AttemptSpec, runtime_root: Path) -> dict[str, Any]:
             raise ValueError(f"input object for {name!r} is not strict JSON") from exc
         values[name] = strict_copy(decoded)
     return values
+
+
+def _load_registered_input(
+        name: str, receipt: RegisteredArtifactInputReceipt) -> Any:
+    """Consume one registry record directly from its verified native path."""
+    from artifacts.records import ArtifactRecord
+    record = ArtifactRecord.from_dict(strict_copy(receipt.record))
+    if record.media_type != "application/json":
+        raise ValueError(
+            f"registered input for {name!r} has unsupported media type")
+    payload = read_verified_native_bytes(
+        record.location,
+        content_sha256=record.content_sha256,
+        size_bytes=record.size_bytes,
+    )
+    if receipt.delivery is RegisteredArtifactDelivery.NATIVE_FILE_POINTER:
+        return NativeFilePointer.bind(
+            record.location,
+            record.media_type,
+            content_sha256=record.content_sha256,
+            size_bytes=record.size_bytes,
+            metadata={
+                "source_artifact_id": record.artifact_id,
+                "source_record_id": record.record_id,
+                "source_snapshot_id": receipt.snapshot_id,
+            },
+        ).to_dict()
+    if receipt.delivery is not RegisteredArtifactDelivery.JSON_VALUE:
+        raise ValueError(f"unknown registered input delivery for {name!r}")
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"registered input for {name!r} is not strict JSON") from exc
+    return strict_copy(decoded)
 
 
 def _validate_port(port: str) -> None:

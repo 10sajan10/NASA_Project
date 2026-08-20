@@ -388,6 +388,13 @@ class PipelineRunner:
                     error="upstream dependency failed"))
                 failed.add(n)
 
+            # Removing one unreachable layer may make another downstream
+            # layer unreachable as well.  Recompute the closure before
+            # declaring the graph stuck; otherwise A -> B -> C with A failed
+            # drops B and then raises while C is still waiting on B.
+            if unreachable and not ready:
+                continue
+
             if not ready:
                 if not node_after:
                     break

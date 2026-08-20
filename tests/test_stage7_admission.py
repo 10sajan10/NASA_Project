@@ -45,10 +45,12 @@ def _spec(tiles: int = 10, windows: int = 10) -> PartitionSetSpec:
 def _template(**policy) -> PartitionTaskTemplate:
     # A real resolved invocation, not a restated one: the template must carry
     # the science the resolver actually chose.
-    from stage7.fixtures import resolve_one_selection
+    from stage7.fixtures import deployment_binding_for, resolve_one_selection
     if not policy:
         policy = {"retry_safe": True}
-    return PartitionTaskTemplate.bind(resolve_one_selection(), **policy)
+    invocation = resolve_one_selection()
+    return PartitionTaskTemplate.bind(
+        invocation, deployment_binding_for(invocation), **policy)
 
 
 def _manifest(spec: PartitionSetSpec,
@@ -353,14 +355,16 @@ def test_admission_refuses_a_foreign_partition_set_or_template(tmp_path):
     The audit registered one collection, admitted with a different template,
     and watched the cursor advance while the wrong task was stored permanently.
     """
-    from stage7.fixtures import resolve_all_selected
+    from stage7.fixtures import deployment_binding_for, resolve_all_selected
     spec, template = _spec(), _template()
     store = PartitionStore(tmp_path / "p.sqlite3")
     manifest = _manifest(spec, template)
     store.open_collection(manifest, spec, template)
 
+    foreign_invocation = resolve_all_selected()[0]
     foreign_template = PartitionTaskTemplate.bind(
-        resolve_all_selected()[0], estimated_cost_units=7)
+        foreign_invocation, deployment_binding_for(foreign_invocation),
+        estimated_cost_units=7)
     assert foreign_template.template_id != template.template_id
     with pytest.raises(ValueError, match="registered against template"):
         store.admit_window(manifest.collection_id, spec, foreign_template, 4)
@@ -779,6 +783,12 @@ def test_a_live_lease_is_idempotent_but_fences_repacketised_members(tmp_path):
         _registered_attempt(
             store, manifest, packet, 1, "competing-fence")
 
+    # Packet discovery itself must not offer members already owned by a
+    # durable attempt.  Registration remains the final atomic fence, but
+    # excluding leased rows prevents a normal scheduler loop from repeatedly
+    # constructing work that can only be rejected.
+    assert controller.next_packets(limit=4) == ()
+
     # A caller cannot evade the packet lease by regrouping the same member.
     subset = WorkPacket.bind(
         manifest.collection_id, template.template_id, (packet.members[0],))
@@ -975,11 +985,12 @@ def test_partitions_compile_into_real_stage_1_tasks(tmp_path):
 def test_a_template_with_unbound_inputs_refuses_to_execute(tmp_path):
     """Refuse rather than invent inputs the acquisition bridge would supply."""
     from partitions import PartitionNotExecutable, compile_packet
-    from stage7.fixtures import resolve_all_selected
+    from stage7.fixtures import deployment_binding_for, resolve_all_selected
 
     consuming = next(item for item in resolve_all_selected()
                      if item.input_uses)
-    template = PartitionTaskTemplate.bind(consuming)
+    template = PartitionTaskTemplate.bind(
+        consuming, deployment_binding_for(consuming))
     spec = _spec(2, 2)
     store = PartitionStore(tmp_path / "p.sqlite3")
     manifest = CollectionManifest.bind(
@@ -1065,7 +1076,7 @@ def test_expired_packet_accepts_only_its_exact_terminal_runtime_result(tmp_path)
 
 def test_a_packet_refuses_a_foreign_template(tmp_path):
     from partitions import compile_packet
-    from stage7.fixtures import resolve_all_selected
+    from stage7.fixtures import deployment_binding_for, resolve_all_selected
     spec, template = _spec(2, 2), _template()
     store = PartitionStore(tmp_path / "p.sqlite3")
     manifest = _manifest(spec, template)
@@ -1075,7 +1086,9 @@ def test_a_packet_refuses_a_foreign_template(tmp_path):
                                high_watermark=4))
     packet = _one_packet(store, controller)
 
+    other_invocation = resolve_all_selected()[0]
     other = PartitionTaskTemplate.bind(
-        resolve_all_selected()[0], estimated_cost_units=99)
+        other_invocation, deployment_binding_for(other_invocation),
+        estimated_cost_units=99)
     with pytest.raises(ValueError, match="does not belong to this template"):
         compile_packet(other, packet)

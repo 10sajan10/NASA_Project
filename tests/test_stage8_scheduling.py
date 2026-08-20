@@ -133,6 +133,14 @@ def test_detected_capacity_is_allocation_aware():
     assert capacity.cpu_cores <= affinity
 
 
+def test_detected_capacity_honours_the_cgroup_memory_envelope(monkeypatch):
+    monkeypatch.setattr(
+        "engine.runtime.site._cgroup_memory_limit_bytes",
+        lambda **_kwargs: 384 * 1024 * 1024,
+    )
+    assert detect_capacity().memory_mb == 384
+
+
 # -- priority ------------------------------------------------------------
 
 
@@ -399,6 +407,21 @@ def test_logical_sites_cannot_jointly_overrun_their_physical_host():
     assert ledger.invariant_holds()
 
 
+def test_best_fit_does_not_offer_capacity_exhausted_on_a_shared_host():
+    """The advisory placement check must agree with authoritative reserve."""
+    host = ResourceEnvelopeSpec(4, 4096)
+    ledger = ReservationLedger((
+        ExecutionSite("a", ResourceEnvelopeSpec(4, 4096),
+                      host_id="node1", host_capacity=host),
+        ExecutionSite("b", ResourceEnvelopeSpec(4, 4096),
+                      host_id="node1", host_capacity=host),
+    ))
+    ledger.reserve("running", "a", ResourceEnvelopeSpec(4, 1024))
+
+    assert best_fit_site(
+        ledger, ResourceEnvelopeSpec(1, 128)) is None
+
+
 def test_sites_must_agree_about_their_shared_host():
     with pytest.raises(ValueError, match="disagree about the capacity"):
         ReservationLedger((
@@ -434,6 +457,8 @@ def test_non_finite_durations_are_refused_everywhere(value):
         TaskObservation.completed("x", value, memory_mb=10)
     with pytest.raises(ValueError, match="finite"):
         PriorityPolicy(aging_weight_per_s=value)
+    with pytest.raises(ValueError, match="finite"):
+        ObservationHistory(memory_headroom=value)
 
 
 def test_an_attempt_killed_by_a_limit_still_drives_a_revision():

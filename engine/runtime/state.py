@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .identity import strict_canonical_json, strict_hash, strict_json_loads
+from .native import verify_native_file
 from .types import (
     ArtifactRecipe,
     AttemptInputReceipt,
@@ -19,9 +20,15 @@ from .types import (
     BoundExecutionGraph,
     BoundTask,
     ExternalHandle,
+    ExternalArtifactInputBinding,
+    InputArtifactSource,
     ProviderObservation,
+    RegisteredArtifactDelivery,
+    RegisteredArtifactInputBinding,
+    RegisteredArtifactInputReceipt,
     RunState,
     TaskState,
+    TaskInputLineage,
     WakeKind,
     attempt_id as make_attempt_id,
 )
@@ -95,6 +102,18 @@ CREATE TABLE IF NOT EXISTS task_external_inputs (
   recipe_id TEXT NOT NULL REFERENCES artifact_recipes(recipe_id),
   manifest_path TEXT NOT NULL,
   content_sha256 TEXT NOT NULL,
+  PRIMARY KEY(run_id, task_id, input_name),
+  FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
+) STRICT;
+CREATE TABLE IF NOT EXISTS task_registered_inputs (
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  input_name TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  artifact_id TEXT NOT NULL,
+  record_json TEXT NOT NULL,
+  delivery TEXT NOT NULL CHECK(delivery IN ('JSON_VALUE','NATIVE_FILE_POINTER')),
   PRIMARY KEY(run_id, task_id, input_name),
   FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
 ) STRICT;
@@ -526,6 +545,15 @@ class RuntimeStore:
                         self._resolve_committed_external_artifact(
                             con, binding.artifact_id)
                     for binding in task.external_inputs
+                    if isinstance(binding, ExternalArtifactInputBinding)
+                }
+                registered = {
+                    binding.input_name: (
+                        binding,
+                        self._verify_registered_artifact(binding, task),
+                    )
+                    for binding in task.external_inputs
+                    if isinstance(binding, RegisteredArtifactInputBinding)
                 }
                 unmet = len(task.inputs)
                 state = TaskState.READY if unmet == 0 else TaskState.WAITING
@@ -546,6 +574,18 @@ class RuntimeStore:
                          artifact.artifact_id, artifact.source_run_id,
                          artifact.recipe.recipe_id, artifact.manifest_path,
                          artifact.content_sha256))
+                for input_name, (binding, record) in sorted(
+                        registered.items()):
+                    con.execute(
+                        "INSERT INTO task_registered_inputs"
+                        "(run_id,task_id,input_name,snapshot_id,record_id,"
+                        " artifact_id,record_json,delivery) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (run_id, task.task_id, input_name,
+                         binding.snapshot_id, record.record_id,
+                         record.artifact_id,
+                         strict_canonical_json(record.to_dict()),
+                         binding.delivery.value))
                 for recipe in task.outputs:
                     recipe_json = strict_canonical_json(
                         __import__("dataclasses").asdict(recipe))
@@ -1456,6 +1496,13 @@ class RuntimeStore:
     def task_input_artifact_ids(
             self, run_id: str, task_id: str) -> tuple[tuple[str, str], ...]:
         """Return exact committed inputs under their runtime port names."""
+        return tuple(
+            (value.input_name, value.artifact_id)
+            for value in self.task_input_lineage(run_id, task_id))
+
+    def task_input_lineage(
+            self, run_id: str, task_id: str) -> tuple[TaskInputLineage, ...]:
+        """Return exact input identities with their authoritative namespace."""
         with self.connect() as con:
             internal = con.execute(
                 "SELECT d.input_name,s.artifact_id FROM task_dependencies d "
@@ -1470,10 +1517,20 @@ class RuntimeStore:
                 "WHERE run_id=? AND task_id=?",
                 (run_id, task_id),
             ).fetchall()
-        values = tuple(sorted(
-            ((str(row[0]), str(row[1])) for row in (*internal, *external)),
-            key=lambda value: value[0]))
-        if len({value[0] for value in values}) != len(values):
+            registered = con.execute(
+                "SELECT input_name,artifact_id FROM task_registered_inputs "
+                "WHERE run_id=? AND task_id=?",
+                (run_id, task_id),
+            ).fetchall()
+        values = tuple(sorted((
+            *(TaskInputLineage(
+                str(row[0]), InputArtifactSource.STAGE1_COMMIT, str(row[1]))
+              for row in (*internal, *external)),
+            *(TaskInputLineage(
+                str(row[0]), InputArtifactSource.REGISTERED_ARTIFACT,
+                str(row[1])) for row in registered),
+        ), key=lambda value: value.input_name))
+        if len({value.input_name for value in values}) != len(values):
             raise RuntimeError("runtime task input port identity is ambiguous")
         return values
 
@@ -1549,7 +1606,8 @@ class RuntimeStore:
 
     def _input_artifact_receipts(
             self, con: sqlite3.Connection, run_id: str,
-            downstream_task_id: str) -> dict[str, AttemptInputReceipt]:
+            downstream_task_id: str) -> dict[
+                str, AttemptInputReceipt | RegisteredArtifactInputReceipt]:
         internal_rows = con.execute(
             "SELECT d.input_name,a.artifact_id,a.recipe_id,a.manifest_path,"
             "a.content_sha256,a.manifest_json FROM task_dependencies d "
@@ -1581,6 +1639,11 @@ class RuntimeStore:
             "            AND c.artifact_id=e.artifact_id "
             "            AND c.recipe_id=e.recipe_id)",
             (run_id, downstream_task_id)).fetchall()
+        registered_rows = con.execute(
+            "SELECT input_name,snapshot_id,record_id,artifact_id,record_json,"
+            "delivery FROM task_registered_inputs "
+            "WHERE run_id=? AND task_id=?",
+            (run_id, downstream_task_id)).fetchall()
         task_row = con.execute(
             "SELECT task_json FROM tasks WHERE run_id=? AND task_id=?",
             (run_id, downstream_task_id)).fetchone()
@@ -1590,11 +1653,20 @@ class RuntimeStore:
         expected_external = {
             value.input_name: value.artifact_id
             for value in task.external_inputs
+            if isinstance(value, ExternalArtifactInputBinding)
         }
         actual_external = {row[0]: row[1] for row in external_rows}
         if actual_external != expected_external:
             raise RuntimeError(
                 "external artifact input binding lost authoritative commit")
+        expected_registered = {
+            value.input_name: value
+            for value in task.external_inputs
+            if isinstance(value, RegisteredArtifactInputBinding)
+        }
+        if set(row[0] for row in registered_rows) != set(expected_registered):
+            raise RuntimeError(
+                "registered artifact input binding lost its exact receipt")
         result = {
             row[0]: self._attempt_input_receipt(row)
             for row in internal_rows
@@ -1603,9 +1675,52 @@ class RuntimeStore:
             row[0]: self._attempt_input_receipt(row)
             for row in external_rows
         })
-        if len(result) != expected_internal + len(expected_external):
+        for row in registered_rows:
+            binding = expected_registered[row[0]]
+            if (row[1] != binding.snapshot_id
+                    or row[2] != binding.record_id
+                    or row[3] != binding.artifact_id
+                    or row[4] != strict_canonical_json(binding.record)
+                    or row[5] != binding.delivery.value):
+                raise RuntimeError(
+                    "registered artifact receipt conflicts with bound graph")
+            record = self._verify_registered_artifact(binding, task)
+            result[row[0]] = RegisteredArtifactInputReceipt(
+                snapshot_id=binding.snapshot_id,
+                record=record.to_dict(),
+                delivery=binding.delivery,
+            )
+        if (len(result) != expected_internal + len(expected_external)
+                + len(expected_registered)):
             raise RuntimeError("attempt input ports are not uniquely bound")
         return result
+
+    @staticmethod
+    def _verify_registered_artifact(
+            binding: RegisteredArtifactInputBinding, task: BoundTask):
+        """Replay a native registry receipt and its current exact bytes."""
+        from artifacts.records import ArtifactRecord
+        record = ArtifactRecord.from_dict(dict(binding.record))
+        if record.media_type != "application/json":
+            raise ValueError(
+                "registered runtime inputs currently support application/json "
+                "only")
+        pointer_operation = (
+            task.component.operation_key == "native.file_pointer_identity.v1")
+        if binding.delivery is RegisteredArtifactDelivery.NATIVE_FILE_POINTER:
+            if not pointer_operation or binding.input_name != "source":
+                raise ValueError(
+                    "native pointer delivery is restricted to the closed "
+                    "native pointer identity source port")
+        elif pointer_operation:
+            raise ValueError(
+                "native pointer identity requires explicit pointer delivery")
+        verify_native_file(
+            record.location,
+            content_sha256=record.content_sha256,
+            size_bytes=record.size_bytes,
+        )
+        return record
 
     @staticmethod
     def _attempt_input_receipt(row: sqlite3.Row) -> AttemptInputReceipt:

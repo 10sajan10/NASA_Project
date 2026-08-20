@@ -1,6 +1,7 @@
 """Scientific workflow composition primitives."""
 
 from .compiler import (
+    CompilationAuthority,
     CompilationRecord,
     CompilationResult,
     CompilationStatus,
@@ -32,6 +33,7 @@ __all__ = [
     "BlockerTree",
     "CandidateRejection",
     "CardinalityRange",
+    "CompilationAuthority",
     "CompilationRecord",
     "CompilationResult",
     "CompilationStatus",

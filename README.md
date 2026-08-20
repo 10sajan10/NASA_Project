@@ -1,6 +1,7 @@
 # A Pluggable HPC System for Asteroid-Impact Cascade Modeling
 
-**Ask for a scientific outcome. Get an admissible, costed, reproducible workflow — composed automatically.**
+**Ask for a scientific outcome. Get an admissible, costed, reproducible
+workflow plan and searchable verified native artifacts.**
 
 An asteroid airburst over a city is not one simulation. It is a cascade: a
 thermal pulse ignites fuels, a fire spreads under real weather, smoke loads the
@@ -39,9 +40,15 @@ decisions that matter. This project builds the system that assembles it for you
                           │
                           ▼
       ┌─────────────────────────────────────────┐
-      │  durable execution → validated commit    │   laptop or allocated node
+      │  durable execution → validated commit    │   separate bounded runtime
       └─────────────────────────────────────────┘
 ```
+
+The resolver-to-plan path and the commit-to-artifact feedback path are working
+bounded slices. One general application bridge is still missing: a selected
+plan containing ordinary producers and existing `ArtifactLeaf` inputs is not
+yet compiled and launched automatically from the target request. The planning
+manifest is therefore not execution permission.
 
 Nothing in that pipeline knows what "asteroid", "fire", or "wind" *mean*. The
 domain enters entirely through declared contracts and capabilities — which is
@@ -181,7 +188,7 @@ runnable, and no stage may claim capability it has not demonstrated.
 | [10A](stage10a/) | Automatic native-artifact registration and target-time discovery | bounded local implementation |
 | [10B](stage10b/) | Durable targets, output-event replay, and automatic re-planning | bounded local implementation |
 | [10C](stage10c/) | Stage-1 commit to durable native-artifact event bridge | bounded local implementation |
-| 9B | WRF integration behind a certified provider | |
+| [9B](stage9b/) | WRF integration behind a certified provider | blocked; placement prerequisite only |
 
 Stages 5–8 are deliberately labelled below "done". An external audit found
 several claims running ahead of the implementation; those defects are fixed and
@@ -190,7 +197,7 @@ the labels now match what is demonstrated. The honest reading:
 - **Stage 5** contacts no real network provider; both connectors run in process.
 - **Stage 6** competes a model against data on synthetic evidence. No real
   held-out reference observations exist, and its Section 9.5 planning-latency
-  gate is **measured and missed** by roughly 5x.
+  gate is **measured and missed**: 7.06 s against a 5 s budget, or 1.41x.
 - **Stage 7** drives 10^4 partitions through bounded control-plane admission.
   The Stage-8R bridge also executes bounded partitions through Stage 1 with
   exact committed input receipts; it is not yet the million-partition design.
@@ -214,23 +221,26 @@ the labels now match what is demonstrated. The honest reading:
   crash-safe `PENDING -> REGISTERED -> APPLIED` replay loop registers each
   content-addressed artifact idempotently, automatically re-resolves durable
   targets, and writes a portable identity-checked workflow manifest. Metadata
-  search is indexed and snapshot verification re-hashes on stat change. The
-  current bridge is same-node SQLite/local files; Stage-1 binary outputs do not
-  emit those records themselves.
+  search is indexed and planning snapshots re-hash by default; stat-fingerprint
+  caching is an explicit weaker opt-in. The current bridge is same-node
+  SQLite/local files; Stage 10C supplies its authoritative Stage-1 commit
+  observer.
 - **Stage 10C** connects the event stream to the authoritative Stage-1 commit.
   A closed native-file pointer operation validates producer-owned bytes, the
   controller commits its receipt under the normal fence, and a replayable
   observer binds the exact scientific descriptor and runtime lineage before
-  emitting Stage 10B events. The native payload remains at its original path.
+  emitting Stage 10B events. The narrow publication operation is authorized by
+  the compiler and maps Stage-1 committed inputs to their Stage-10 artifact
+  identities. It is not the general `ArtifactLeaf` compiler bridge. The native
+  payload remains at its original path.
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_stage*.py tests/test_cube*.py
 ```
 
 Use [`stage8r/adversarial_matrix.json`](stage8r/adversarial_matrix.json) for
-the stable cross-layer gates. The complete repository suite currently stalls
-in an older Cube/critic test on this NFS workspace, so the handoff reports
-split subsystem evidence rather than inventing one aggregate green count.
+the stable cross-layer gates. The handoff reports bounded subsystem evidence;
+it does not turn an old aggregate test count into a current release claim.
 
 ---
 
@@ -239,10 +249,12 @@ split subsystem evidence rather than inventing one aggregate green count.
 Stated plainly, because a workflow system that overstates itself is worse than
 none.
 
-- **WRF-SFIRE has not been run through the v2 stack.** It remains a heavy
-  example model. A known open blocker is recorded in
-  [`stage0/wrf_interface_audit.md`](stage0/wrf_interface_audit.md): fire-domain
-  output at `(253,253)` has no defined placement onto a `(1001,1001)` cube grid.
+- **WRF-SFIRE has not been run through the v2 stack.** The historical
+  `(253,253)` versus `(1001,1001)` failure can now be rejected before launch by
+  a typed placement preflight. Real `wrfout` inspection showed that CRS and
+  variable-specific extents—not shape alone—still need an explicit adapter
+  contract before WRF publication is eligible; see
+  [`stage9b/README.md`](stage9b/README.md).
 - **Idealized and real-data fire modes are different contracts.** Real-data WRF
   needs a full 3-D meteorological boundary collection; it must never be
   simplified to "10 m wind".
@@ -252,9 +264,14 @@ none.
   transcript, not a claim about an open provider's global catalog.
 - **Cost is the only automatic objective.** Quality, latency, and Pareto
   ranking are deferred; transformation loss is visible but not optimized.
-- **SLURM is unavailable on this development node** and is a future conditional
-  provider, not a current dependency. Durability is same-node process recovery,
-  not node-loss durability.
+- **No authorized real Slurm site has been exercised.** Installed client tools,
+  when present, are checked only for command compatibility; Stage 9A uses a
+  fake scheduler and is not site certification. Durability is same-node process
+  recovery, not node-loss durability.
+- **A target request does not yet launch its missing producers automatically.**
+  Target planning, durable local execution, and post-commit registration all
+  exist, but the general target-to-execution service and ordinary
+  `ArtifactLeaf` external-input lowering remain to be built.
 - **Agentic/LLM planning is out of scope** for the current architecture. The
   legacy [`agentic/`](agentic/) layer predates it and is parked, not extended.
 
@@ -287,9 +304,9 @@ resolution/     recursive discovery, exact global selector, independent validato
 composition/    exhaustive correctness oracle, blocker trees, Stage-1 compiler
 plans/          candidate / bound / deployment derivation identities
 engine/runtime/ durable controller, attempts, leases, fencing, atomic commit
-stage0..stage4/ per-stage evidence, fixtures, and runnable demonstrations
+stage*/         bounded per-stage evidence, fixtures, and demonstrations
 
-cube/           legacy Zarr + DuckDB gridded artifact backend (retained)
+cube/           retained optional projection/read model; not the Stage-10 payload path
 engine/         legacy orchestration substrate (retained as baseline)
 drivers/        data-source fetchers (thermal, LANDFIRE, DEM, ERA5)
 models/         WRF-SFIRE adapter, namelist generation, consequence models

@@ -17,9 +17,10 @@ available on this node. The current honest status is:
 | E: queued provider | PASS in the hermetic fake; deployment evidence PARTIAL | Controller-to-fake-Slurm worker/commit path and visibility/identity failures are tested. No real Slurm site was exercised. |
 | F: Cube projection | PASS, bounded local pair | RuntimeStore commits project through a replayable outbox; a fresh Cube catalog rebuilds authority. Cross-database convergence is idempotent, not atomic. |
 
-The next work is release reconciliation rather than another implementation
-layer: review and commit the large working tree, run the Composition MVP
-latency/evidence decision, and gather deployment evidence only when an actual
+The latency/evidence decision has since been recorded: Stage 6 remains a
+synthetic conformance fixture, and its 7.06 s p95 misses the 5 s budget by
+1.41x. The next integration work is the general target-to-execution and
+`ArtifactLeaf` external-input bridge, plus real-site evidence only when an
 authorized site is available. Continue to describe optimality as relative to
 the declared certificate-covered universe and source completeness as relative
 to the durable connector transcript.
@@ -43,7 +44,8 @@ the implementation evidence in the code repository.
 
 - Branch: `v2`
 - Audited code head: `45aaee1`
-- Full-suite evidence before Stage 8R: 852 passed, 1 skipped, 7 xfailed.
+- Historical aggregate counts are not current release evidence; run the full
+  repaired tree before recording a new aggregate.
 - Cube v3 is a tested immutable-entry sidecar, not authoritative publication.
 
 The machine-readable case inventory is `adversarial_matrix.json`. Every case
@@ -94,7 +96,9 @@ convention is `sample-centres-axis-aligned-v1`:
 - `GridDescriptor.affine` is `(dx, 0, first_x_centre, 0, dy,
   first_y_centre)`, `shape` is row-major `(y, x)`, and `axis_order` names the
   semantic `(x_axis, y_axis)` pair;
-- signed non-zero steps are authoritative, so a north-up grid has `dy < 0`;
+- signed non-zero steps are authoritative. A north-first raster has `dy < 0`,
+  while a WRF array whose `south_north` index increases northward has `dy > 0`;
+  replay must preserve the producer's actual row order;
 - spatial-support bounds are the outer cell edges, half a step beyond the
   first and last centres; and
 - field payloads carry the exact axis names, while compile-time output
@@ -153,7 +157,10 @@ from result bytes.
 
 `CubeProjector` reconstructs each projection solely from the immutable bound
 graph, `artifact_commits`, the matching passed validation, and the committed
-manifest/object bytes. Input edges are reconstructed from the bound graph's
+manifest/object bytes. A private projection authority is minted only after the
+manifest is re-read and the object bytes are re-hashed; an internally
+self-consistent caller-authored projection cannot publish an entry. Input edges
+are reconstructed from the bound graph's
 ports and exact upstream RuntimeStore artifact slots, then resolved to their
 authoritative Cube projection receipts. Precommitted external inputs retain
 the exact source-run, recipe, artifact, and entry identities rather than being
@@ -176,9 +183,9 @@ than the dependency-release authority; projection is an explicit local
 service call rather than an automatically configured controller sink; the
 current artifact format is the runtime's validated JSON object format; and no
 claim is made for distributed object-store/DuckDB transactions or recovery
-after loss of the local durable files. As elsewhere in Stage 1, graph admission
-trusts a caller presenting an identity-valid `BoundExecutionGraph`; this track
-does not add a cryptographic signer for the Stage-2 compiler.
+after loss of the local durable files. The repaired compilation path uses a
+private process-local authority after exact graph replay; it is not a
+cryptographic signer or a distributed authorization protocol.
 
 ## Early Track D correction
 
@@ -186,6 +193,6 @@ The packet-result idempotency gate is already closed independently of the
 remaining runtime work. A durable packet-result receipt makes exact replay a
 no-op, contradictory outcomes for one attempt fail closed, and
 `NOT_ATTEMPTED` leaves the member admitted without consuming retry budget.
-Focused evidence: `32 passed, 6 xfailed` across the Stage-7 admission and
-Stage-8R gate files. This does **not** close restart reservation recovery,
+Focused regressions cover the Stage-7 admission and Stage-8R gate files. This
+historical subsection does **not** by itself close restart reservation recovery,
 full-graph live ranking, or partition-specific scientific input binding.

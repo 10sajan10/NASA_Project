@@ -20,6 +20,17 @@ from .coordinator import (
 )
 from .registry import ArtifactQuery, VerificationPolicy
 from .runtime import RuntimeArtifactEventBridge
+from .publication import (
+    NativePublicationDeclaration,
+    NativePublicationProposal,
+    PublicationProducerRole,
+    prepare_native_publication,
+)
+from .query import (
+    ArtifactSnapshotQuery,
+    ArtifactSnapshotQueryResult,
+    SnapshotArtifactCatalog,
+)
 
 __all__ = [
     "ArtifactAvailability",
@@ -31,15 +42,22 @@ __all__ = [
     "ArtifactRecord",
     "ArtifactRegistry",
     "ArtifactRegistrySnapshot",
+    "ArtifactSnapshotQuery",
+    "ArtifactSnapshotQueryResult",
     "ArtifactSnapshotEntry",
     "ArtifactTargetCoordinator",
     "ArtifactWorkflowOutcome",
     "ArtifactWorkflowResolver",
     "OutputEventStatus",
+    "NativePublicationDeclaration",
+    "NativePublicationProposal",
+    "PublicationProducerRole",
     "RuntimeArtifactEventBridge",
+    "SnapshotArtifactCatalog",
     "TargetRequest",
     "TargetState",
     "TargetStatus",
     "VerificationPolicy",
     "WorkflowManifest",
+    "prepare_native_publication",
 ]

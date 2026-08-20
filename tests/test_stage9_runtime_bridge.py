@@ -21,6 +21,7 @@ from engine.runtime.types import (
     BoundExecutionGraph,
     OutputSpec,
     ResourceRequest,
+    SiteSnapshot,
     TaskTemplate,
 )
 from scheduling import (
@@ -73,6 +74,25 @@ def test_concurrency_requires_a_reservation_ledger(tmp_path):
         WorkflowController(tmp_path / "a", max_inflight=4)
     with pytest.raises(ValueError, match="positive integer"):
         WorkflowController(tmp_path / "b", max_inflight=-1)
+
+
+def test_ledger_capacity_cannot_exceed_the_bound_physical_site(tmp_path):
+    """Logical accounting cannot manufacture CPUs the provider does not own."""
+    physical = SiteSnapshot(
+        site_id="one-core",
+        hostname="fixture",
+        cpuset=(0,),
+        memory_mb=1024,
+        gpu_ids=(),
+        allocation_expires_at=None,
+    )
+    oversized = ReservationLedger((
+        ExecutionSite("node", ResourceEnvelopeSpec(4, 1024)),
+    ))
+    with pytest.raises(ValueError, match="exceeds the bound provider site"):
+        WorkflowController(
+            tmp_path / "oversized", site=physical, max_inflight=2,
+            ledger=oversized, site_id="node")
 
 
 def test_concurrent_attempts_beat_serial_wall_clock(tmp_path):

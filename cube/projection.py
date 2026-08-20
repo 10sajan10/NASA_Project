@@ -417,17 +417,16 @@ class CubeProjector:
         if expected_validation_id != row["validation_id"]:
             raise RuntimeError("validation receipt identity does not verify")
 
-        authority = self._verify_manifest(
+        self._verify_manifest(
             manifest_path=Path(row["manifest_path"]),
             manifest_json=row["manifest_json"],
             expected_artifact_id=artifact_id,
             expected_recipe_id=recipe_id,
-            expected_run_id=run_id,
             expected_content_sha256=row["content_sha256"],
         )
 
         inputs = self._projection_inputs(run_id, graph, task.task_id)
-        return CubeEntryProjection.bind(
+        projection = CubeEntryProjection.bind(
             run_id=run_id,
             runtime_plan_id=graph.plan_id,
             binding=binding,
@@ -435,7 +434,15 @@ class CubeProjector:
             artifact_id=artifact_id,
             content_sha256=row["content_sha256"],
             inputs=inputs,
-        ), authority
+        )
+        # Mint only after the manifest/object bytes and every projection
+        # coordinate have both been replayed.  The authority is therefore not
+        # transferable to another self-consistent receipt for the same bytes.
+        authority = _mint_projection_authority(
+            projection.projection_id,
+            strict_canonical_json(projection.to_dict()),
+        )
+        return projection, authority
 
     def _projection_inputs(
         self, run_id: str, graph: BoundExecutionGraph, task_id: str,
@@ -501,9 +508,8 @@ class CubeProjector:
     def _verify_manifest(
         self, *, manifest_path: Path, manifest_json: str,
         expected_artifact_id: str, expected_recipe_id: str,
-        expected_run_id: str,
         expected_content_sha256: str,
-    ) -> ProjectionAuthority:
+    ) -> None:
         if not manifest_path.is_absolute():
             raise RuntimeError("authoritative artifact manifest path is not absolute")
         if manifest_path.is_symlink():
@@ -565,10 +571,8 @@ class CubeProjector:
         if (digest.hexdigest() != expected_content_sha256
                 or size != stored["size_bytes"]):
             raise RuntimeError("artifact object no longer matches its manifest")
-        # Everything above re-derived this artifact from bytes on disk, so this
-        # is the only place entitled to mint publication authority.
-        return _mint_projection_authority(
-            expected_run_id, expected_artifact_id, expected_content_sha256)
+        # Authority is minted by the caller only after it also constructs the
+        # complete canonical projection that these verified bytes will back.
 
     def _ack(self, projection: CubeEntryProjection, entry_id: str) -> None:
         with self.store.transaction() as connection:

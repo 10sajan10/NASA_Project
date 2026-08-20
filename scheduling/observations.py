@@ -244,8 +244,12 @@ class ObservationHistory:
         if (isinstance(minimum_samples, bool)
                 or not isinstance(minimum_samples, int) or minimum_samples < 1):
             raise ValueError("minimum_samples must be a positive integer")
-        if memory_headroom < 1.0:
-            raise ValueError("memory headroom cannot shrink an envelope")
+        if (isinstance(memory_headroom, bool)
+                or not isinstance(memory_headroom, (int, float))
+                or not math.isfinite(float(memory_headroom))
+                or memory_headroom < 1.0):
+            raise ValueError(
+                "memory headroom must be a finite number of at least one")
         self.minimum_samples = minimum_samples
         self.memory_headroom = memory_headroom
         self._observations: dict[str, list[TaskObservation]] = {}

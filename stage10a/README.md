@@ -84,10 +84,11 @@ The focused suite proves:
   never infers scientific metadata from a filename or array shape.
 - The catalog is a searchable read model.  `ArtifactRecord` and its verified
   manifest-backed `ArtifactLeaf` remain authoritative.
-- Stage-1 native binary-file output is not generalized here.  The automatic
-  output hook accepts typed `DatasetRef` events directly. `ProducerV2` can
-  attach the same registry through the retained Cube publisher bridge, but the
-  Stage-10A service and demo do not require Cube.
+- Stage-1 native binary-file output is not generalized here. The automatic
+  output hook accepts typed `DatasetRef` events directly; Stage 10C later adds
+  one narrow compiler-authorized native-pointer publication path. That path is
+  not a general `ArtifactLeaf` external-input bridge, and the Stage-10A service
+  and demo do not require Cube.
 - No WRF, MPI, Slurm, network provider, reprojection, transformation, or heavy
   workload was run for this stage.
 

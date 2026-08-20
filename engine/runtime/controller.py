@@ -55,11 +55,11 @@ class _LiveReservation:
 
 
 class WorkflowController:
-    """Durable FIFO controller for an already-bound execution graph.
+    """Durable controller for an already-bound execution graph.
 
-    Stage 1 deliberately admits at most one attempt at a time.  Resource-aware
-    packing and priority policies belong to Stage 8; keeping admission here
-    serial makes the private-node envelope conservative and auditable.
+    The one-at-a-time default remains conservative.  Higher concurrency is
+    available only through a capacity ledger whose logical capacities are
+    checked against the provider's physical site snapshot.
     """
 
     def __init__(self, runtime_root: Path | str, *,
@@ -94,6 +94,7 @@ class WorkflowController:
         self.max_inflight = max_inflight
         self.ledger = ledger
         self.scheduling_site_id = site_id
+        self._validate_ledger_site_binding()
         self.priority_policy = priority_policy
         self.observations = observations
         self.artifact_commit_observer = artifact_commit_observer
@@ -130,6 +131,61 @@ class WorkflowController:
                     pass
             self._lock.close()
             raise
+
+    def _validate_ledger_site_binding(self) -> None:
+        """Refuse logical capacity that the bound provider cannot supply.
+
+        A reservation ledger is useful only if its accounting universe is no
+        larger than the actual cpuset/memory/GPU allocation.  Multiple logical
+        sites are safe on one local provider only when they explicitly share a
+        single physical-host envelope; otherwise their independent capacities
+        could double-count the same machine.
+        """
+        if self.ledger is None:
+            if self.scheduling_site_id is not None:
+                raise ValueError("site_id requires a ReservationLedger")
+            return
+        from scheduling import ResourceEnvelopeSpec
+
+        physical = ResourceEnvelopeSpec(
+            cpu_cores=len(self.site.cpuset),
+            memory_mb=self.site.memory_mb,
+            gpus=len(self.site.gpu_ids),
+            # The current SiteSnapshot has no scratch-allocation field.  The
+            # live controller consequently requests zero scratch.
+            scratch_mb=0,
+        )
+        sites = self.ledger.sites
+        if self.scheduling_site_id is not None:
+            selected = (self.ledger.site(self.scheduling_site_id),)
+        else:
+            selected = sites
+        for logical in selected:
+            comparable = ResourceEnvelopeSpec(
+                logical.capacity.cpu_cores,
+                logical.capacity.memory_mb,
+                logical.capacity.gpus,
+                0,
+            )
+            if not comparable.fits_within(physical):
+                raise ValueError(
+                    f"ledger site {logical.site_id!r} exceeds the bound "
+                    "provider site capacity")
+
+        if self.scheduling_site_id is None and len(sites) > 1:
+            host_ids = {site.host_id for site in sites}
+            if None in host_ids or len(host_ids) != 1:
+                raise ValueError(
+                    "multiple logical scheduling sites on one provider must "
+                    "declare one shared physical host capacity")
+            host = sites[0].host_capacity
+            assert host is not None
+            comparable_host = ResourceEnvelopeSpec(
+                host.cpu_cores, host.memory_mb, host.gpus, 0)
+            if not comparable_host.fits_within(physical):
+                raise ValueError(
+                    "ledger shared-host capacity exceeds the bound provider "
+                    "site capacity")
 
     def create_run(self, graph: BoundExecutionGraph, *,
                    run_id: str | None = None) -> str:

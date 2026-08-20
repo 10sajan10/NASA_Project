@@ -209,11 +209,12 @@ def resolve_profile_from_snapshot(
 ) -> EvidenceProfile | None:
     """Find the evidence profile the *frozen snapshot* binds to this producer.
 
-    The evidence subject is derived from the producer itself and then matched
-    against the snapshot, exactly as ``direct_match`` does it.  Nothing is
-    taken on trust from a caller-supplied mapping: a profile that is not in the
-    frozen snapshot, or whose subject this producer could not have produced,
-    simply does not exist as far as the decision report is concerned.
+    The producer's frozen ``evidence_profile_id`` selects the exact snapshot
+    profile.  Its evidence subject is independently derived from the producer
+    and checked as well, exactly as ``direct_match`` does it.  Nothing is taken
+    on trust from a caller-supplied mapping: a profile that is not in the frozen
+    snapshot, or whose subject this producer could not have produced, simply
+    does not exist as far as the decision report is concerned.
     """
     if snapshot is None:
         return None
@@ -230,14 +231,19 @@ def resolve_profile_from_snapshot(
         if port is None:
             return None
         subject = invocation_evidence_subject(node.invocation, port.port_id)
+        profile_id = node.invocation.evidence_profile_id
     else:
         node = next((item for item in graph.artifact_nodes
                      if item.leaf_id == producer.producer_id), None)
         if node is None:
             return None
         subject = artifact_evidence_subject(node.leaf)
-    return next((item for item in snapshot.profiles
-                 if item.subject == subject), None)
+        profile_id = node.leaf.evidence_profile_id
+    profile = next((item for item in snapshot.profiles
+                    if item.profile_id == profile_id), None)
+    if profile is None or profile.subject != subject:
+        return None
+    return profile
 
 
 def enumerate_source_alternatives(
@@ -291,7 +297,8 @@ def enumerate_source_alternatives(
             baseline.hypergraph, evidence_snapshot, producer, concept_id,
             satisfaction.output_port_id)
         reading = read_metric(
-            label, profile, metric_definition_id, requirement_use.requirement)
+            label, profile, evidence_snapshot, metric_definition_id,
+            requirement_use.requirement)
         if admissible:
             alternatives.append(SourceAlternative(
                 producer=producer, satisfaction=satisfaction,

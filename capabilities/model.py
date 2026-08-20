@@ -44,6 +44,7 @@ def _is_reserved_transformation_operation(operation_key: str) -> bool:
 _ACQUISITION_OPERATION_KEY = "acquisition.materialize.v1"
 _ACQUISITION_BINDER_KEY = "acquisition.materialize.bind.v1"
 _ACQUISITION_AUTHORITY_MINT = object()
+_NATIVE_POINTER_IDENTITY_OPERATION_KEY = "native.file_pointer_identity.v1"
 
 
 def _is_reserved_acquisition(
@@ -564,6 +565,18 @@ class CapabilitySpec:
             raise ValueError("parameter schema disagrees with its closed binder")
         for parameterization in self.parameterizations:
             self.parameter_schema.validate(parameterization.parameters)
+        if self.implementation.operation_key == (
+                _NATIVE_POINTER_IDENTITY_OPERATION_KEY):
+            # This no-copy operation may preserve a pointer's provenance, but
+            # it may never relabel the referenced science.  The exact input
+            # descriptor identity is therefore part of capability validity,
+            # not a convention left to discovery or runtime code.
+            if (len(self.input_ports) != 1 or len(self.output_ports) != 1
+                    or self.input_ports[0].requirement.exact_descriptor_id
+                    != self.output_ports[0].descriptor.descriptor_id):
+                raise ValueError(
+                    "native pointer identity input must require the exact "
+                    "output descriptor")
         reserved_transform = _is_reserved_transformation_operation(
             self.implementation.operation_key)
         if reserved_transform and self.transformation_authority is None:

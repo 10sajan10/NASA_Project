@@ -144,6 +144,12 @@ def test_coarsening_is_refused_as_manufactured_detail():
                         _placement(PlacementStatus.INTEGER_COARSENING, factor=2))
 
 
+def test_opposite_axis_directions_require_reorientation():
+    with pytest.raises(ResamplingNotAdmissible, match="reorientation"):
+        plan_resampling(
+            "arrival_s", _placement(PlacementStatus.AXIS_DIRECTION_MISMATCH))
+
+
 # -- planning a whole target list ----------------------------------------
 
 

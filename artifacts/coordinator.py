@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS artifact_output_events (
     event_json       TEXT NOT NULL,
     status           TEXT NOT NULL,
     registered_record_ids_json TEXT,
+    registration_attempts INTEGER NOT NULL DEFAULT 0,
     error            TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -68,6 +69,7 @@ class TargetStatus(str, Enum):
 
 class OutputEventStatus(str, Enum):
     PENDING = "PENDING"
+    RETRYABLE = "RETRYABLE"
     REGISTERED = "REGISTERED"
     APPLIED = "APPLIED"
     FAILED = "FAILED"
@@ -223,18 +225,38 @@ class ArtifactTargetCoordinator:
 
     Registry publication and this coordination database are separate SQLite
     transactions.  The state machine is deliberately replayable: PENDING may
-    be registered repeatedly, and REGISTERED may re-resolve targets repeatedly,
-    before APPLIED closes the event.
+    be registered repeatedly, bounded RETRYABLE failures receive one attempt
+    per explicit retry or recovery pass, and REGISTERED may re-resolve targets
+    repeatedly before APPLIED closes the event. Scientific refusals and
+    exhausted transient failures remain terminal FAILED records.
     """
 
-    def __init__(self, path: str | Path, resolver: ArtifactWorkflowResolver):
+    def __init__(
+        self,
+        path: str | Path,
+        resolver: ArtifactWorkflowResolver,
+        *,
+        max_registration_attempts: int = 3,
+    ):
         if not isinstance(resolver, ArtifactWorkflowResolver):
             raise TypeError("coordinator requires ArtifactWorkflowResolver")
+        if (isinstance(max_registration_attempts, bool)
+                or not isinstance(max_registration_attempts, int)
+                or max_registration_attempts < 1):
+            raise ValueError(
+                "max_registration_attempts must be a positive integer")
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.resolver = resolver
+        self.max_registration_attempts = max_registration_attempts
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
+            columns = {row["name"] for row in connection.execute(
+                "PRAGMA table_info(artifact_output_events)")}
+            if "registration_attempts" not in columns:
+                connection.execute(
+                    "ALTER TABLE artifact_output_events ADD COLUMN "
+                    "registration_attempts INTEGER NOT NULL DEFAULT 0")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path), timeout=30)
@@ -419,29 +441,63 @@ class ArtifactTargetCoordinator:
             raise KeyError(event_id)
         return ArtifactOutputEvent.from_dict(json.loads(row["event_json"]))
 
+    @staticmethod
+    def _retryable_registration_error(exc: Exception) -> bool:
+        """Classify bounded infrastructure failures, never science refusals."""
+        return isinstance(exc, (
+            sqlite3.OperationalError,
+            TimeoutError,
+            ConnectionError,
+            BlockingIOError,
+            InterruptedError,
+        ))
+
+    def _record_registration_failure(
+        self, event_id: str, exc: Exception,
+    ) -> OutputEventStatus:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT registration_attempts FROM artifact_output_events "
+                "WHERE event_id=?", (event_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(event_id)
+            attempts = int(row["registration_attempts"]) + 1
+            retryable = (self._retryable_registration_error(exc)
+                         and attempts < self.max_registration_attempts)
+            status = (OutputEventStatus.RETRYABLE if retryable else
+                      OutputEventStatus.FAILED)
+            connection.execute(
+                "UPDATE artifact_output_events SET status=?,error=?,"
+                "registration_attempts=?,updated_at=CURRENT_TIMESTAMP "
+                "WHERE event_id=?",
+                (status.value, f"{type(exc).__name__}:{exc}", attempts,
+                 event_id),
+            )
+            connection.commit()
+        return status
+
     def process_event(self, event_id: str) -> OutputEventStatus:
         status = self.event_status(event_id)
         if status is OutputEventStatus.APPLIED:
             return status
+        if status is OutputEventStatus.FAILED:
+            return status
         event = self._event(event_id)
-        if status is OutputEventStatus.PENDING:
+        if status in (OutputEventStatus.PENDING, OutputEventStatus.RETRYABLE):
             try:
                 records = self.resolver.artifact_registry.register_records(
                     event.records)
             except Exception as exc:
-                with self._connect() as connection:
-                    connection.execute(
-                        "UPDATE artifact_output_events SET status=?,error=?,"
-                        "updated_at=CURRENT_TIMESTAMP WHERE event_id=?",
-                        (OutputEventStatus.FAILED.value,
-                         f"{type(exc).__name__}:{exc}", event_id),
-                    )
+                self._record_registration_failure(event_id, exc)
                 raise
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute(
                     "UPDATE artifact_output_events SET status=?,"
                     "registered_record_ids_json=?,error='',"
+                    "registration_attempts=registration_attempts+1,"
                     "updated_at=CURRENT_TIMESTAMP WHERE event_id=?",
                     (OutputEventStatus.REGISTERED.value,
                      strict_canonical_json(
@@ -461,16 +517,77 @@ class ArtifactTargetCoordinator:
             status = OutputEventStatus.APPLIED
         return status
 
+    def retry_event(self, event_id: str) -> OutputEventStatus:
+        """Retry one transient registration failure exactly once per call."""
+        status = self.event_status(event_id)
+        if status is not OutputEventStatus.RETRYABLE:
+            raise ValueError(
+                "only a RETRYABLE output event can be retried explicitly")
+        return self.process_event(event_id)
+
+    def requeue_failed_event(self, event_id: str) -> OutputEventStatus:
+        """Operator-controlled reset after exact prepared bytes return.
+
+        Generic scientific/identity ``ValueError`` failures are never retried
+        automatically.  An operator may requeue a terminal event only after
+        every immutable record in its original event re-verifies against the
+        same local bytes; neither event nor record identity is rewritten.
+        """
+        if self.event_status(event_id) is not OutputEventStatus.FAILED:
+            raise ValueError("only a FAILED output event can be requeued")
+        event = self._event(event_id)
+        refusals = []
+        for record in event.records:
+            available, reason = self.resolver.artifact_registry.verify_record(
+                record)
+            if not available:
+                refusals.append(f"{record.record_id}:{reason}")
+        if refusals:
+            raise ValueError(
+                "failed event records do not re-verify: " + ",".join(refusals))
+        encoded = strict_canonical_json(event.to_dict())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT event_json,status FROM artifact_output_events "
+                "WHERE event_id=?", (event_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(event_id)
+            if (row["status"] != OutputEventStatus.FAILED.value
+                    or row["event_json"] != encoded):
+                raise ValueError(
+                    "failed event changed while operator requeue was verified")
+            connection.execute(
+                "UPDATE artifact_output_events SET status=?,error='',"
+                "registration_attempts=0,updated_at=CURRENT_TIMESTAMP "
+                "WHERE event_id=?",
+                (OutputEventStatus.PENDING.value, event_id),
+            )
+            connection.commit()
+        return OutputEventStatus.PENDING
+
     def recover(self) -> tuple[str, ...]:
         with self._connect() as connection:
             ids = tuple(row["event_id"] for row in connection.execute(
                 "SELECT event_id FROM artifact_output_events "
-                "WHERE status IN (?,?) ORDER BY event_id",
+                "WHERE status IN (?,?,?) ORDER BY event_id",
                 (OutputEventStatus.PENDING.value,
+                 OutputEventStatus.RETRYABLE.value,
                  OutputEventStatus.REGISTERED.value),
             ))
         for event_id in ids:
-            self.process_event(event_id)
+            try:
+                self.process_event(event_id)
+            except Exception:
+                # A registration failure has already been durably classified.
+                # Retryable events get at most one attempt per recovery pass;
+                # terminal/exhausted events remain FAILED and cannot poison the
+                # rest of the replay queue.
+                if self.event_status(event_id) not in (
+                        OutputEventStatus.RETRYABLE,
+                        OutputEventStatus.FAILED):
+                    raise
         return ids
 
     def output_arrived(self, *, producer_id: str,
@@ -478,7 +595,11 @@ class ArtifactTargetCoordinator:
                        inputs: Iterable[ArtifactInput] = ()) -> ArtifactOutputEvent:
         event = self.enqueue_output_event(
             producer_id=producer_id, outputs=outputs, inputs=inputs)
-        self.process_event(event.event_id)
+        status = self.process_event(event.event_id)
+        if status is not OutputEventStatus.APPLIED:
+            raise RuntimeError(
+                f"output event {event.event_id} was not applied: "
+                f"{status.value}")
         return event
 
 

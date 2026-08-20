@@ -182,6 +182,78 @@ class ExternalArtifactInputBinding:
             value, cls, "ExternalArtifactInputBinding"))
 
 
+class RegisteredArtifactDelivery(str, Enum):
+    """Closed ways verified native bytes may enter an operation."""
+
+    JSON_VALUE = "JSON_VALUE"
+    NATIVE_FILE_POINTER = "NATIVE_FILE_POINTER"
+
+
+class InputArtifactSource(str, Enum):
+    """Identity namespace used by one runtime input-lineage edge."""
+
+    STAGE1_COMMIT = "STAGE1_COMMIT"
+    REGISTERED_ARTIFACT = "REGISTERED_ARTIFACT"
+
+
+@dataclass(frozen=True)
+class TaskInputLineage:
+    input_name: str
+    source: InputArtifactSource
+    artifact_id: str
+
+    def __post_init__(self) -> None:
+        _required_text(self.input_name, "lineage input_name")
+        if not isinstance(self.source, InputArtifactSource):
+            raise TypeError("lineage source must be typed")
+        _digest(self.artifact_id, "lineage artifact_id")
+
+
+@dataclass(frozen=True)
+class RegisteredArtifactInputBinding:
+    """One exact Stage-10 registry record selected by a frozen snapshot.
+
+    This is deliberately distinct from :class:`ExternalArtifactInputBinding`:
+    the latter resolves an artifact committed by this Stage-1 store, while
+    this binding names producer-owned native bytes which must remain at their
+    registered location.  The full record is retained so a restarted runtime
+    can replay its content identity without consulting mutable registry state.
+    """
+
+    input_name: str
+    snapshot_id: str
+    record: dict[str, Any]
+    delivery: RegisteredArtifactDelivery = RegisteredArtifactDelivery.JSON_VALUE
+
+    def __post_init__(self) -> None:
+        _required_text(self.input_name, "registered input_name")
+        _digest(self.snapshot_id, "registered input snapshot_id")
+        if not isinstance(self.delivery, RegisteredArtifactDelivery):
+            raise TypeError("registered input delivery must be typed")
+        object.__setattr__(self, "record", freeze_json(self.record))
+        if not isinstance(self.record, dict):
+            raise TypeError("registered input record must be an object")
+        # Local import avoids making the Stage-1 type module initialize the
+        # artifact service (which itself imports this runtime package).
+        from artifacts.records import ArtifactRecord
+        ArtifactRecord.from_dict(strict_copy(self.record))
+
+    @property
+    def record_id(self) -> str:
+        return str(self.record["record_id"])
+
+    @property
+    def artifact_id(self) -> str:
+        return str(self.record["artifact_id"])
+
+    @classmethod
+    def from_dict(
+            cls, value: dict[str, Any]) -> "RegisteredArtifactInputBinding":
+        raw = _strict_dataclass(value, cls, "RegisteredArtifactInputBinding")
+        raw["delivery"] = RegisteredArtifactDelivery(raw["delivery"])
+        return cls(**raw)
+
+
 @dataclass(frozen=True)
 class AttemptInputReceipt:
     """Exact immutable artifact receipt presented to one worker input port.
@@ -217,6 +289,35 @@ class AttemptInputReceipt:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "AttemptInputReceipt":
         return cls(**_strict_dataclass(value, cls, "AttemptInputReceipt"))
+
+
+@dataclass(frozen=True)
+class RegisteredArtifactInputReceipt:
+    """Attempt-scoped replay receipt for producer-owned native bytes."""
+
+    snapshot_id: str
+    record: dict[str, Any]
+    delivery: RegisteredArtifactDelivery
+
+    def __post_init__(self) -> None:
+        _digest(self.snapshot_id, "registered receipt snapshot_id")
+        if not isinstance(self.delivery, RegisteredArtifactDelivery):
+            raise TypeError("registered receipt delivery must be typed")
+        object.__setattr__(self, "record", freeze_json(self.record))
+        if not isinstance(self.record, dict):
+            raise TypeError("registered receipt record must be an object")
+        from artifacts.records import ArtifactRecord
+        ArtifactRecord.from_dict(strict_copy(self.record))
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(
+            cls, value: dict[str, Any]) -> "RegisteredArtifactInputReceipt":
+        raw = _strict_dataclass(value, cls, "RegisteredArtifactInputReceipt")
+        raw["delivery"] = RegisteredArtifactDelivery(raw["delivery"])
+        return cls(**raw)
 
 
 @dataclass(frozen=True)
@@ -308,7 +409,9 @@ class TaskTemplate:
     component: ExecutableComponent
     parameters: dict[str, Any] = field(default_factory=dict)
     inputs: tuple[InputBinding, ...] = ()
-    external_inputs: tuple[ExternalArtifactInputBinding, ...] = ()
+    external_inputs: tuple[
+        ExternalArtifactInputBinding | RegisteredArtifactInputBinding, ...
+    ] = ()
     outputs: tuple[OutputSpec, ...] = field(
         default_factory=lambda: (OutputSpec(),))
     resources: ResourceRequest = field(default_factory=ResourceRequest)
@@ -336,7 +439,10 @@ class TaskTemplate:
                 or not all(isinstance(value, InputBinding)
                            for value in self.inputs)
                 or not isinstance(self.external_inputs, tuple)
-                or not all(isinstance(value, ExternalArtifactInputBinding)
+                or not all(isinstance(value, (
+                    ExternalArtifactInputBinding,
+                    RegisteredArtifactInputBinding,
+                ))
                            for value in self.external_inputs)):
             raise TypeError("task inputs must be immutable typed tuples")
         input_names = tuple(value.input_name for value in self.inputs)
@@ -421,7 +527,9 @@ class BoundTask:
     component: ExecutableComponent
     parameters: dict[str, Any]
     inputs: tuple[InputBinding, ...]
-    external_inputs: tuple[ExternalArtifactInputBinding, ...]
+    external_inputs: tuple[
+        ExternalArtifactInputBinding | RegisteredArtifactInputBinding, ...
+    ]
     outputs: tuple[ArtifactRecipe, ...]
     resources: ResourceRequest
     max_attempts: int
@@ -451,7 +559,10 @@ class BoundTask:
                 or not all(isinstance(value, InputBinding)
                            for value in self.inputs)
                 or not isinstance(self.external_inputs, tuple)
-                or not all(isinstance(value, ExternalArtifactInputBinding)
+                or not all(isinstance(value, (
+                    ExternalArtifactInputBinding,
+                    RegisteredArtifactInputBinding,
+                ))
                            for value in self.external_inputs)
                 or not isinstance(self.outputs, tuple)
                 or not all(isinstance(value, ArtifactRecipe)
@@ -487,7 +598,9 @@ class BoundTask:
             raise ValueError("BoundTask.outputs must be a JSON array")
         raw["inputs"] = tuple(InputBinding.from_dict(v) for v in raw["inputs"])
         raw["external_inputs"] = tuple(
-            ExternalArtifactInputBinding.from_dict(v)
+            RegisteredArtifactInputBinding.from_dict(v)
+            if isinstance(v, dict) and "record" in v
+            else ExternalArtifactInputBinding.from_dict(v)
             for v in raw["external_inputs"])
         raw["outputs"] = tuple(ArtifactRecipe.from_dict(v) for v in raw["outputs"])
         raw["resources"] = ResourceRequest.from_dict(raw["resources"])
@@ -702,7 +815,8 @@ class AttemptSpec:
     attempt_number: int
     fencing_token: int
     provider: str
-    input_artifacts: dict[str, AttemptInputReceipt]
+    input_artifacts: dict[
+        str, AttemptInputReceipt | RegisteredArtifactInputReceipt]
     stage_dir: str
     created_at: float
 
@@ -726,7 +840,10 @@ class AttemptSpec:
             raise ValueError("attempt created_at must be a positive finite timestamp")
         if not isinstance(self.input_artifacts, dict) or any(
                 not isinstance(key, str) or not key
-                or not isinstance(receipt, AttemptInputReceipt)
+                or not isinstance(receipt, (
+                    AttemptInputReceipt,
+                    RegisteredArtifactInputReceipt,
+                ))
                 for key, receipt in self.input_artifacts.items()):
             raise ValueError(
                 "input artifacts must map non-empty ports to exact receipts")
@@ -758,7 +875,9 @@ class AttemptSpec:
         if not isinstance(raw["input_artifacts"], dict):
             raise ValueError("AttemptSpec.input_artifacts must be an object")
         raw["input_artifacts"] = {
-            key: AttemptInputReceipt.from_dict(receipt)
+            key: (RegisteredArtifactInputReceipt.from_dict(receipt)
+                  if isinstance(receipt, dict) and "record" in receipt
+                  else AttemptInputReceipt.from_dict(receipt))
             for key, receipt in raw["input_artifacts"].items()
         }
         spec = cls(**raw)

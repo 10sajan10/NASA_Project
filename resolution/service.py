@@ -11,6 +11,7 @@ from capabilities import (
     ArtifactLeaf,
     CapabilityCatalog,
     DeploymentCapabilitySnapshot,
+    DiscoveryLayerCertificate,
 )
 from composition import OracleProblem, validate_compatibility_record
 from contracts import EvidenceSnapshot, RequirementUse
@@ -228,6 +229,67 @@ class ResolutionOutcome:
         return self.discovery_certificate.limit_codes
 
 
+@dataclass(frozen=True)
+class _DiscoveryReplayProjection:
+    """One independently replayed predecessor -> catalog step."""
+
+    layer: DiscoveryLayerCertificate
+    input_catalog: CapabilityCatalog
+    output_catalog: CapabilityCatalog
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.layer, DiscoveryLayerCertificate):
+            raise TypeError("discovery replay projection layer is invalid")
+        if (not isinstance(self.input_catalog, CapabilityCatalog)
+                or not isinstance(self.output_catalog, CapabilityCatalog)):
+            raise TypeError("discovery replay projection catalogs are invalid")
+        provenance = self.output_catalog.discovery_provenance
+        if provenance.base_catalog_id != self.input_catalog.catalog_id:
+            raise ValueError(
+                "discovery replay output names another predecessor catalog")
+        expected_layers = tuple(sorted(
+            (*self.input_catalog.discovery_provenance.layers, self.layer),
+            key=lambda item: (item.layer_kind, item.expansion_id),
+        ))
+        if provenance.layers != expected_layers:
+            raise ValueError(
+                "discovery replay output does not add exactly one layer")
+
+
+def _verify_replay_chain(
+    catalog: CapabilityCatalog,
+    projections: tuple[_DiscoveryReplayProjection, ...],
+) -> None:
+    """Require every replay to form one exact chain ending at ``catalog``."""
+    by_output: dict[str, _DiscoveryReplayProjection] = {}
+    for projection in projections:
+        previous = by_output.setdefault(
+            projection.output_catalog.catalog_id, projection)
+        if previous != projection:
+            raise ValueError(
+                "multiple discovery replays project the same catalog step")
+
+    current = catalog
+    used: set[str] = set()
+    while current.catalog_id in by_output:
+        projection = by_output[current.catalog_id]
+        if projection.output_catalog != current:
+            raise ValueError(
+                "discovery replay catalog identity collision")
+        key = projection.output_catalog.catalog_id
+        if key in used:
+            raise ValueError("discovery replay projections contain a cycle")
+        used.add(key)
+        current = projection.input_catalog
+
+    if len(used) != len(projections):
+        raise ValueError(
+            "discovery replays do not form one exact chain to the final catalog")
+    if not current.discovery_provenance.authored_directly:
+        raise ValueError(
+            "discovery replay chain ends at an unreplayed generated catalog")
+
+
 class WorkflowResolver:
     """Resolve typed requirements against frozen catalogs and snapshots.
 
@@ -277,25 +339,34 @@ class WorkflowResolver:
 
             allowed = (AcquisitionDiscoveryReplay,
                        TransformationDiscoveryReplay)
-            if not all(isinstance(item, allowed) for item in replay_values):
+            if not all(type(item) in allowed for item in replay_values):
                 raise TypeError(
                     "discovery_replays must contain closed typed replay values")
             unmatched = list(discovery_certificate.layers)
+            projections: list[_DiscoveryReplayProjection] = []
             for replay in replay_values:
-                candidates = [layer for layer in unmatched
-                              if layer.layer_kind == (
-                                  "ACQUISITION_EXPANSION"
-                                  if isinstance(replay, AcquisitionDiscoveryReplay)
-                                  else "TRANSFORMATION_EXPANSION")]
+                if type(replay) is AcquisitionDiscoveryReplay:
+                    layer = replay.expansion.discovery_layer()
+                    input_catalog = replay.base_catalog
+                    output_catalog = replay.verify(catalog, layer)
+                else:
+                    replayed = replay.replay()
+                    layer = replayed.discovery_layer()
+                    input_catalog = replay.base_catalog
+                    output_catalog = replayed.augmented_catalog
+                candidates = [candidate for candidate in unmatched
+                              if candidate == layer]
                 if len(candidates) != 1:
                     raise ValueError(
-                        "discovery replay does not map uniquely to a catalog layer")
-                layer = candidates[0]
-                replay.verify(catalog, layer)
-                unmatched.remove(layer)
+                        "independent replay does not map by exact expansion "
+                        "identity to one catalog layer")
+                unmatched.remove(candidates[0])
+                projections.append(_DiscoveryReplayProjection(
+                    layer, input_catalog, output_catalog))
             if unmatched:
                 raise ValueError(
                     "every discovered catalog layer requires independent replay")
+            _verify_replay_chain(catalog, tuple(projections))
         elif replay_values:
             raise ValueError(
                 "an authored catalog cannot take discovery replay evidence")

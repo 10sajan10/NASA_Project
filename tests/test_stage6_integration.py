@@ -273,6 +273,60 @@ def test_evidence_comes_from_the_frozen_snapshot_not_the_caller():
             evidence_snapshot=unrelated)
 
 
+def test_report_uses_the_exact_profile_id_bound_to_each_producer():
+    """A second profile for the same subject cannot replace the bound one."""
+    from dataclasses import replace
+
+    from contracts import (
+        EstimateUncertainty,
+        EvidenceClaim,
+        EvidenceProfile,
+        EvidenceSnapshot,
+    )
+
+    fixture = fx.make_stage6_fixture()
+    direct_profile = next(
+        profile for profile in fixture.evidence_snapshot.profiles
+        if profile.claims[0].value == "0.9")
+    direct_claim = direct_profile.claims[0]
+    decoy_claim = EvidenceClaim.known(
+        direct_claim.metric_definition_id, "0.3", direct_claim.unit,
+        bound_kind=direct_claim.bound_kind,
+        reference_manifest_id=direct_claim.reference_manifest_id,
+        protocol_id=direct_claim.protocol_id,
+        evaluator_id=direct_claim.evaluator_id,
+        applicability=direct_claim.applicability,
+        estimate_uncertainty=EstimateUncertainty.known(
+            "0.2", "0.4", direct_claim.unit, "0.95",
+            "example.block-bootstrap.v1"),
+    )
+    decoy = EvidenceProfile(
+        direct_profile.schema_version, direct_profile.subject, (decoy_claim,),
+        direct_profile.factual_metadata_ids)
+    # The old subject-only lookup returned the first sorted profile. Make that
+    # explicitly be the decoy so this is a regression, not a coincidental pass.
+    assert decoy.profile_id < direct_profile.profile_id
+    snapshot = EvidenceSnapshot(
+        fixture.evidence_snapshot.captured_at,
+        fixture.evidence_snapshot.evaluator,
+        fixture.evidence_snapshot.profiles + (decoy,))
+    fixture = replace(fixture, evidence_snapshot=snapshot)
+    baseline = _resolve(fixture)
+
+    report = build_choice_report(
+        baseline, lambda constraints: _resolve(fixture, constraints),
+        concept_id=fx.FLOW_CONCEPT, requirement_use=fixture.flow_use,
+        metric_definition_id=fx.METRIC_ID,
+        evidence_snapshot=fixture.evidence_snapshot)
+    direct = next(
+        item for item in report.alternatives
+        if item.capability_id == "example-flow-direct")
+
+    assert direct.reading is not None
+    assert direct.reading.value == direct_claim.value
+    assert direct.reading.value != decoy_claim.value
+
+
 def test_alternatives_cannot_mix_different_frozen_resolution_universes():
     from objectives import build_choice_report
 

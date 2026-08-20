@@ -7,6 +7,8 @@ made from.
 """
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from contracts import BoundKind, EvidenceStatus, UncertaintyStatus
@@ -24,6 +26,8 @@ from objectives import (
 )
 from plans import ProducerKind
 from resolution import ProducerSelectionRef, SatisfactionArcSelectionRef
+from stage6 import fixtures as stage6_fixtures
+from objectives.comparability import read_metric
 
 METRIC = "example.metric.error"
 
@@ -126,6 +130,10 @@ def test_missing_intervals_are_treated_as_unresolved():
     ({"unit": "km.h-1"}, ComparabilityCode.UNIT_DIFFERS),
     ({"bound_kind": BoundKind.CONSERVATIVE_UPPER},
      ComparabilityCode.BOUND_KIND_DIFFERS),
+    ({"uncertainty_confidence_level": "0.99"},
+     ComparabilityCode.UNCERTAINTY_CONFIDENCE_DIFFERS),
+    ({"uncertainty_method_id": "iid-bootstrap"},
+     ComparabilityCode.UNCERTAINTY_METHOD_DIFFERS),
     ({"applicability_covers_request": False},
      ComparabilityCode.APPLICABILITY_DOES_NOT_COVER_REQUEST),
 ])
@@ -138,11 +146,51 @@ def test_provenance_differences_block_comparison(override, code):
     assert verdict.detail
 
 
+def test_disjoint_intervals_with_incomparable_uncertainty_do_not_separate():
+    verdict = assess_comparability(
+        (_reading(
+            "a", "0.5", uncertainty_lower="0", uncertainty_upper="1",
+            uncertainty_confidence_level="0.50",
+            uncertainty_method_id="bootstrap-a"),
+         _reading(
+            "b", "2.5", uncertainty_lower="2", uncertainty_upper="3",
+            uncertainty_confidence_level="0.99",
+            uncertainty_method_id="bootstrap-b")),
+        METRIC)
+
+    assert not verdict.comparable
+    assert {ComparabilityCode.UNCERTAINTY_CONFIDENCE_DIFFERS,
+            ComparabilityCode.UNCERTAINTY_METHOD_DIFFERS}.issubset(
+                verdict.blocking_codes)
+    assert not verdict.separation_established
+
+
 def test_unknown_metric_blocks_comparison():
     verdict = assess_comparability(
         (_reading("a"), _reading("b", value=None)), METRIC)
     assert not verdict.comparable
     assert ComparabilityCode.METRIC_NOT_KNOWN in verdict.blocking_codes
+
+
+def test_report_only_metric_replays_the_frozen_evaluator_definition():
+    fixture = stage6_fixtures.make_stage6_fixture()
+    definition = fixture.evidence_snapshot.evaluator.definition_for(METRIC)
+    assert definition is not None
+    incompatible_evaluator = dataclasses.replace(
+        fixture.evidence_snapshot.evaluator,
+        metric_definitions=(dataclasses.replace(definition, unit="m"),),
+    )
+    incompatible_snapshot = dataclasses.replace(
+        fixture.evidence_snapshot, evaluator=incompatible_evaluator)
+
+    reading = read_metric(
+        "producer", fixture.evidence_snapshot.profiles[0],
+        incompatible_snapshot, METRIC,
+        stage6_fixtures.flow_requirement(require_evidence=False))
+
+    assert not reading.known
+    assert reading.reason == (
+        "the claim does not match the frozen metric definition")
 
 
 def test_a_single_alternative_is_not_a_comparison():

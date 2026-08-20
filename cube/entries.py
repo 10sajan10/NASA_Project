@@ -31,6 +31,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from contracts.identity import strict_hash
@@ -56,6 +57,18 @@ class ResolutionPolicy(str, Enum):
 
 class EntryNotFound(KeyError):
     """No entry satisfies the request, and none is invented."""
+
+
+class DatasetRegistrationConflict(ValueError):
+    """A verified dataset registration conflicts with catalogued state."""
+
+
+class DatasetLocatorConflict(DatasetRegistrationConflict):
+    """Two verified live locations claim to be current for one entry."""
+
+
+class DatasetMetadataConflict(DatasetRegistrationConflict):
+    """Non-identity discovery metadata disagrees for one scientific entry."""
 
 
 @dataclass(frozen=True)
@@ -91,6 +104,8 @@ class CubeEntry:
     #: Deliberately outside `identity_payload`: moving a file or re-recording
     #: its format does not change what the value *is*, and an entry whose id
     #: changed when a file moved would break every lineage edge pointing at it.
+    #: Catalog reads populate these from the explicit current locator receipt;
+    #: the inline database columns are only a backwards-compatible fallback.
     location: str = ""
     media_type: str = ""
     #: Free-form descriptive metadata. Anything not covered by the structured
@@ -178,6 +193,62 @@ class CubeEntry:
     def grid_json(self) -> str:
         return "" if self.grid is None else json.dumps(
             self.grid.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class EntryLocator:
+    """One immutable, content-bound registration of an entry's bytes.
+
+    A scientific ``CubeEntry`` keeps the same identity when its file moves,
+    because cascade edges refer to the scientific value rather than a path.
+    The path cannot therefore live only on that immutable row.  Locator
+    receipts give location changes their own content identity, while the
+    catalog's explicit locator head selects which verified receipt consumers
+    currently receive.
+
+    ``registered_at`` orders audit history but is not identity-bearing.  An
+    idempotent re-registration of the same entry/path/format is one receipt.
+    """
+
+    locator_id: str
+    entry_id: str
+    location: str
+    content_sha256: str
+    media_type: str
+    registered_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for value, label in (
+                (self.entry_id, "entry_id"),
+                (self.location, "location"),
+                (self.content_sha256, "content_sha256"),
+                (self.media_type, "media_type")):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"an entry locator requires a {label}")
+        if not Path(self.location).is_absolute():
+            raise ValueError("an entry locator requires an absolute location")
+        if self.locator_id and self.locator_id != self.expected_id():
+            raise ValueError("entry locator identity does not verify")
+
+    def identity_payload(self) -> dict[str, str]:
+        return {
+            "schema": "cube-entry-locator-v1",
+            "entry_id": self.entry_id,
+            "location": self.location,
+            "content_sha256": self.content_sha256,
+            "media_type": self.media_type,
+        }
+
+    def expected_id(self) -> str:
+        return strict_hash(self.identity_payload())
+
+    @classmethod
+    def create(cls, *, entry_id: str, location: str,
+               content_sha256: str, media_type: str,
+               registered_at: datetime | None = None) -> "EntryLocator":
+        draft = cls("", entry_id, location, content_sha256, media_type,
+                    registered_at)
+        return dataclasses.replace(draft, locator_id=draft.expected_id())
 
 
 def bbox_lonlat_from_grid(grid: GridDescriptor
@@ -313,42 +384,51 @@ class ProjectionAuthority:
     So the committer now demands one of these, and it can only be minted after
     ``CubeProjector._verify_manifest`` has re-read the manifest bytes, replayed
     the artifact identity, and re-hashed the object.  It is bound to the exact
-    artifact it was minted for, so it cannot be replayed against another.
+    canonical projection receipt it was minted for, so it cannot be replayed
+    with different producer, descriptor, recipe, lineage, or plan coordinates
+    even when those altered coordinates form a self-consistent projection.
 
     This mirrors ``acquisition.connector.FetchAuthorization``, which guards the
     fetch boundary the same way.
     """
 
-    __slots__ = ("run_id", "artifact_id", "content_sha256")
+    __slots__ = ("projection_id", "projection_json")
 
-    def __init__(self, mint: object, run_id: str, artifact_id: str,
-                 content_sha256: str) -> None:
+    def __init__(self, mint: object, projection_id: str,
+                 projection_json: str) -> None:
         if mint is not _MINT:
             raise PermissionError(
                 "ProjectionAuthority is minted only by a verified "
                 "RuntimeStore artifact projection")
-        self.run_id = run_id
-        self.artifact_id = artifact_id
-        self.content_sha256 = content_sha256
+        if not isinstance(projection_id, str) or not projection_id:
+            raise ValueError("ProjectionAuthority requires a projection_id")
+        if not isinstance(projection_json, str) or not projection_json:
+            raise ValueError("ProjectionAuthority requires exact projection JSON")
+        self.projection_id = projection_id
+        self.projection_json = projection_json
 
-    def authorizes(self, run_id: str, artifact_id: str,
-                   content_sha256: str) -> bool:
-        return (run_id == self.run_id and artifact_id == self.artifact_id
-                and content_sha256 == self.content_sha256)
+    def authorizes(self, projection_id: str, projection_json: str) -> bool:
+        return (projection_id == self.projection_id
+                and projection_json == self.projection_json)
 
 
 _MINT = object()
 
 
-def _mint_projection_authority(run_id: str, artifact_id: str,
-                               content_sha256: str) -> ProjectionAuthority:
+def _mint_projection_authority(
+    projection_id: str, projection_json: str,
+) -> ProjectionAuthority:
     """Internal: used by :mod:`cube.projection` after verification succeeds."""
-    return ProjectionAuthority(_MINT, run_id, artifact_id, content_sha256)
+    return ProjectionAuthority(_MINT, projection_id, projection_json)
 
 
 __all__ = [
     "CubeEntry",
+    "DatasetLocatorConflict",
+    "DatasetMetadataConflict",
+    "DatasetRegistrationConflict",
     "DatasetRef",
+    "EntryLocator",
     "EntryInput",
     "EntryNotFound",
     "ProjectionAuthority",

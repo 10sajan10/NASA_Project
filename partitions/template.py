@@ -3,8 +3,10 @@
 The partition layer is not allowed to restate an operation selected by the
 resolver. A template therefore carries the complete, self-verifying
 ``BoundInvocation``: implementation digest, parameters, input requirements,
-and output descriptors all travel together. Partitioning adds only the
-partition key and execution-policy metadata.
+and output descriptors all travel together.  The exact Stage-3 deployment
+binding travels with it as well, so partition execution cannot quietly replace
+the selected execution profile, deployment class, or resource request.
+Partitioning adds only the partition key and retry-policy metadata.
 """
 from __future__ import annotations
 
@@ -14,6 +16,8 @@ from typing import Any
 from capabilities import BoundInvocation
 from capabilities.implementation import _digest
 from engine.runtime.identity import require_object_fields, strict_hash
+from engine.runtime.types import ResourceRequest
+from plans import InvocationDeploymentBinding
 
 from .space import PartitionKey
 
@@ -67,6 +71,7 @@ class PartitionTaskTemplate:
 
     template_id: str
     invocation: BoundInvocation
+    deployment_binding: InvocationDeploymentBinding
     estimated_cost_units: int
     retry_policy: PartitionRetryPolicy
 
@@ -75,6 +80,23 @@ class PartitionTaskTemplate:
         if not isinstance(self.invocation, BoundInvocation):
             raise TypeError("partition template requires a BoundInvocation")
         self.invocation.implementation.verify_current()
+        if not isinstance(
+                self.deployment_binding, InvocationDeploymentBinding):
+            raise TypeError(
+                "partition template requires an InvocationDeploymentBinding")
+        if (self.deployment_binding.invocation_id
+                != self.invocation.invocation_key):
+            raise ValueError(
+                "deployment binding names another bound invocation")
+        if (self.deployment_binding.execution_profile_id
+                != self.invocation.execution_profile_id):
+            raise ValueError(
+                "deployment binding names another execution profile")
+        # Reject incomplete, unknown, or non-runtime resource fields when the
+        # collection is bound, rather than deferring the mismatch until a
+        # packet happens to execute.
+        ResourceRequest.from_dict(
+            dict(self.deployment_binding.resource_request))
         if (isinstance(self.estimated_cost_units, bool)
                 or not isinstance(self.estimated_cost_units, int)
                 or self.estimated_cost_units < 0):
@@ -91,14 +113,18 @@ class PartitionTaskTemplate:
             raise ValueError("partition task template identity does not verify")
 
     @classmethod
-    def bind(cls, invocation: BoundInvocation, *,
+    def bind(cls, invocation: BoundInvocation,
+             deployment_binding: InvocationDeploymentBinding, *,
              estimated_cost_units: int | None = None,
              retry_policy: PartitionRetryPolicy | None = None,
              retry_safe: bool | None = None,
              max_attempts: int | None = None) -> "PartitionTaskTemplate":
-        """Compile from a resolver output; automatic retry is opt-in."""
+        """Compile from resolver and deployment outputs; retry is opt-in."""
         if not isinstance(invocation, BoundInvocation):
             raise TypeError("bind requires a BoundInvocation")
+        if not isinstance(deployment_binding, InvocationDeploymentBinding):
+            raise TypeError(
+                "bind requires an InvocationDeploymentBinding")
         if estimated_cost_units is None:
             value = invocation.metric_estimates.get("cost_units", 1)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -119,16 +145,21 @@ class PartitionTaskTemplate:
                        else max_attempts)
             retry_policy = PartitionRetryPolicy(safe, ceiling)
         payload = cls._payload(
-            invocation, estimated_cost_units, retry_policy)
-        return cls(strict_hash(payload), invocation, estimated_cost_units,
-                   retry_policy)
+            invocation, deployment_binding, estimated_cost_units,
+            retry_policy)
+        return cls(
+            strict_hash(payload), invocation, deployment_binding,
+            estimated_cost_units, retry_policy)
 
     @staticmethod
-    def _payload(invocation: BoundInvocation, estimated_cost_units: int,
+    def _payload(invocation: BoundInvocation,
+                 deployment_binding: InvocationDeploymentBinding,
+                 estimated_cost_units: int,
                  retry_policy: PartitionRetryPolicy) -> dict[str, Any]:
         return {
-            "schema": "stage8r-partition-task-template-v3",
+            "schema": "stage8r-partition-task-template-v4",
             "invocation": invocation.to_dict(),
+            "deployment_binding": deployment_binding.to_dict(),
             "estimated_cost_units": estimated_cost_units,
             "retry_policy": retry_policy.to_dict(),
         }
@@ -172,7 +203,8 @@ class PartitionTaskTemplate:
 
     def expected_id(self) -> str:
         return strict_hash(self._payload(
-            self.invocation, self.estimated_cost_units, self.retry_policy))
+            self.invocation, self.deployment_binding,
+            self.estimated_cost_units, self.retry_policy))
 
     def logical_task_key(self, partition: PartitionKey) -> str:
         """Stable identity for this exact invocation and one partition."""
@@ -187,7 +219,8 @@ class PartitionTaskTemplate:
 
     def to_dict(self) -> dict[str, Any]:
         payload = self._payload(
-            self.invocation, self.estimated_cost_units, self.retry_policy)
+            self.invocation, self.deployment_binding,
+            self.estimated_cost_units, self.retry_policy)
         payload["template_id"] = self.template_id
         return payload
 
@@ -196,13 +229,15 @@ class PartitionTaskTemplate:
         raw = require_object_fields(
             value,
             {"schema", "template_id", "invocation",
-             "estimated_cost_units", "retry_policy"},
+             "deployment_binding", "estimated_cost_units", "retry_policy"},
             "PartitionTaskTemplate")
-        if raw.pop("schema") != "stage8r-partition-task-template-v3":
+        if raw.pop("schema") != "stage8r-partition-task-template-v4":
             raise ValueError(
                 "PartitionTaskTemplate schema is not "
-                "stage8r-partition-task-template-v3")
+                "stage8r-partition-task-template-v4")
         raw["invocation"] = BoundInvocation.from_dict(raw["invocation"])
+        raw["deployment_binding"] = InvocationDeploymentBinding.from_dict(
+            raw["deployment_binding"])
         raw["retry_policy"] = PartitionRetryPolicy.from_dict(
             raw["retry_policy"])
         return cls(**raw)

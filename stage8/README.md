@@ -1,7 +1,7 @@
 # Stage 8 — Resource-aware local scheduling
 
-Status: **policy plus a working runtime bridge** — implemented and
-acceptance-tested on 2026-08-15, revised 2026-08-16 after an external audit.
+Status: **policy plus a working bounded local runtime bridge** — implemented
+and acceptance-tested, with correctness repairs through 2026-08-19.
 The policy now drives the durable Stage-1 controller: concurrent attempts run
 under a reservation ledger, measured on real subprocesses. The three-policy
 makespan comparison below is still a **simulation**. No WRF-SFIRE, MPI, Slurm,
@@ -184,31 +184,35 @@ the schedule.
 
 ## What this does not do
 
-- **The policy is not wired into the live Stage-1 controller.** That controller
-  still enforces `max_inflight=1` — it is deliberately serial, and its comment
-  says packing and priority belong to Stage 8. Lifting that guard means
-  reworking a durable runtime that Stages 1–7 depend on, and it was not done
-  here. Stage 8 delivers the *policy*, tested in isolation; making it the
-  runtime's scheduler is the first follow-up.
-- **Makespans come from a discrete-event simulation**, not from wall-clock runs
-  of real subprocesses. Durations are declared estimates or measured history.
-  The simulator answers "does this policy order work better" — not "how long
-  will this take on your node". Resource feasibility inside it *is* real: every
-  start goes through the same ledger.
-- **No live observation collection.** `TaskObservation` values are supplied by
-  the caller; nothing yet instruments the Stage-1 worker to produce them from
-  real attempts. Duration, memory, and transfer history are therefore only as
-  real as what is fed in.
-- **`peak_memory_mb` is not measured anywhere.** There is no cgroup or
-  `resource.getrusage` sampling in this stage; the revision machinery is
-  correct but is currently driven by supplied numbers.
+- **The live bridge does not make the simulation a wall-clock benchmark.** The
+  controller now supports concurrent attempts, critical-path/aging ordering,
+  durable reservation recovery, and real subprocess observations. The 39/39/30
+  comparison above still comes from the discrete-event fixture and demonstrates
+  policy ordering only; it does not predict wall-clock time on another node.
+  Resource feasibility inside that fixture is still enforced through the same
+  ledger.
+- **Observation scope is narrow.** The live worker emits attempt duration and
+  `ru_maxrss` peak memory for local subprocesses. CPU cores and GPUs in an
+  observation remain the reserved envelope, not sampled utilization; scratch
+  and transfer volume are not measured. A restart can recover a reservation
+  but cannot reconstruct the missing monotonic start time, so it emits no
+  fabricated duration for that attempt.
+- **Reservations are accounting, not full OS isolation.** The ledger is checked
+  against the provider's cpuset, cgroup-aware memory limit, and visible GPU
+  count, and thread variables are capped. It does not pin individual CPUs or
+  GPUs or enforce per-attempt memory/scratch cgroups.
 - **Stage-5 acquisition throttling and network-site feasibility are not
   integrated** into this admission path. `ExecutionSite` carries
   `network_classes` and placement filters on them, but the per-provider quota
   ledger from Stage 5 remains separate. Unifying them is explicitly listed in
   the Build section and is unfinished.
+- **Scratch is not propagated by the live controller.** `SiteSnapshot` has no
+  scratch-allocation field, so the controller deliberately requests zero
+  scratch even though the policy ledger models it.
 - No GPU-ID assignment — GPUs are counted, not individually reserved or pinned.
-- No locality, fan-out, or learned runtime estimates. The roadmap says to add
-  those only after measurement, and the measurement does not exist yet.
-- Single node. "Best-fit placement across sites" means multiple logical sites
-  on one machine, never cluster-node allocation.
+- No locality, fan-out, or learned runtime estimates. The local synthetic
+  observations are not yet a representative workload history from which to
+  train them.
+- Single local provider. Multiple logical sites must declare one shared physical
+  host envelope when they share the machine; this is not cluster-node
+  allocation.

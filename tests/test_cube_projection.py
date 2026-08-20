@@ -2,11 +2,17 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 import pytest
 
+from contracts.types import ArtifactDescriptor
 from cube.catalog import Catalog
-from cube.projection import CubeProjector, ProjectionFailpoint
+from cube.projection import (
+    CubeEntryProjection,
+    CubeProjector,
+    ProjectionFailpoint,
+)
 from engine.runtime import RunState, WorkflowController
 from engine.runtime.identity import strict_hash
 from engine.runtime.operations import operation_component
@@ -390,10 +396,8 @@ def test_a_self_consistent_receipt_is_not_authority(tmp_path):
         catalog.close()
 
 
-def test_an_authority_is_bound_to_one_artifact(tmp_path):
-    """A minted authority cannot be replayed against a different artifact."""
-    from cube.entries import _mint_projection_authority
-
+def test_an_authority_is_bound_to_the_exact_projection(tmp_path):
+    """Verified bytes cannot authorize forged scientific coordinates."""
     demo, graph, controller, run_id = _execute_chain(tmp_path)
     catalog = Catalog(tmp_path / "cube.duckdb")
     try:
@@ -403,19 +407,53 @@ def test_an_authority_is_bound_to_one_artifact(tmp_path):
                 "SELECT run_id,recipe_id,artifact_id FROM "
                 "cube_projection_outbox ORDER BY created_at LIMIT 1"
             ).fetchone()
-        projection, _ = projector._reconstruct(*[str(v) for v in key])
+        projection, authority = projector._reconstruct(
+            *[str(value) for value in key])
+        binding = ScientificArtifactBinding(
+            projection.bound_plan_id,
+            projection.invocation_id,
+            projection.output_port,
+            projection.descriptor_id,
+            projection.descriptor,
+        )
+        descriptor = ArtifactDescriptor.from_dict(projection.descriptor)
+        forged_descriptor = replace(
+            descriptor, concept_id="forged.scientific.concept")
+        forged_bindings = (
+            replace(binding, invocation_id="f" * 64),
+            replace(
+                binding,
+                descriptor_id=forged_descriptor.descriptor_id,
+                descriptor=forged_descriptor.to_dict(),
+            ),
+        )
+        forged = [
+            CubeEntryProjection.bind(
+                run_id=projection.run_id,
+                runtime_plan_id=projection.runtime_plan_id,
+                binding=value,
+                recipe_id=projection.recipe_id,
+                artifact_id=projection.artifact_id,
+                content_sha256=projection.content_sha256,
+                inputs=projection.inputs,
+            )
+            for value in forged_bindings
+        ]
+        forged.append(CubeEntryProjection.bind(
+            run_id=projection.run_id,
+            runtime_plan_id=projection.runtime_plan_id,
+            binding=binding,
+            recipe_id="e" * 64,
+            artifact_id=projection.artifact_id,
+            content_sha256=projection.content_sha256,
+            inputs=projection.inputs,
+        ))
 
-        for wrong in (
-            _mint_projection_authority(
-                projection.run_id, "f" * 64, projection.content_sha256),
-            _mint_projection_authority(
-                projection.run_id, projection.artifact_id, "e" * 64),
-            _mint_projection_authority(
-                "other-run", projection.artifact_id,
-                projection.content_sha256),
-        ):
-            with pytest.raises(PermissionError, match="different artifact"):
-                catalog._commit_authoritative_projection(projection, wrong)
+        assert all(value.expected_id() == value.projection_id
+                   for value in forged)
+        for value in forged:
+            with pytest.raises(PermissionError, match="different projection"):
+                catalog._commit_authoritative_projection(value, authority)
     finally:
         catalog.close()
 
@@ -424,4 +462,4 @@ def test_authority_cannot_be_constructed_without_the_mint():
     from cube.entries import ProjectionAuthority
 
     with pytest.raises(PermissionError, match="minted only"):
-        ProjectionAuthority(object(), "run", "artifact", "a" * 64)
+        ProjectionAuthority(object(), "projection", "{}")

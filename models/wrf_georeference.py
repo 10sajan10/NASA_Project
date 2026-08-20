@@ -171,14 +171,17 @@ class WrfGeoreference:
         return None
 
 
-def _grid(crs: str, shape: tuple[int, int], x0: float, y1: float,
+def _grid(crs: str, shape: tuple[int, int], x0: float, y0: float,
           cell: float) -> GridDescriptor:
-    # x0/y1 are outer edges derived above; GridDescriptor's canonical affine
-    # stores the first sample centre in array order.
+    # WRF's native south_north array index increases from south to north.
+    # x0/y0 are therefore the leading (west/south) outer edges, and the signed
+    # y step must be positive.  A conventional north-up raster uses a negative
+    # step because its row zero is north; describing WRF that way would attach
+    # every native array row to the vertically mirrored coordinate.
     return GridDescriptor(
         crs, ("easting", "northing"), (int(shape[0]), int(shape[1])),
         (repr(float(cell)), "0", repr(float(x0 + cell / 2.0)),
-         "0", repr(-float(cell)), repr(float(y1 - cell / 2.0))),
+         "0", repr(float(cell)), repr(float(y0 + cell / 2.0))),
         SpatialScale(repr(float(cell)), repr(float(cell)), "m"))
 
 
@@ -207,22 +210,21 @@ def georeference_from_dataset(dataset: Any) -> WrfGeoreference:
     from_crs = Transformer.from_crs(crs, 4326, always_xy=True)
 
     # XLONG/XLAT index [0, 0] is the south-west mass point, so its projected
-    # position fixes the grid's lower-left corner and hence its top edge.
+    # position fixes the leading west/south edges in native array order.
     corner_x, corner_y = to_crs.transform(lon[0, 0], lat[0, 0])
     x0 = corner_x - cell / 2.0
     y0 = corner_y - cell / 2.0
-    y1 = y0 + rows * cell
 
-    residual = _verify(from_crs, x0, y0, cell, rows, cols, lon, lat)
+    atmospheric = _grid(token, (rows, cols), x0, y0, cell)
+    residual = _verify(from_crs, atmospheric, lon, lat)
     if residual > _COORDINATE_TOLERANCE_M:
         raise WrfGeoreferenceUnverified(
             f"the derived grid misses WRF's own XLONG/XLAT by {residual:.1f} m, "
             f"above the {_COORDINATE_TOLERANCE_M:.0f} m tolerance; the "
             "projection or the origin is wrong and no grid is returned")
 
-    atmospheric = _grid(token, (rows, cols), x0, y1, cell)
     fire, ratio, allocated = _fire_grid(
-        dataset, attrs, token, x0, y1, cell, rows, cols)
+        dataset, attrs, token, x0, y0, cell, rows, cols)
 
     return WrfGeoreference(
         domain_id=int(_number(attrs.get("GRID_ID", 0))),
@@ -231,12 +233,22 @@ def georeference_from_dataset(dataset: Any) -> WrfGeoreference:
         max_coordinate_residual_m=residual)
 
 
-def _verify(from_crs: Transformer, x0: float, y0: float, cell: float,
-            rows: int, cols: int, lon: np.ndarray,
+def _verify(from_crs: Transformer, grid: GridDescriptor, lon: np.ndarray,
             lat: np.ndarray) -> float:
-    """Largest distance between the derived cell centres and WRF's own."""
-    xs = x0 + (np.arange(cols) + 0.5) * cell
-    ys = y0 + (np.arange(rows) + 0.5) * cell
+    """Largest distance between the returned affine and WRF's coordinates.
+
+    Verification deliberately replays the exact descriptor returned to
+    callers.  Keeping a parallel, increasing-y verification grid while
+    returning a decreasing-y affine is the bug this check must prevent.
+    """
+    if tuple(lon.shape) != tuple(grid.shape) or lat.shape != lon.shape:
+        raise WrfGeoreferenceError(
+            "XLONG/XLAT shapes do not match the atmospheric grid")
+    rows, cols = grid.shape
+    x_step = float(grid.affine[0])
+    y_step = float(grid.affine[4])
+    xs = float(grid.affine[2]) + np.arange(cols) * x_step
+    ys = float(grid.affine[5]) + np.arange(rows) * y_step
     grid_x, grid_y = np.meshgrid(xs, ys)
     derived_lon, derived_lat = from_crs.transform(grid_x, grid_y)
     # Degrees to metres, with longitude shortened by latitude.
@@ -247,7 +259,7 @@ def _verify(from_crs: Transformer, x0: float, y0: float, cell: float,
 
 
 def _fire_grid(dataset: Any, attrs: dict[str, Any], token: str, x0: float,
-               y1: float, cell: float, rows: int, cols: int
+               y0: float, cell: float, rows: int, cols: int
                ) -> tuple[GridDescriptor | None, tuple[int, int] | None,
                           tuple[int, int] | None]:
     """The valid fire subgrid, with the staggered padding strip excluded."""
@@ -275,7 +287,7 @@ def _fire_grid(dataset: Any, attrs: dict[str, Any], token: str, x0: float,
         raise WrfGeoreferenceError(
             f"valid fire extent {valid} exceeds the allocated array "
             f"{allocated}")
-    return (_grid(token, valid, x0, y1, cell / ratio[0]), ratio, allocated)
+    return (_grid(token, valid, x0, y0, cell / ratio[0]), ratio, allocated)
 
 
 def read_wrf_georeference(path: Path | str) -> WrfGeoreference:
@@ -380,4 +392,8 @@ def native_grid_from_scenario(scenario: Any, *, fire: bool = True
         cell = domain.dx_m
         shape = (domain.ny, domain.nx)
     x_left, y_top = _domain_origin(scenario, index)
-    return _grid(token, shape, x_left, y_top, cell)
+    # Configuration declares the same native array orientation that wrfout
+    # later carries: row zero is the southernmost row.  The top edge remains
+    # useful for nest placement, but the affine's leading edge is the bottom.
+    y_bottom = y_top - shape[0] * cell
+    return _grid(token, shape, x_left, y_bottom, cell)
